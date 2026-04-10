@@ -6,7 +6,7 @@ from pathlib import Path
 import torch
 
 from config_const import SIGLIP_EMBEDDINGS_PATH
-from data_utils.stimuli import load_stimuli
+from data_utils.stimuli import load_rust_stimuli
 from encoders.siglip_embed import embed_images, load_siglip
 
 
@@ -23,7 +23,7 @@ def main():
         return
 
     out_path.parent.mkdir(parents=True, exist_ok=True)
-    images = load_stimuli()
+    images = load_rust_stimuli()
     model = load_siglip(args.device)
     embeddings = embed_images(model, images)
     torch.save(embeddings, out_path)
