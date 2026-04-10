@@ -1,1 +1,2 @@
-from HexPred.object_decoding.get_rust_response import get_rust_responses
+from HexPred.object_response.get_rust_response import get_rust_responses
+from HexPred.object_response.get_hvm_response import get_hvm_responses
