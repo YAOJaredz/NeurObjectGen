@@ -4,7 +4,7 @@ from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parent
 CACHE_DIR = REPO_ROOT / "cache"
-STIMULI_DIR = CACHE_DIR / "stimuli"
+RUST_STIM_DIR = REPO_ROOT / "stimuli" / "rust_cropped"
 SIGLIP_EMBEDDINGS_PATH = CACHE_DIR / "siglip_embeddings.pt"
 BLIP2_CAPTIONS_PATH = CACHE_DIR / "blip2_captions.json"
 
