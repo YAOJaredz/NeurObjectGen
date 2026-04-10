@@ -7,6 +7,7 @@ CACHE_DIR = REPO_ROOT / "cache"
 RUST_STIM_DIR = REPO_ROOT / "stimuli" / "rust_cropped"
 SIGLIP_EMBEDDINGS_PATH = CACHE_DIR / "siglip_embeddings.pt"
 BLIP2_CAPTIONS_PATH = CACHE_DIR / "blip2_captions.json"
+BLIP2_DETAILED_CAPTIONS_PATH = CACHE_DIR / "blip2_detailed_captions.json"
 
 SEED = 42
 
