@@ -5,6 +5,7 @@ from pathlib import Path
 
 import torch
 
+from config_const import SIGLIP_EMBEDDINGS_PATH
 from data_utils.stimuli import load_stimuli
 from encoders.siglip_embed import embed_images, load_siglip
 
@@ -12,7 +13,7 @@ from encoders.siglip_embed import embed_images, load_siglip
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--device", default="cuda")
-    parser.add_argument("--out", default="cache/siglip_embeddings.pt")
+    parser.add_argument("--out", default=str(SIGLIP_EMBEDDINGS_PATH))
     parser.add_argument("--force", action="store_true")
     args = parser.parse_args()
 

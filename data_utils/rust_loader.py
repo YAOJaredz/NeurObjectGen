@@ -6,8 +6,10 @@ from HexPred.object_response.get_rust_response import get_rust_responses
 # from HexPred.object_response.get_hvm_response import get_hvm_responses
 from HexPred.constants import ALL_MONKEYS
 
+from config_const import N_STIMULI, N_TRAIN, N_VAL, RUST_TIME_WINDOW, SEED
 
-def make_rust_loader(batch_size=64, seed=42) -> tuple[DataLoader, DataLoader, DataLoader]:
+
+def make_rust_loader(batch_size=64, seed=SEED) -> tuple[DataLoader, DataLoader, DataLoader]:
     """Build train/val/test DataLoaders for the RUST neural response dataset.
 
     Loads per-area spike responses for every monkey in ``ALL_MONKEYS`` over the
@@ -32,7 +34,7 @@ def make_rust_loader(batch_size=64, seed=42) -> tuple[DataLoader, DataLoader, Da
     monkey_responses = []
     for monkey in ALL_MONKEYS:
         rsp, _ = get_rust_responses(
-            mode='area', area='all', monkey=monkey, time_window=(0, 250)
+            mode='area', area='all', monkey=monkey, time_window=RUST_TIME_WINDOW
         )
         monkey_responses.append(rsp)
 
@@ -45,17 +47,17 @@ def make_rust_loader(batch_size=64, seed=42) -> tuple[DataLoader, DataLoader, Da
     )
     object_responses = object_responses[:, ~dead_neuron, :]
 
-    assert object_responses.shape[0] == 300, (
-        f"expected 300 stimuli, got {object_responses.shape[0]}"
+    assert object_responses.shape[0] == N_STIMULI, (
+        f"expected {N_STIMULI} stimuli, got {object_responses.shape[0]}"
     )
 
     tensor = torch.from_numpy(object_responses).float()
 
     rng = np.random.default_rng(seed)
-    perm = rng.permutation(300)
-    train_idx = torch.from_numpy(perm[:200]).long()
-    val_idx = torch.from_numpy(perm[200:250]).long()
-    test_idx = torch.from_numpy(perm[250:]).long()
+    perm = rng.permutation(N_STIMULI)
+    train_idx = torch.from_numpy(perm[:N_TRAIN]).long()
+    val_idx = torch.from_numpy(perm[N_TRAIN:N_TRAIN + N_VAL]).long()
+    test_idx = torch.from_numpy(perm[N_TRAIN + N_VAL:]).long()
 
     train_set = TensorDataset(tensor[train_idx])
     val_set = TensorDataset(tensor[val_idx])
