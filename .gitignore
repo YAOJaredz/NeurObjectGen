@@ -210,3 +210,5 @@ __marimo__/
 .codex
 
 test.ipynb
+
+cache/
