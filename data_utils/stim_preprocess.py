@@ -12,7 +12,7 @@ from pathlib import Path
 
 import numpy as np
 from PIL import Image
-from scipy import ndimage
+import scipy
 
 STIMULI_ROOT = Path(__file__).resolve().parent.parent / "stimuli"
 SRC_NAME = "20231025_Rust_NaturalImages300_300ms"
@@ -29,20 +29,20 @@ def compute_bbox(img: Image.Image, pad: int = 2) -> tuple[int, int, int, int]:
     """
     arr = np.asarray(img.convert("RGB"))
     mask = (arr > BG_THRESHOLD).any(axis=-1)
-    labels, n = ndimage.label(mask)
+    labels, n = scipy.ndimage.label(mask) 
     if n == 0:
         raise ValueError("no foreground pixels found")
-    h, w = mask.shape
-    edge_labels = set(labels[0].tolist()) | set(labels[-1].tolist())
+    h, w = mask.shape # type: ignore
+    edge_labels: set[int] = set(labels[0].tolist()) | set(labels[-1].tolist())
     edge_labels |= set(labels[:, 0].tolist()) | set(labels[:, -1].tolist())
     sizes = np.bincount(labels.ravel())
     sizes[0] = 0
     for lbl in edge_labels:
         sizes[lbl] = 0  # drop photodiode / edge artifacts
-    biggest = sizes.argmax()
+    biggest = int(sizes.argmax())
     ys, xs = np.where(labels == biggest)
-    y0, y1 = ys.min(), ys.max() + 1
-    x0, x1 = xs.min(), xs.max() + 1
+    y0, y1 = int(ys.min()), int(ys.max()) + 1
+    x0, x1 = int(xs.min()), int(xs.max()) + 1
     return (
         max(x0 - pad, 0),
         max(y0 - pad, 0),
@@ -56,7 +56,13 @@ def main() -> None:
     dst = STIMULI_ROOT / DST_NAME
     dst.mkdir(parents=True, exist_ok=True)
 
-    pngs = sorted(src.glob("*.png"), key=lambda p: int(INDEX_RE.search(p.name).group(1)))
+    def _index(p: Path) -> int:
+        m = INDEX_RE.search(p.name)
+        if m is None:
+            raise ValueError(f"unexpected filename: {p.name}")
+        return int(m.group(1))
+
+    pngs = sorted(src.glob("*.png"), key=_index)
     if not pngs:
         raise SystemExit(f"no PNGs found in {src}")
 
@@ -65,10 +71,7 @@ def main() -> None:
     print(f"bbox from {pngs[0].name}: {bbox} (w={bbox[2]-bbox[0]}, h={bbox[3]-bbox[1]})")
 
     for p in pngs[:-5]:
-        m = INDEX_RE.search(p.name)
-        if not m:
-            raise ValueError(f"unexpected filename: {p.name}")
-        idx = int(m.group(1))
+        idx = _index(p)
         with Image.open(p) as im:
             im.crop(bbox).save(dst / f"{idx:04d}.png")
 
