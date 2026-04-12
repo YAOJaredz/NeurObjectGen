@@ -52,11 +52,14 @@ def make_rust_loader(
     # stimuli x neurons x time
     object_responses = np.concatenate(monkey_responses, axis=1)
 
-    # drop neurons that are all-zero / all-NaN across stimuli and time
-    dead_neuron = np.all(
-        (object_responses == 0) | np.isnan(object_responses), axis=(0, 2)
+    # drop neurons that are all-zero or contain any NaN across stimuli and time
+    dead_neuron = (
+        np.all((object_responses == 0) | np.isnan(object_responses), axis=(0, 2))
+        | np.any(np.isnan(object_responses), axis=(0, 2))
     )
     object_responses = object_responses[:, ~dead_neuron, :]
+    # replace any remaining zeros with zero (no-op) and verify clean
+    assert not np.isnan(object_responses).any(), "NaN values remain after neuron filtering."
 
     assert object_responses.shape[0] == N_STIMULI, (
         f"expected {N_STIMULI} stimuli, got {object_responses.shape[0]}"

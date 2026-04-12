@@ -12,7 +12,6 @@ Usage examples:
 
 import argparse
 import sys
-from datetime import datetime
 from pathlib import Path
 
 import torch
@@ -36,15 +35,22 @@ from get_device import get_device
 # ---------------------------------------------------------------------------
 
 def run_name(args) -> str:
-    """Unique directory name encoding model type and key hyperparameters."""
-    ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+    """Deterministic directory name encoding all hyperparameters for this run.
+
+    Structure: checkpoints/<model>/<run_name>/
+    """
+    shared = f"do{args.dropout}_lr{args.lr}_wd{args.weight_decay}_tn{args.target_noise}_bs{args.batch_size}_t{args.temperature}"
     if args.model == "mlp":
-        hparams = f"bn{args.bottleneck}"
+        return f"bn{args.bottleneck}_{shared}"
     elif args.model == "lstm":
-        hparams = f"h{args.hidden}"
+        return f"h{args.hidden}_{shared}"
     else:
-        hparams = f"d{args.d_model}_nh{args.n_heads}_nl{args.n_layers}"
-    return f"{args.model}_{hparams}_do{args.dropout}_wd{args.weight_decay}_{ts}"
+        return f"d{args.d_model}_nh{args.n_heads}_nl{args.n_layers}_{shared}"
+
+
+def run_dir(args) -> Path:
+    """checkpoints/<model>/<run_name>/"""
+    return CHECKPOINT_DIR / args.model / run_name(args)
 
 
 def save_checkpoint(path: Path, model, optimizer, scheduler, epoch: int, metrics: dict, args):
@@ -127,13 +133,23 @@ def train_with_embeddings(args):
     sample_neural, _ = next(iter(train_loader))
     _, n_neurons, n_time = sample_neural.shape
 
+    # --- sanity checks before training ---
+    # 1. NaN in neural data
+    all_neural = sample_neural
+    if torch.isnan(all_neural).any():
+        raise ValueError("NaN values detected in neural input — check dead-neuron filtering in rust_loader.")
+
+    # 2. batch too small for InfoNCE
+    if args.batch_size < 2:
+        raise ValueError("batch_size must be >= 2 for InfoNCE loss.")
+
     model = build_model(args, n_neurons, n_time).to(device)
     print(f"Model: {model.__class__.__name__} | params: {sum(p.numel() for p in model.parameters() if p.requires_grad):,}")
 
     optimizer = AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
     scheduler = CosineAnnealingLR(optimizer, T_max=args.epochs)
 
-    ckpt_dir = CHECKPOINT_DIR / run_name(args)
+    ckpt_dir = run_dir(args)
     ckpt_dir.mkdir(parents=True, exist_ok=True)
     print(f"Checkpoints -> {ckpt_dir}")
 
@@ -149,7 +165,16 @@ def train_with_embeddings(args):
 
             x    = prepare_input(neural, args.model)
             pred = model(x)
+            if args.target_noise > 0.0:
+                siglip = F.normalize(siglip + torch.randn_like(siglip) * args.target_noise, dim=-1)
             loss = infonce_loss(pred, siglip, temperature=args.temperature)
+
+            if torch.isnan(loss):
+                raise RuntimeError(
+                    f"NaN loss at epoch {epoch}. "
+                    "Likely causes: NaN in inputs, embeddings not L2-normalised, "
+                    "or temperature too low. Try --temperature 0.1 or higher."
+                )
 
             optimizer.zero_grad()
             loss.backward()
@@ -211,6 +236,8 @@ def parse_args():
 
     # shared
     p.add_argument("--dropout", type=float, default=0.1)
+    p.add_argument("--target-noise", type=float, default=0.0,
+                   help="Std of Gaussian noise added to SigLIP targets during training (re-normalised after)")
 
     # optimisation
     p.add_argument("--epochs", type=int, default=100)

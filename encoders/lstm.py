@@ -22,6 +22,7 @@ class TemporalLSTM(nn.Module):
 
     def __init__(self, n_neurons: int, hidden: int, out_dim: int, dropout: float = 0.0):
         super().__init__()
+        self.input_norm = nn.LayerNorm(n_neurons)
         self.lstm = nn.LSTM(input_size=n_neurons, hidden_size=hidden, batch_first=True)
         self.drop = nn.Dropout(dropout)
         self.proj = nn.Linear(hidden, out_dim)
@@ -34,6 +35,7 @@ class TemporalLSTM(nn.Module):
         Returns:
             (B, out_dim) L2-normalised embedding tensor.
         """
-        _, (h_n, _) = self.lstm(x)           # h_n: (1, B, hidden)
-        out = self.proj(self.drop(h_n.squeeze(0)))  # (B, out_dim)
+        x = self.input_norm(x)                              # normalise across neurons at each time step
+        _, (h_n, _) = self.lstm(x)                         # h_n: (1, B, hidden)
+        out = self.proj(self.drop(h_n.squeeze(0)))          # (B, out_dim)
         return F.normalize(out, dim=-1)
