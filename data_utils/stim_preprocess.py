@@ -14,10 +14,7 @@ import numpy as np
 from PIL import Image
 import scipy
 
-STIMULI_ROOT = Path(__file__).resolve().parent.parent / "stimuli"
-SRC_NAME = "20231025_Rust_NaturalImages300_300ms"
-DST_NAME = "rust_cropped"
-BG_THRESHOLD = 5  # pixels <= this on all channels are background (black)
+from config_const import STIMULI_ROOT, RUST_SRC_NAME, RUST_DST_NAME, RUST_BG_THRESHOLD
 
 INDEX_RE = re.compile(r"index(\d+)\.png$")
 
@@ -28,7 +25,7 @@ def compute_bbox(img: Image.Image, pad: int = 2) -> tuple[int, int, int, int]:
     Ignores small artifacts like the photodiode sync patch in the corner.
     """
     arr = np.asarray(img.convert("RGB"))
-    mask = (arr > BG_THRESHOLD).any(axis=-1)
+    mask = (arr > RUST_BG_THRESHOLD).any(axis=-1)
     labels, n = scipy.ndimage.label(mask) 
     if n == 0:
         raise ValueError("no foreground pixels found")
@@ -52,8 +49,8 @@ def compute_bbox(img: Image.Image, pad: int = 2) -> tuple[int, int, int, int]:
 
 
 def main() -> None:
-    src = STIMULI_ROOT / SRC_NAME
-    dst = STIMULI_ROOT / DST_NAME
+    src = STIMULI_ROOT / RUST_SRC_NAME
+    dst = STIMULI_ROOT / RUST_DST_NAME
     dst.mkdir(parents=True, exist_ok=True)
 
     def _index(p: Path) -> int:
