@@ -6,11 +6,16 @@ from HexPred.object_response.get_rust_response import get_rust_responses
 # from HexPred.object_response.get_hvm_response import get_hvm_responses
 from HexPred.constants import ALL_MONKEYS
 
-from config_const import N_STIMULI, N_TRAIN, N_VAL, RUST_TIME_WINDOW, SEED
+from config_const import N_STIMULI, N_TRAIN, N_VAL, RUST_TIME_WINDOW, SEED, SIGLIP_EMBEDDINGS_PATH
 from data_utils.stimuli import load_rust_stimuli
 
 
-def make_rust_loader(batch_size: int =64, seed: int = SEED, verbose: bool = True) -> tuple[DataLoader, DataLoader, DataLoader]:
+def make_rust_loader(
+    batch_size: int = 64,
+    seed: int = SEED,
+    verbose: bool = True,
+    use_embeddings: bool = False,
+) -> tuple[DataLoader, DataLoader, DataLoader]:
     """Build train/val/test DataLoaders for neural-response → image reconstruction.
 
     Loads per-area spike responses for every monkey in ``ALL_MONKEYS`` over the
@@ -19,14 +24,18 @@ def make_rust_loader(batch_size: int =64, seed: int = SEED, verbose: bool = True
     and time bins, and splits the 300 stimuli into fixed 200/50/50
     train/val/test partitions using a seeded permutation.
 
-    Each sample yielded by the loaders is ``(neural_response, image)`` where
-    ``neural_response`` has shape ``(neurons, time)`` and ``image`` has shape
-    ``(3, 224, 224)``.
+    Each sample yielded by the loaders is ``(neural_response, target)`` where
+    ``neural_response`` has shape ``(neurons, time)`` and ``target`` is either
+    an image of shape ``(3, 224, 224)`` or a pre-cached SigLIP embedding of
+    shape ``(D,)`` depending on ``use_embeddings``.
 
     Args:
-        batch_size: Number of stimuli per batch. Defaults to 64.
-        seed: Seed for the NumPy RNG used to permute stimulus indices. Fixing
-            this guarantees reproducible train/val/test splits. Defaults to 42.
+        batch_size:      Number of stimuli per batch. Defaults to 64.
+        seed:            Seed for the NumPy RNG used to permute stimulus indices.
+        verbose:         Print loader statistics.
+        use_embeddings:  If True, yield pre-cached SigLIP embeddings as targets
+                         instead of raw images. Requires the cache at
+                         SIGLIP_EMBEDDINGS_PATH (run scripts/cache_siglip.py).
 
     Returns:
         A tuple ``(train_loader, val_loader, test_loader)`` of PyTorch
@@ -54,7 +63,16 @@ def make_rust_loader(batch_size: int =64, seed: int = SEED, verbose: bool = True
     )
 
     neural_tensor = torch.from_numpy(object_responses).float()  # (N_STIMULI, neurons, time)
-    image_tensor = load_rust_stimuli()                                # (N_STIMULI, 3, 224, 224)
+
+    if use_embeddings:
+        if not SIGLIP_EMBEDDINGS_PATH.exists():
+            raise FileNotFoundError(
+                f"SigLIP cache not found at {SIGLIP_EMBEDDINGS_PATH}. "
+                "Run: python scripts/cache_siglip.py"
+            )
+        target_tensor = torch.load(SIGLIP_EMBEDDINGS_PATH, weights_only=True)  # (N_STIMULI, D)
+    else:
+        target_tensor = load_rust_stimuli()  # (N_STIMULI, 3, 224, 224)
 
     rng = np.random.default_rng(seed)
     perm = rng.permutation(N_STIMULI)
@@ -62,15 +80,18 @@ def make_rust_loader(batch_size: int =64, seed: int = SEED, verbose: bool = True
     val_idx = torch.from_numpy(perm[N_TRAIN:N_TRAIN + N_VAL]).long()
     test_idx = torch.from_numpy(perm[N_TRAIN + N_VAL:]).long()
 
-    train_set = TensorDataset(neural_tensor[train_idx], image_tensor[train_idx])
-    val_set = TensorDataset(neural_tensor[val_idx], image_tensor[val_idx])
-    test_set = TensorDataset(neural_tensor[test_idx], image_tensor[test_idx])
+    def make(idx, shuffle):
+        return DataLoader(
+            TensorDataset(neural_tensor[idx], target_tensor[idx]),
+            batch_size=batch_size, shuffle=shuffle,
+        )
 
-    train_loader = DataLoader(train_set, batch_size=batch_size, shuffle=True)
-    val_loader = DataLoader(val_set, batch_size=batch_size, shuffle=False)
-    test_loader = DataLoader(test_set, batch_size=batch_size, shuffle=False)
+    train_loader = make(train_idx, shuffle=True)
+    val_loader   = make(val_idx,   shuffle=False)
+    test_loader  = make(test_idx,  shuffle=False)
 
     if verbose:
+        target_shape = tuple(target_tensor.shape[1:])
         print(
             f"RUST loaders created: "
             f"train={train_idx.shape[0]}, "
@@ -78,7 +99,7 @@ def make_rust_loader(batch_size: int =64, seed: int = SEED, verbose: bool = True
             f"test={test_idx.shape[0]}, "
             f"neurons={object_responses.shape[1]}, "
             f"time={object_responses.shape[2]}, "
-            f"image={tuple(image_tensor.shape[1:])}"
+            f"target={target_shape}"
         )
 
     return train_loader, val_loader, test_loader

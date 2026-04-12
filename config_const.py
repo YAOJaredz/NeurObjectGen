@@ -21,3 +21,6 @@ N_VAL = 50
 N_TEST = 50
 
 RUST_TIME_WINDOW = (0, 250)
+
+SIGLIP_DIM = 1152  # google/siglip-so400m-patch14-384
+CHECKPOINT_DIR = REPO_ROOT / "checkpoints"
