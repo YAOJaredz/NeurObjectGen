@@ -4,6 +4,7 @@ from __future__ import annotations
 import torch
 from PIL import Image
 from torchvision import transforms
+from tqdm import tqdm
 
 from config_const import N_STIMULI, RUST_STIM_DIR
 
@@ -11,7 +12,6 @@ _transform = transforms.Compose([
     transforms.Resize(224),
     transforms.CenterCrop(224),
     transforms.ToTensor(),
-    transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
 ])
 
 
@@ -22,7 +22,7 @@ def load_rust_stimuli() -> torch.Tensor:
     in the neural response arrays from rust_loader.py.
     """
     imgs = []
-    for i in range(N_STIMULI):
+    for i in tqdm(range(N_STIMULI), desc="Loading stimuli"):
         path = RUST_STIM_DIR / f"{i:04d}.png"
         with Image.open(path) as im:
             imgs.append(_transform(im.convert("RGB")))
