@@ -5,9 +5,9 @@ Loss: InfoNCE (NT-Xent) contrastive loss aligning predicted embeddings with
 Regularisation: L2 weight decay via AdamW (set with --weight-decay).
 
 Usage examples:
-    python scripts/train_encoder.py --model mlp --bottleneck 128 --dropout 0.2
+    python scripts/train_encoder.py --model mlp --bottleneck 256 --dropout 0.1
     python scripts/train_encoder.py --model lstm --hidden 128 --dropout 0.1
-    python scripts/train_encoder.py --model transformer --d-model 64 --n-heads 4 --n-layers 2
+    python scripts/train_encoder.py --model transformer --d-model 128 --n-heads 4 --n-layers 1
 """
 
 import argparse
@@ -225,14 +225,14 @@ def parse_args():
     p.add_argument("--model", choices=["mlp", "lstm", "transformer"], default="mlp")
 
     # MLP
-    p.add_argument("--bottleneck", type=int, default=128)
+    p.add_argument("--bottleneck", type=int, default=256)
     # LSTM
     p.add_argument("--hidden", type=int, default=128)
 
     # Transformer
-    p.add_argument("--d-model", type=int, default=64)
+    p.add_argument("--d-model", type=int, default=128)
     p.add_argument("--n-heads", type=int, default=4)
-    p.add_argument("--n-layers", type=int, default=2)
+    p.add_argument("--n-layers", type=int, default=1)
 
     # shared
     p.add_argument("--dropout", type=float, default=0.1)
