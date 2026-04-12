@@ -10,6 +10,7 @@ RUST_DST_NAME = "rust_cropped"
 RUST_STIM_DIR = STIMULI_ROOT / RUST_DST_NAME
 RUST_BG_THRESHOLD = 5  # pixels <= this on all channels are background (black)
 SIGLIP_EMBEDDINGS_PATH = CACHE_DIR / "siglip_embeddings.pt"
+RUST_LOSS_MASK_PATH = RUST_STIM_DIR / "loss_mask.pt"
 BLIP2_CAPTIONS_PATH = CACHE_DIR / "blip2_captions.json"
 BLIP2_DETAILED_CAPTIONS_PATH = CACHE_DIR / "blip2_detailed_captions.json"
 
