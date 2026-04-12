@@ -9,6 +9,7 @@
 #SBATCH --mem=48gb
 #SBATCH --time=0-02:00:00
 #SBATCH --partition=issa
+#SBATCH --exclude=ax09,ax10,ax11
 #SBATCH --output=/home/yy3658/NeurObjectGen/jobs/logs/transformer_sweep_%A_%a.log
 #SBATCH --array=0-15%5        # 2 d_models x 2 n_layers x 2 dropouts x 2 lrs = 16
 
@@ -17,11 +18,12 @@
 # ---------------------------------------------------------------------------
 mkdir -p /home/yy3658/NeurObjectGen/jobs/logs
 
-source ~/miniconda3/etc/profile.d/conda.sh
-conda activate objGen
-echo "Activated conda environment: objGen"
+SIF=~/vscode.sif
+PYTHON_BIN=~/miniconda3/envs/objGen/bin/python
+PYTHON="apptainer exec -B /run:/run --mount type=bind,src=/mnt/smb/locker/issa-locker,dst=/mnt/smb/locker/issa-locker --mount type=bind,src=/share/issa,dst=/share/issa --nv $SIF $PYTHON_BIN"
+echo "Using Apptainer: $SIF"
 
-python -V
+$PYTHON -V
 
 # ---------------------------------------------------------------------------
 # Hyperparameter grid
@@ -59,7 +61,7 @@ echo "Task ${SLURM_ARRAY_TASK_ID}: d_model=${D_MODEL} n_layers=${N_LAYER} dropou
 # ---------------------------------------------------------------------------
 # Train
 # ---------------------------------------------------------------------------
-python scripts/train_encoder.py \
+$PYTHON scripts/train_encoder.py \
     --model transformer \
     --d-model      "${D_MODEL}" \
     --n-heads      "${N_HEADS}" \
