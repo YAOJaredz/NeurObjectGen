@@ -1,10 +1,10 @@
 """FLUX.1-dev + IP-Adapter pipeline for neural image reconstruction.
 
-The IP-Adapter approach injects a SigLIP image embedding into the FLUX.1
-transformer via cross-attention projection layers, without full fine-tuning.
-We expose the full manual forward pass (text encode → prepare latents →
-denoise loop → VAE decode) so that neural embeddings can be swapped in
-as the image conditioning signal.
+The IP-Adapter projects a SigLIP/neural embedding into a small set of extra
+"text" tokens and prepends them to the T5 encoder_hidden_states before the
+FLUX transformer forward pass. This lets FLUX's native joint attention attend
+to the image conditioning signal without any modification to the attention
+processor. Only the projection MLP is trainable; all FLUX weights are frozen.
 """
 
 import torch
@@ -16,62 +16,55 @@ from tqdm import tqdm
 
 from config_const import SIGLIP_DIM
 
+# FLUX T5 encoder_hidden_states width — the dim of tokens fed to the transformer.
+FLUX_TEXT_DIM = 4096
+
 
 # ---------------------------------------------------------------------------
-# IP-Adapter: project a SigLIP embedding into the FLUX transformer's
-# cross-attention key/value space for each double-stream block.
+# IP-Adapter: project an image embedding into N extra text tokens that get
+# prepended to the FLUX T5 encoder_hidden_states.
 # ---------------------------------------------------------------------------
 
 class IPAdapterProjection(nn.Module):
-    """Lightweight MLP that maps a SigLIP embedding to per-block K/V pairs.
+    """MLP that maps an image embedding to ``n_tokens`` extra text tokens.
 
-    For each of the ``n_blocks`` double-stream transformer blocks we learn
-    a separate linear projection from the image embedding space into
-    the block's cross-attention dim.  At inference time the projected
-    vectors are injected as extra key/value tokens via forward hooks.
+    The output tokens are prepended to the T5 encoder_hidden_states inside
+    ``generate()``, so FLUX's existing joint attention attends to them as if
+    they were part of the text prompt.
 
     Args:
         image_dim:  Dimensionality of the SigLIP (or neural) embedding.
         hidden_dim: Internal width of the projection MLP.
-        n_blocks:   Number of double-stream blocks in the FLUX transformer.
-        head_dim:   Attention head dimension of the FLUX transformer.
-        n_heads:    Number of attention heads in each block.
+        n_tokens:   Number of extra tokens emitted per sample.
+        text_dim:   Target token dim — must match FLUX's T5 width (4096).
     """
 
     def __init__(
         self,
         image_dim: int,
         hidden_dim: int,
-        n_blocks: int,
-        head_dim: int = 128,
-        n_heads: int = 24,
+        n_tokens: int = 4,
+        text_dim: int = FLUX_TEXT_DIM,
     ):
         super().__init__()
-        cross_dim = head_dim * n_heads  # 3072 for FLUX.1-dev
-        self.to_kv = nn.ModuleList([
-            nn.Sequential(
-                nn.Linear(image_dim, hidden_dim),
-                nn.GELU(),
-                nn.Linear(hidden_dim, cross_dim * 2),  # → [K, V] concatenated
-            )
-            for _ in range(n_blocks)
-        ])
+        self.n_tokens = n_tokens
+        self.text_dim = text_dim
+        self.proj = nn.Sequential(
+            nn.Linear(image_dim, hidden_dim),
+            nn.GELU(),
+            nn.Linear(hidden_dim, n_tokens * text_dim),
+        )
 
-    def forward(self, image_embed: torch.Tensor) -> list[tuple[torch.Tensor, torch.Tensor]]:
-        """Project image_embed into per-block (K, V) pairs.
-
+    def forward(self, image_embed: torch.Tensor) -> torch.Tensor:
+        """
         Args:
             image_embed: (B, image_dim) embedding.
 
         Returns:
-            List of (K, V) tuples, each of shape (B, 1, cross_dim).
+            (B, n_tokens, text_dim) tensor of extra text tokens.
         """
-        kvs = []
-        for proj in self.to_kv:
-            kv = proj(image_embed)  # (B, cross_dim * 2)
-            k, v = kv.chunk(2, dim=-1)
-            kvs.append((k.unsqueeze(1), v.unsqueeze(1)))  # (B, 1, cross_dim)
-        return kvs
+        out = self.proj(image_embed)
+        return out.reshape(image_embed.shape[0], self.n_tokens, self.text_dim)
 
 
 # ---------------------------------------------------------------------------
@@ -80,7 +73,8 @@ class IPAdapterProjection(nn.Module):
 
 def load_pipeline(
     device: str = "cuda",
-    ip_adapter_hidden_dim: int = 512,
+    ip_adapter_hidden_dim: int = 1024,
+    ip_adapter_n_tokens: int = 4,
     ip_adapter_checkpoint: str | None = None,
 ) -> tuple[FluxPipeline, IPAdapterProjection]:
     """Load FLUX.1-dev and an IP-Adapter projection head.
@@ -90,6 +84,7 @@ def load_pipeline(
     Args:
         device:                  Target device.
         ip_adapter_hidden_dim:   Hidden width of the IP-Adapter MLP.
+        ip_adapter_n_tokens:     Number of extra text tokens to emit.
         ip_adapter_checkpoint:   Optional path to a saved IPAdapterProjection
                                  state dict to resume fine-tuning.
 
@@ -113,11 +108,10 @@ def load_pipeline(
     for p in pipe.vae.parameters():
         p.requires_grad_(False)
 
-    n_blocks = len(pipe.transformer.transformer_blocks)
     ip_adapter = IPAdapterProjection(
         image_dim=SIGLIP_DIM,
         hidden_dim=ip_adapter_hidden_dim,
-        n_blocks=n_blocks,
+        n_tokens=ip_adapter_n_tokens,
     ).to(device)
 
     if ip_adapter_checkpoint is not None:
@@ -171,9 +165,10 @@ def generate(
 ) -> Image.Image:
     """Generate an image conditioned on a (neural or SigLIP) image embedding.
 
-    The IP-Adapter projection layers inject the image embedding as extra K/V
-    tokens into each double-stream block of the FLUX transformer via forward
-    hooks.  A text prompt can optionally supplement the neural signal.
+    The IP-Adapter projects the image embedding into ``ip_adapter.n_tokens``
+    extra text tokens that are prepended to the T5 encoder_hidden_states, so
+    FLUX's joint attention attends to them natively.  A text prompt can
+    optionally supplement the neural signal.
 
     Args:
         pipe:               Loaded FluxPipeline (weights frozen).
@@ -185,7 +180,7 @@ def generate(
         num_inference_steps: Number of denoising steps.
         guidance_scale:     FLUX distilled guidance scale (embedded in forward).
         seed:               RNG seed for reproducibility.
-        ip_adapter_scale:   Weight of the IP-Adapter K/V injection.
+        ip_adapter_scale:   Multiplier on the injected IP-Adapter tokens.
         show_progress:      Show tqdm progress bar.
 
     Returns:
@@ -241,59 +236,35 @@ def generate(
 
     guidance = torch.full([1], guidance_scale, device=device, dtype=dtype)
 
-    # --- 4. IP-Adapter: compute per-block K/V projections -------------------
+    # --- 4. IP-Adapter: project image embedding into extra text tokens ------
+    # ip_adapter lives in its own dtype (typically float32); cast the embedding
+    # to match, then cast the projected tokens back to the pipe dtype.
     ip_adapter.eval()
-    block_kvs: list[tuple[torch.Tensor, torch.Tensor]] = ip_adapter(image_embedding)
-    # block_kvs[i] = (K_i, V_i), each (1, 1, cross_dim)
-
-    # Register forward hooks on each double-stream block to inject IP-Adapter
-    # K/V tokens by concatenating them to the existing cross-attention inputs.
-    hooks = []
-
-    def _make_hook(k_ip: torch.Tensor, v_ip: torch.Tensor, scale: float):
-        def hook(module, args, kwargs):
-            # Double-stream blocks receive encoder_hidden_states as the text
-            # side; we inject our image K/V by patching joint_attention_kwargs.
-            if kwargs is None:
-                kwargs = {}
-            # Pass IP tokens through joint_attention_kwargs so the block can
-            # concatenate them.  If the block doesn't support this key we fall
-            # back to a no-op (zero-scale injection).
-            kwargs.setdefault("joint_attention_kwargs", {})
-            kwargs["joint_attention_kwargs"]["ip_adapter_image_embeds"] = (
-                k_ip * scale, v_ip * scale
-            )
-            return args, kwargs
-        return hook
-
-    for block_idx, (block, (k_ip, v_ip)) in enumerate(
-        zip(pipe.transformer.transformer_blocks, block_kvs)
-    ):
-        h = block.register_forward_pre_hook(
-            _make_hook(k_ip, v_ip, ip_adapter_scale), with_kwargs=True
-        )
-        hooks.append(h)
+    ip_dtype = next(ip_adapter.parameters()).dtype
+    ip_tokens = ip_adapter(image_embedding.to(ip_dtype)).to(dtype) * ip_adapter_scale
+    # (1, n_tokens, 4096) — prepend to the T5 encoder_hidden_states so FLUX's
+    # joint attention attends to them as additional text tokens.
+    prompt_embeds = torch.cat([ip_tokens, prompt_embeds], dim=1)
+    # Extend txt_ids with zero-position entries for the IP tokens.
+    ip_ids = torch.zeros(ip_tokens.shape[1], text_ids.shape[-1], device=device, dtype=text_ids.dtype)
+    text_ids = torch.cat([ip_ids, text_ids], dim=0)
 
     # --- 5. Denoising loop ---------------------------------------------------
-    try:
-        iterator = tqdm(enumerate(timesteps), total=len(timesteps)) if show_progress else enumerate(timesteps)
-        for _, t in iterator:
-            t_input = torch.as_tensor(t, device=device).expand(latents.shape[0]).to(latents.dtype)
-            noise_pred = pipe.transformer(
-                hidden_states=latents,
-                timestep=t_input / 1000,
-                guidance=guidance,
-                encoder_hidden_states=prompt_embeds,
-                pooled_projections=pooled_prompt_embeds,
-                txt_ids=text_ids,
-                img_ids=latent_image_ids,
-                joint_attention_kwargs=None,
-                return_dict=False,
-            )[0]
-            latents = pipe.scheduler.step(noise_pred, t, latents, return_dict=False)[0]
-    finally:
-        for h in hooks:
-            h.remove()
+    iterator = tqdm(enumerate(timesteps), total=len(timesteps)) if show_progress else enumerate(timesteps)
+    for _, t in iterator:
+        t_input = torch.as_tensor(t, device=device).expand(latents.shape[0]).to(latents.dtype)
+        noise_pred = pipe.transformer(
+            hidden_states=latents,
+            timestep=t_input / 1000,
+            guidance=guidance,
+            encoder_hidden_states=prompt_embeds,
+            pooled_projections=pooled_prompt_embeds,
+            txt_ids=text_ids,
+            img_ids=latent_image_ids,
+            joint_attention_kwargs=None,
+            return_dict=False,
+        )[0]
+        latents = pipe.scheduler.step(noise_pred, t, latents, return_dict=False)[0]
 
     # --- 6. Decode -----------------------------------------------------------
     latents = pipe._unpack_latents(latents, height, width, pipe.vae_scale_factor)
