@@ -14,7 +14,30 @@ from PIL import Image
 import torchvision.transforms as T
 from tqdm import tqdm
 
-from config_const import SIGLIP_DIM
+from config_const import RUST_LOSS_MASK_PATH, SIGLIP_DIM
+
+
+def _load_packed_aperture_mask(
+    image_size: int,
+    device: torch.device | str,
+    dtype: torch.dtype,
+) -> torch.Tensor:
+    """Load the cached training loss mask and binarise it for compositing.
+
+    The cache at RUST_LOSS_MASK_PATH stores {'mask', 'params'} where mask is
+    (1, packed_seq_len, 1) soft-pooled values in [0, 1]. We binarise so the
+    composite is a hard inside/outside split aligned with the trained area.
+    """
+    blob = torch.load(RUST_LOSS_MASK_PATH, weights_only=False, map_location="cpu")
+    mask = blob["mask"]
+    params = blob.get("params", {})
+    cached_size = params.get("image_size")
+    if cached_size != image_size:
+        raise ValueError(
+            f"loss mask at {RUST_LOSS_MASK_PATH} was built for image_size={cached_size}, "
+            f"but generate_img2img was called with height={image_size}"
+        )
+    return (mask > 0.5).to(device=device, dtype=dtype)
 
 # FLUX T5 encoder_hidden_states width — the dim of tokens fed to the transformer.
 FLUX_TEXT_DIM = 4096
@@ -69,6 +92,54 @@ class IPAdapterProjection(nn.Module):
         return out.reshape(image_embed.shape[0], self.n_tokens, self.text_dim)
 
 
+class PatchIPAdapterProjection(nn.Module):
+    """Per-token linear projection from SigLIP patch features to FLUX text tokens.
+
+    Each spatial token is projected independently — no cross-token mixing — so
+    the spatial structure of the SigLIP patch grid is preserved into the FLUX
+    encoder_hidden_states. The unconditional / null token used by CFG and by
+    embedding-dropout during training is a learned (1, n_tokens, text_dim)
+    parameter; projecting all-zeros through a per-token linear would give
+    n_tokens identical tokens, which is a degenerate "null."
+
+    Args:
+        image_dim: Dim of each input patch token (e.g. 1152 for SigLIP).
+        n_tokens:  Number of spatial tokens in the patch grid (e.g. 196).
+        text_dim:  Target token dim — must match FLUX's T5 width (4096).
+    """
+
+    def __init__(
+        self,
+        image_dim: int,
+        n_tokens: int,
+        text_dim: int = FLUX_TEXT_DIM,
+    ):
+        super().__init__()
+        self.image_dim = image_dim
+        self.n_tokens = n_tokens
+        self.text_dim = text_dim
+        self.proj = nn.Linear(image_dim, text_dim)
+        self.null_tokens = nn.Parameter(torch.zeros(1, n_tokens, text_dim))
+        nn.init.normal_(self.null_tokens, std=0.02)
+
+    def forward(self, patch_embed: torch.Tensor) -> torch.Tensor:
+        """
+        Args:
+            patch_embed: (B, n_tokens, image_dim) patch-grid embedding.
+
+        Returns:
+            (B, n_tokens, text_dim) tensor of extra text tokens.
+        """
+        assert patch_embed.shape[1] == self.n_tokens, (
+            f"expected n_tokens={self.n_tokens}, got {patch_embed.shape[1]}"
+        )
+        return self.proj(patch_embed)
+
+    def null(self, batch_size: int) -> torch.Tensor:
+        """Return the learned unconditional tokens broadcast to batch_size."""
+        return self.null_tokens.expand(batch_size, -1, -1)
+
+
 # ---------------------------------------------------------------------------
 # Pipeline loading
 # ---------------------------------------------------------------------------
@@ -79,7 +150,8 @@ def load_pipeline(
     ip_adapter_n_tokens: int = 4,
     ip_adapter_dropout: float = 0.1,
     ip_adapter_checkpoint: str | None = None,
-) -> tuple[FluxPipeline, IPAdapterProjection]:
+    patch_grid: int | None = None,
+) -> tuple[FluxPipeline, nn.Module]:
     """Load FLUX.1-dev and an IP-Adapter projection head.
 
     The FLUX weights are frozen; only the IPAdapterProjection is trainable.
@@ -111,12 +183,19 @@ def load_pipeline(
     for p in pipe.vae.parameters():
         p.requires_grad_(False)
 
-    ip_adapter = IPAdapterProjection(
-        image_dim=SIGLIP_DIM,
-        hidden_dim=ip_adapter_hidden_dim,
-        n_tokens=ip_adapter_n_tokens,
-        dropout=ip_adapter_dropout,
-    ).to(device)
+    if patch_grid is not None:
+        n_patch_tokens = patch_grid * patch_grid
+        ip_adapter: nn.Module = PatchIPAdapterProjection(
+            image_dim=SIGLIP_DIM,
+            n_tokens=n_patch_tokens,
+        ).to(device)
+    else:
+        ip_adapter = IPAdapterProjection(
+            image_dim=SIGLIP_DIM,
+            hidden_dim=ip_adapter_hidden_dim,
+            n_tokens=ip_adapter_n_tokens,
+            dropout=ip_adapter_dropout,
+        ).to(device)
 
     if ip_adapter_checkpoint is not None:
         state = torch.load(ip_adapter_checkpoint, map_location=device, weights_only=True)
@@ -133,8 +212,16 @@ def load_pipeline(
 # ---------------------------------------------------------------------------
 
 def _encode_image(pipe: FluxPipeline, pil_image: Image.Image) -> torch.Tensor:
-    transform = T.Compose([T.ToTensor(), T.Normalize([0.5], [0.5])])
-    x = torch.as_tensor(transform(pil_image))
+    """VAE-encode a PIL image after converting to grayscale-replicated-3ch.
+
+    The training script encodes images as luminance replicated across the three
+    RGB channels (see prepare_latents in train_ip_adapter_img2img.py). Inference
+    must match that distribution or the adapter operates off-manifold.
+    """
+    x = T.ToTensor()(pil_image.convert("RGB"))                              # (3, H, W) in [0,1]
+    gray = 0.2989 * x[0:1] + 0.5870 * x[1:2] + 0.1140 * x[2:3]              # (1, H, W)
+    x = gray.expand(3, -1, -1).contiguous()                                  # (3, H, W)
+    x = x * 2 - 1                                                            # [-1, 1]
     x = x.unsqueeze(0).to(pipe.vae.device, dtype=pipe.vae.dtype)
     with torch.no_grad():
         latent = pipe.vae.encode(x).latent_dist.sample()
@@ -322,7 +409,9 @@ def generate_img2img(
         ip_adapter:          Trained IPAdapterProjection.
         init_image:          PIL image used as the starting latent (resized to
                              height × width before encoding).
-        image_embedding:     (1, D) or (D,) SigLIP or neural embedding tensor.
+        image_embedding:     For a global IP-Adapter: (1, D) or (D,) SigLIP /
+                             neural embedding. For a PatchIPAdapterProjection:
+                             (1, K, D) or (K, D) per-token patch embeddings.
         strength:            Noise strength in [0, 1].  1.0 = pure noise (same
                              as generate()); 0.0 = no denoising (VAE round-trip).
         prompt:              Optional text prompt.
@@ -343,9 +432,17 @@ def generate_img2img(
     dtype  = torch.bfloat16
     generator = torch.Generator(device).manual_seed(seed)
 
-    # Normalise embedding shape to (1, D)
-    if image_embedding.dim() == 1:
-        image_embedding = image_embedding.unsqueeze(0)
+    is_patch_adapter = isinstance(ip_adapter, PatchIPAdapterProjection)
+
+    if is_patch_adapter:
+        # (K, D) → (1, K, D)
+        if image_embedding.dim() == 2:
+            image_embedding = image_embedding.unsqueeze(0)
+        assert image_embedding.dim() == 3, \
+            f"PatchIPAdapter expects (1, K, D); got {tuple(image_embedding.shape)}"
+    else:
+        if image_embedding.dim() == 1:
+            image_embedding = image_embedding.unsqueeze(0)
     image_embedding = image_embedding.to(device, dtype=dtype)
 
     # --- IP-Adapter tokens --------------------------------------------------
@@ -355,10 +452,14 @@ def generate_img2img(
     cond_tokens = ip_adapter(image_embedding.to(ip_dtype)).to(dtype) * ip_adapter_scale
     # (1, n_tokens, 4096)
 
-    # Unconditional tokens: project the null (zero) embedding, matching the
-    # training-time dropout null condition.
-    null_embed   = torch.zeros_like(image_embedding.to(ip_dtype))
-    uncond_tokens = ip_adapter(null_embed).to(dtype) * ip_adapter_scale
+    # Unconditional tokens. For the patch adapter we use the learned null
+    # parameter; for the global adapter we project a zero embedding (matches
+    # the training-time dropout null).
+    if is_patch_adapter:
+        uncond_tokens = ip_adapter.null(1).to(dtype) * ip_adapter_scale
+    else:
+        null_embed   = torch.zeros_like(image_embedding.to(ip_dtype))
+        uncond_tokens = ip_adapter(null_embed).to(dtype) * ip_adapter_scale
     # (1, n_tokens, 4096)
 
     ip_ids = torch.zeros(cond_tokens.shape[1], 3, device=device, dtype=dtype)
@@ -419,6 +520,19 @@ def generate_img2img(
     t_start = timesteps[0:1].to(dtype)
     latents = pipe.scheduler.scale_noise(init_latent_packed, t_start, noise)
 
+    # Aperture mask: 1 in trained area (circle minus center fixation),
+    # 0 in untrained area. After each denoising step we paste a freshly
+    # noised version of the original init latent into the untrained area
+    # so it always shows the original.
+    aperture_mask = _load_packed_aperture_mask(
+        image_size=height,
+        device=device,
+        dtype=dtype,
+    )  # (1, seq, 1)
+    assert aperture_mask.shape[1] == init_latent_packed.shape[1], (
+        f"mask seq {aperture_mask.shape[1]} != latent seq {init_latent_packed.shape[1]}"
+    )
+
     guidance = torch.full([1], guidance_scale, device=device, dtype=dtype)
 
     # --- Denoising loop ------------------------------------------------------
@@ -458,6 +572,16 @@ def generate_img2img(
             noise_pred = pred_cond
 
         latents = pipe.scheduler.step(noise_pred, t, latents, return_dict=False)[0]
+
+        # Composite: keep the trained area from the model, paste the original
+        # init latent (re-noised to the *next* timestep) into the untrained area.
+        step_idx = (timesteps == t).nonzero(as_tuple=True)[0].item()
+        if step_idx + 1 < len(timesteps):
+            t_next = timesteps[step_idx + 1 : step_idx + 2].to(dtype)
+            init_noisy = pipe.scheduler.scale_noise(init_latent_packed, t_next, noise)
+        else:
+            init_noisy = init_latent_packed  # final step → use clean init
+        latents = aperture_mask * latents + (1.0 - aperture_mask) * init_noisy
 
     # --- Decode --------------------------------------------------------------
     latents = pipe._unpack_latents(latents, height, width, pipe.vae_scale_factor)

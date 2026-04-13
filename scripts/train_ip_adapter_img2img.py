@@ -1,14 +1,17 @@
 """Train the IP-Adapter projection with an img2img flow-matching objective.
 
 Unlike ``train_ip_adapter.py`` which samples timesteps over the full range
-(0, 1) and uses an MSE velocity loss, this script makes two changes:
+(0, 1), this script restricts training timesteps to [strength_min, strength_max]
+to match the partial-noise regime used by ``generate_img2img()`` at inference.
 
-1. Restricts training timesteps to [strength_min, strength_max] to match the
-   partial-noise regime used by ``generate_img2img()`` at inference.
-2. Uses an x0-prediction L1 loss: the predicted velocity is converted back to
-   a clean-latent estimate (x0_pred = (xt - t*v) / (1-t)) and L1 is applied
-   against the true clean latent. This directly optimises for image similarity
-   rather than velocity-space agreement and produces sharper reconstructions.
+A linear curriculum on strength_min ramps from STRENGTH_MIN_START up to
+STRENGTH_MIN_END across training so the adapter first learns near the easy
+low-noise regime and progressively faces harder high-noise samples.
+
+Loss: x0-space MSE against the ground-truth clean latent. Implemented as
+weighted velocity MSE with weight (t/(1-t))^2, which is algebraically
+identical to ‖x0_pred - x0‖^2 but avoids the numerical blow-up of dividing
+by (1-t). Cancels the high-t gradient dominance that drives mean-seeking blur.
 
 Embedding source is switchable via ``--embedding-source``:
   siglip  (default) — ground-truth SigLIP embeddings from cache
@@ -17,7 +20,6 @@ Embedding source is switchable via ``--embedding-source``:
 Usage:
     python scripts/train_ip_adapter_img2img.py \\
         --embedding-source siglip \\
-        --strength-min 0.5 --strength-max 0.9 \\
         --epochs 100 --batch-size 32 --micro-batch 2
 """
 
@@ -44,10 +46,21 @@ from config_const import (
     SEED,
     SIGLIP_DIM,
     SIGLIP_EMBEDDINGS_PATH,
+    SIGLIP_PATCH8_PATH,
+    SIGLIP_PATCH14_PATH,
 )
 from data_utils.stimuli import load_rust_stimuli
 from generation.flux_ipadapter import load_pipeline
 from get_device import get_device
+
+
+# --- Strength curriculum (hardcoded) ---------------------------------------
+# Linearly ramp the lower bound of the training timestep range from
+# STRENGTH_MIN_START at epoch 1 up to STRENGTH_MIN_END at the final epoch.
+# Upper bound STRENGTH_MAX is fixed.
+STRENGTH_MIN_START = 0.3
+STRENGTH_MIN_END   = 0.6
+STRENGTH_MAX       = 0.9
 
 
 # ---------------------------------------------------------------------------
@@ -149,12 +162,16 @@ def make_packed_loss_mask(
 # ---------------------------------------------------------------------------
 
 def run_dir(args) -> Path:
+    if args.patch_grid is not None:
+        head = f"patch{args.patch_grid}"
+    else:
+        head = f"ntok{args.n_tokens}_hid{args.hidden}"
     name = (
-        f"ntok{args.n_tokens}_hid{args.hidden}"
+        f"{head}"
         f"_lr{args.lr}_wd{args.weight_decay}"
         f"_size{args.image_size}"
         f"_emb{args.embedding_source}"
-        f"_s{args.strength_min}-{args.strength_max}"
+        f"_s{STRENGTH_MIN_START}-{STRENGTH_MIN_END}-{STRENGTH_MAX}"
     )
     return CHECKPOINT_DIR / "ip_adapter_img2img" / name
 
@@ -170,13 +187,27 @@ def load_train_embeddings(args, train_idx: torch.Tensor, device: torch.device) -
     neural  — embeddings predicted by the best trained neural encoder
     """
     if args.embedding_source == "siglip":
-        if not SIGLIP_EMBEDDINGS_PATH.exists():
+        if args.patch_grid is None:
+            cache_path = SIGLIP_EMBEDDINGS_PATH
+        elif args.patch_grid == 14:
+            cache_path = SIGLIP_PATCH14_PATH
+        elif args.patch_grid == 8:
+            cache_path = SIGLIP_PATCH8_PATH
+        else:
+            raise ValueError(f"unsupported --patch-grid {args.patch_grid}")
+        if not cache_path.exists():
             raise FileNotFoundError(
-                f"SigLIP cache not found at {SIGLIP_EMBEDDINGS_PATH}. "
+                f"SigLIP cache not found at {cache_path}. "
                 "Run: python scripts/cache_siglip.py"
             )
-        all_embeds = torch.load(SIGLIP_EMBEDDINGS_PATH, weights_only=True)  # (300, 1152)
+        all_embeds = torch.load(cache_path, weights_only=True)
         return all_embeds[train_idx].to(device)
+
+    if args.patch_grid is not None:
+        raise NotImplementedError(
+            "Neural embedding source with --patch-grid is not implemented yet. "
+            "Train the SigLIP-source patch adapter first to establish a ceiling."
+        )
 
     # neural: run best encoder on training neural responses
     from data_utils.rust_loader import make_rust_loader
@@ -263,6 +294,7 @@ def train(args):
         ip_adapter_hidden_dim=args.hidden,
         ip_adapter_n_tokens=args.n_tokens,
         ip_adapter_dropout=args.mlp_dropout,
+        patch_grid=args.patch_grid,
     )
     ip_adapter.float()
     for p in ip_adapter.parameters():
@@ -306,9 +338,12 @@ def train(args):
     pipe.text_encoder_2.to("cpu")
     torch.cuda.empty_cache()
 
-    # Null embedding for unconditional tokens — recomputed each forward pass
-    # from the current adapter weights so it stays consistent as the MLP trains.
-    null_embed = torch.zeros(1, train_embeds.shape[-1], device=device)
+    # Null embedding for unconditional tokens (global adapter only).
+    # The patch adapter has its own learned null parameter; we don't need this.
+    if args.patch_grid is None:
+        null_embed = torch.zeros(1, train_embeds.shape[-1], device=device)
+    else:
+        null_embed = None
 
     n_train = clean_latents.shape[0]
     micro_batch = args.micro_batch
@@ -333,15 +368,22 @@ def train(args):
     ckpt_dir = run_dir(args)
     ckpt_dir.mkdir(parents=True, exist_ok=True)
     print(f"Checkpoints -> {ckpt_dir}")
-    print(f"Strength range: [{args.strength_min}, {args.strength_max}]")
+    print(f"Strength curriculum: t_lo {STRENGTH_MIN_START} -> {STRENGTH_MIN_END}, t_hi={STRENGTH_MAX}")
 
     best_loss = float("inf")
-    ip_ids = torch.zeros(ip_adapter.n_tokens, 3, device=device, dtype=bf16)
+    n_ip_tokens = ip_adapter.n_tokens
+    ip_ids = torch.zeros(n_ip_tokens, 3, device=device, dtype=bf16)
 
-    t_lo = args.strength_min
-    t_hi = args.strength_max
+    t_hi = STRENGTH_MAX
 
     for epoch in range(1, args.epochs + 1):
+        # Linear curriculum on the lower strength bound.
+        if args.epochs > 1:
+            frac = (epoch - 1) / (args.epochs - 1)
+        else:
+            frac = 1.0
+        t_lo = STRENGTH_MIN_START + (STRENGTH_MIN_END - STRENGTH_MIN_START) * frac
+
         ip_adapter.train()
         perm_e = torch.randperm(n_train)
         epoch_loss = 0.0
@@ -358,16 +400,11 @@ def train(args):
             b = idx.shape[0]
 
             x0  = clean_latents[idx].to(device, dtype=bf16)   # (b, seq, 64)
-            emb = train_embeds[idx].clone()                    # (b, 1152)
+            emb = train_embeds[idx]                            # (b, 1152) or (b, K, 1152)
 
-            # --- Embedding augmentation (training only) ---
-            # 1. Gaussian noise: simulates the gap between ground-truth SigLIP
-            #    embeddings (train) and noisy neural-predicted embeddings (inference).
-            if args.embed_noise_std > 0:
-                emb = emb + args.embed_noise_std * torch.randn_like(emb)
-            # 2. Embedding dropout: for dropped samples substitute the pre-computed
-            #    unconditional tokens directly rather than projecting a zero vector.
-            #    This gives the model a stable null anchor for CFG-style guidance.
+            # Embedding dropout: for dropped samples substitute the pre-computed
+            # unconditional tokens directly rather than projecting a zero vector.
+            # This gives the model a stable null anchor for CFG-style guidance.
             if args.embed_dropout > 0:
                 is_dropped = torch.rand(b, device=device) < args.embed_dropout  # (b,)
             else:
@@ -386,10 +423,12 @@ def train(args):
             xt     = (1 - t[:, None, None]) * x0 + t[:, None, None] * noise
 
             ip_tokens = ip_adapter(emb.float()).to(bf16)      # (b, n_tokens, 4096)
-            # Replace dropped samples with unconditional tokens — the projection
-            # of the null (zero) embedding under the current adapter weights.
+            # Replace dropped samples with unconditional tokens.
             if is_dropped.any():
-                uncond_tokens = ip_adapter(null_embed.float()).to(bf16)  # (1, n_tokens, 4096)
+                if args.patch_grid is None:
+                    uncond_tokens = ip_adapter(null_embed.float()).to(bf16)  # (1, n_tokens, 4096)
+                else:
+                    uncond_tokens = ip_adapter.null(1).to(bf16)              # (1, n_tokens, 4096)
                 ip_tokens[is_dropped] = uncond_tokens.expand(is_dropped.sum(), -1, -1)
 
             guidance  = torch.full([b], args.guidance_scale, device=device, dtype=bf16)
@@ -407,16 +446,15 @@ def train(args):
                 return_dict=False,
             )[0]
 
-            # x0-prediction loss with L1:
-            # Convert predicted velocity → x0 estimate via the flow ODE inverse:
-            #   xt = (1-t)*x0 + t*noise  →  x0 = (xt - t*pred) / (1-t)
-            # At low t (our regime) (1-t) is well away from zero, so this is stable.
-            # L1 on x0 directly optimises for clean-image similarity rather than
-            # velocity-space agreement, giving sharper reconstructions.
-            x0_pred = (xt - t[:, None, None] * pred.to(bf16)) / (1 - t[:, None, None])
-            err   = (x0_pred.float() - x0.float()).abs()       # L1, (b, seq, 64)
-            denom = mask.sum() * err.shape[-1]
+            # Weighted velocity MSE ≡ x0-space MSE against the clean latent.
+            # ‖x0_pred - x0‖² = (t/(1-t))² · ‖pred - (noise - x0)‖²
+            target = (noise - x0).float()
+            err    = (pred.float() - target) ** 2              # (b, seq, 64)
+            t_f    = t.float()
+            x0_weight = (t_f / (1.0 - t_f)) ** 2               # (b,)
+            denom  = mask.sum() * err.shape[-1]
             per_sample_loss = (err * mask).sum(dim=(1, 2)) / denom   # (b,)
+            per_sample_loss = per_sample_loss * x0_weight
             micro_loss = per_sample_loss.mean()
             loss = micro_loss * (b / args.batch_size)
             loss.backward()
@@ -468,10 +506,13 @@ def train(args):
                     return_dict=False,
                 )[0]
 
-                x0_pred = (xt - t[:, None, None] * pred.to(bf16)) / (1 - t[:, None, None])
-                err     = (x0_pred.float() - x0.float()).abs()
-                denom   = mask.sum() * err.shape[-1]
-                val_loss += (err * mask).sum(dim=(1, 2)).sum().item() / denom.item()
+                target = (noise - x0).float()
+                err    = (pred.float() - target) ** 2
+                t_f    = t.float()
+                x0_weight = (t_f / (1.0 - t_f)) ** 2
+                denom  = mask.sum() * err.shape[-1]
+                per_sample = (err * mask).sum(dim=(1, 2)) / denom
+                val_loss += (per_sample * x0_weight).sum().item()
 
         val_loss /= n_val
         current_lr = optimizer.param_groups[0]["lr"]
@@ -480,6 +521,7 @@ def train(args):
             f"  train={epoch_loss:.5f}"
             f"  val={val_loss:.5f}"
             f"  lr={current_lr:.2e}"
+            f"  t_lo={t_lo:.3f}"
         )
 
         ckpt = {
@@ -514,21 +556,19 @@ def parse_args():
     p.add_argument("--embedding-source",  type=str,   default="siglip",
                    choices=["siglip", "neural"],
                    help="siglip: ground-truth SigLIP embeddings; neural: best encoder predictions")
-    p.add_argument("--strength-min",      type=float, default=0.5,
-                   help="Lower bound of the partial-noise range for img2img training")
-    p.add_argument("--strength-max",      type=float, default=0.9,
-                   help="Upper bound of the partial-noise range for img2img training")
     p.add_argument("--mlp-dropout",       type=float, default=0.1,
                    help="Dropout rate inside the IP-Adapter MLP (between the two linear layers)")
     p.add_argument("--embed-dropout",     type=float, default=0.1,
                    help="Probability of zeroing the entire embedding for a sample (CFG-style)")
-    p.add_argument("--embed-noise-std",   type=float, default=0.05,
-                   help="Std of Gaussian noise added to embeddings during training")
+    p.add_argument("--patch-grid",        type=int,   default=None, choices=[8, 14],
+                   help="If set, use the per-patch SigLIP cache and a PatchIPAdapterProjection "
+                        "(K = patch_grid**2 spatial tokens). If unset, use the global CLS embedding "
+                        "with the original IPAdapterProjection.")
     return p.parse_args()
 
 
 if __name__ == "__main__":
     args = parse_args()
-    assert 0.0 <= args.strength_min < args.strength_max <= 1.0, \
-        "strength_min and strength_max must satisfy 0 <= min < max <= 1"
+    assert 0.0 <= STRENGTH_MIN_START <= STRENGTH_MIN_END < STRENGTH_MAX <= 1.0, \
+        "strength curriculum must satisfy 0 <= start <= end < max <= 1"
     train(args)

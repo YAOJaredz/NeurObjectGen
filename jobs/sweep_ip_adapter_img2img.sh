@@ -1,6 +1,7 @@
 #!/bin/bash
 # Sweep img2img IP-Adapter hyperparameters via SLURM job arrays.
 # Grid: 3 n_tokens x 3 hiddens = 9 runs
+# n_tokens reduced to 4/8/16 to limit disruption to FLUX's T5 attention.
 # Embedding source: siglip (switch to neural after initial validation)
 
 #SBATCH --job-name=ip_adapter_img2img
@@ -34,7 +35,7 @@ export PYTHONPATH="/home/yy3658/NeurObjectGen${PYTHONPATH:+:${PYTHONPATH}}"
 # ---------------------------------------------------------------------------
 # Hyperparameter grid
 # ---------------------------------------------------------------------------
-N_TOKENS=(32 64 128)
+N_TOKENS=(4 8 16)
 HIDDENS=(128 512 1024)
 
 N_TOK=${#N_TOKENS[@]}   # 3
@@ -61,8 +62,6 @@ $PYTHON scripts/train_ip_adapter_img2img.py \
     --guidance-scale   3.5             \
     --epochs           50              \
     --batch-size       32              \
-    --micro-batch      2               \
+    --micro-batch      4               \
     --weight-decay     1e-4            \
-    --embedding-source neural          \
-    --strength-min     0.5             \
-    --strength-max     0.9
+    --embedding-source neural

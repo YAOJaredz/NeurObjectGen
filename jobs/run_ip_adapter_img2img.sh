@@ -25,13 +25,10 @@ export PYTHONPATH="/home/yy3658/NeurObjectGen${PYTHONPATH:+:${PYTHONPATH}}"
 
 $PYTHON scripts/train_ip_adapter_img2img.py \
     --embedding-source siglip  \
-    --hidden           1024    \
-    --n-tokens         128     \
+    --patch-grid       14      \
     --lr               1e-3    \
     --epochs           50      \
     --batch-size       32      \
     --micro-batch      2       \
     --weight-decay     1e-4    \
-    --guidance-scale   3.5     \
-    --strength-min     0.5     \
-    --strength-max     0.9
+    --guidance-scale   3.5
