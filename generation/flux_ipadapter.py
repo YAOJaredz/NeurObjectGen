@@ -45,6 +45,7 @@ class IPAdapterProjection(nn.Module):
         hidden_dim: int,
         n_tokens: int = 4,
         text_dim: int = FLUX_TEXT_DIM,
+        dropout: float = 0.1,
     ):
         super().__init__()
         self.n_tokens = n_tokens
@@ -52,6 +53,7 @@ class IPAdapterProjection(nn.Module):
         self.proj = nn.Sequential(
             nn.Linear(image_dim, hidden_dim),
             nn.GELU(),
+            nn.Dropout(dropout),
             nn.Linear(hidden_dim, n_tokens * text_dim),
         )
 
@@ -75,6 +77,7 @@ def load_pipeline(
     device: str = "cuda",
     ip_adapter_hidden_dim: int = 1024,
     ip_adapter_n_tokens: int = 4,
+    ip_adapter_dropout: float = 0.1,
     ip_adapter_checkpoint: str | None = None,
 ) -> tuple[FluxPipeline, IPAdapterProjection]:
     """Load FLUX.1-dev and an IP-Adapter projection head.
@@ -112,6 +115,7 @@ def load_pipeline(
         image_dim=SIGLIP_DIM,
         hidden_dim=ip_adapter_hidden_dim,
         n_tokens=ip_adapter_n_tokens,
+        dropout=ip_adapter_dropout,
     ).to(device)
 
     if ip_adapter_checkpoint is not None:
