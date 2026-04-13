@@ -6,8 +6,8 @@
 #SBATCH --account=yy3658
 #SBATCH --chdir=/home/yy3658/NeurObjectGen
 #SBATCH --ntasks=1
-#SBATCH --cpus-per-task=4
-#SBATCH --mem=64gb
+#SBATCH --cpus-per-task=1
+#SBATCH --mem=24gb
 #SBATCH --time=0-06:00:00
 #SBATCH --partition=issa
 #SBATCH --nodelist=ax11
@@ -25,6 +25,9 @@ PYTHON="apptainer exec -B /run:/run --mount type=bind,src=/mnt/smb/locker/issa-l
 echo "Using Apptainer: $SIF"
 
 $PYTHON -V
+
+cd /home/yy3658/NeurObjectGen
+export PYTHONPATH="/home/yy3658/NeurObjectGen${PYTHONPATH:+:${PYTHONPATH}}"
 
 # ---------------------------------------------------------------------------
 # Hyperparameter grid
@@ -52,6 +55,13 @@ HIDDEN=${HIDDENS[$HID_IDX]}
 echo "Task ${SLURM_ARRAY_TASK_ID}: lr=${LR} n_tokens=${N_TOK_VAL} hidden=${HIDDEN}"
 
 # ---------------------------------------------------------------------------
+# TEMPORARY: skip run already in progress with default hyperparameters.
+if [ "${N_TOK_VAL}" = "128" ] && [ "${HIDDEN}" = "1024" ] && [ "${LR}" = "1e-3" ]; then
+    echo "Skipping task ${TASK_ID} — ntok128_hid1024_lr0.001 already running"
+    exit 0
+fi
+
+# ---------------------------------------------------------------------------
 # Train
 # ---------------------------------------------------------------------------
 $PYTHON scripts/train_ip_adapter.py \
@@ -61,5 +71,5 @@ $PYTHON scripts/train_ip_adapter.py \
     --guidance-scale  3.5           \
     --epochs          100           \
     --batch-size      32            \
-    --micro-batch     4             \
+    --micro-batch     2             \
     --weight-decay    1e-4

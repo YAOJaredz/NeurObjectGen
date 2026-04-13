@@ -116,6 +116,8 @@ def load_pipeline(
 
     if ip_adapter_checkpoint is not None:
         state = torch.load(ip_adapter_checkpoint, map_location=device, weights_only=True)
+        if "ip_adapter_state" in state:
+            state = state["ip_adapter_state"]
         ip_adapter.load_state_dict(state)
         print(f"Loaded IP-Adapter from {ip_adapter_checkpoint}")
 

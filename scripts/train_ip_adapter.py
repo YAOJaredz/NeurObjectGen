@@ -26,6 +26,7 @@ from torch.optim import AdamW
 from torch.optim.lr_scheduler import OneCycleLR
 from tqdm import tqdm
 
+sys.path.insert(0, ".")
 from config_const import (
     CHECKPOINT_DIR,
     N_STIMULI,
