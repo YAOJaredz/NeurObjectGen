@@ -12,7 +12,7 @@
 #SBATCH --partition=issa
 #SBATCH --nodelist=ax11
 #SBATCH --output=/home/yy3658/NeurObjectGen/jobs/logs/ip_adapter_sweep_%A_%a.log
-#SBATCH --array=0-11%5   # 12 total, 5 concurrent
+#SBATCH --array=0-11%4   # 12 total, 5 concurrent
 
 # ---------------------------------------------------------------------------
 # Environment
@@ -30,7 +30,7 @@ $PYTHON -V
 # Hyperparameter grid
 # ---------------------------------------------------------------------------
 LRS=(1e-4 3e-4)
-N_TOKENS=(1 4 16)
+N_TOKENS=(32 64 128)
 HIDDENS=(512 1024)
 
 N_LR=${#LRS[@]}   # 2

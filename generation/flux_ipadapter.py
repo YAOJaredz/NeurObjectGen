@@ -194,19 +194,39 @@ def generate(
         image_embedding = image_embedding.unsqueeze(0)
     image_embedding = image_embedding.to(device, dtype=dtype)
 
+    # --- 4. IP-Adapter: project image embedding into extra text tokens ------
+    ip_adapter.eval()
+    ip_dtype = next(ip_adapter.parameters()).dtype
+    ip_tokens = ip_adapter(image_embedding.to(ip_dtype)).to(dtype) * ip_adapter_scale
+    # (1, n_tokens, 4096)
+    ip_ids = torch.zeros(ip_tokens.shape[1], 3, device=device, dtype=dtype)
+
     # --- 1. Text encoding ---------------------------------------------------
-    effective_prompt = prompt if prompt is not None else ""
-    (
-        prompt_embeds,        # (1, 512, 4096)
-        pooled_prompt_embeds, # (1, 768)
-        text_ids,             # (512, 3)
-    ) = pipe.encode_prompt(
-        prompt=effective_prompt,
-        prompt_2=None,
-        device=device,
-        num_images_per_prompt=1,
-        max_sequence_length=512,
-    )
+    # When prompt is None we match the training regime exactly: only IP tokens
+    # are passed as encoder_hidden_states, with no T5 sequence.  The model was
+    # trained without T5 tokens, so injecting an empty-prompt T5 sequence at
+    # inference would shift the conditioning distribution.
+    if prompt is None:
+        encoder_hidden_states = ip_tokens          # (1, n_tokens, 4096)
+        text_ids = ip_ids                          # (n_tokens, 3)
+        _, pooled_prompt_embeds, _ = pipe.encode_prompt(
+            prompt="",
+            prompt_2=None,
+            device=device,
+            num_images_per_prompt=1,
+            max_sequence_length=512,
+        )
+    else:
+        prompt_embeds, pooled_prompt_embeds, t5_ids = pipe.encode_prompt(
+            prompt=prompt,
+            prompt_2=None,
+            device=device,
+            num_images_per_prompt=1,
+            max_sequence_length=512,
+        )
+        # Prepend IP tokens to T5 tokens.
+        encoder_hidden_states = torch.cat([ip_tokens, prompt_embeds], dim=1)
+        text_ids = torch.cat([ip_ids, t5_ids], dim=0)
 
     # --- 2. Prepare latents --------------------------------------------------
     latent_channels = pipe.transformer.config.in_channels // 4
@@ -215,7 +235,7 @@ def generate(
         num_channels_latents=latent_channels,
         height=height,
         width=width,
-        dtype=prompt_embeds.dtype,          # type: ignore
+        dtype=encoder_hidden_states.dtype,
         device=device,
         generator=torch.Generator(device).manual_seed(seed),
     )
@@ -236,19 +256,6 @@ def generate(
 
     guidance = torch.full([1], guidance_scale, device=device, dtype=dtype)
 
-    # --- 4. IP-Adapter: project image embedding into extra text tokens ------
-    # ip_adapter lives in its own dtype (typically float32); cast the embedding
-    # to match, then cast the projected tokens back to the pipe dtype.
-    ip_adapter.eval()
-    ip_dtype = next(ip_adapter.parameters()).dtype
-    ip_tokens = ip_adapter(image_embedding.to(ip_dtype)).to(dtype) * ip_adapter_scale
-    # (1, n_tokens, 4096) — prepend to the T5 encoder_hidden_states so FLUX's
-    # joint attention attends to them as additional text tokens.
-    prompt_embeds = torch.cat([ip_tokens, prompt_embeds], dim=1)
-    # Extend txt_ids with zero-position entries for the IP tokens.
-    ip_ids = torch.zeros(ip_tokens.shape[1], text_ids.shape[-1], device=device, dtype=text_ids.dtype)
-    text_ids = torch.cat([ip_ids, text_ids], dim=0)
-
     # --- 5. Denoising loop ---------------------------------------------------
     iterator = tqdm(enumerate(timesteps), total=len(timesteps)) if show_progress else enumerate(timesteps)
     for _, t in iterator:
@@ -257,7 +264,7 @@ def generate(
             hidden_states=latents,
             timestep=t_input / 1000,
             guidance=guidance,
-            encoder_hidden_states=prompt_embeds,
+            encoder_hidden_states=encoder_hidden_states,
             pooled_projections=pooled_prompt_embeds,
             txt_ids=text_ids,
             img_ids=latent_image_ids,

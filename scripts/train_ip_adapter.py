@@ -292,7 +292,7 @@ def train(args):
             # SD3/FLUX-standard: t = sigmoid(N(0,1)) concentrates mass in the mid-
             # noise regime where conditioning actually matters. Uniform sampling
             # wastes capacity on t≈1 (pure noise, target ≈ noise, input-independent).
-            t = torch.sigmoid(torch.randn(b, device=device)).to(bf16)   # (b,)
+            t = torch.sigmoid(torch.randn(b, device=device)).to(bf16)   # (b,) in (0,1)
             noise = torch.randn_like(x0)
             xt = (1 - t[:, None, None]) * x0 + t[:, None, None] * noise
             target = noise - x0
@@ -302,7 +302,7 @@ def train(args):
 
             pred = pipe.transformer(
                 hidden_states=xt,
-                timestep=t,
+                timestep=t,  # transformer expects normalised t in (0, 1); inference divides scheduler steps by 1000
                 guidance=guidance,
                 encoder_hidden_states=ip_tokens,
                 pooled_projections=pooled_embeds.expand(b, -1),
@@ -366,13 +366,13 @@ def train(args):
 
 def parse_args():
     p = argparse.ArgumentParser()
-    p.add_argument("--n-tokens", type=int, default=4, help="Number of IP-Adapter text tokens")
+    p.add_argument("--n-tokens", type=int, default=128, help="Number of IP-Adapter text tokens")
     p.add_argument("--hidden", type=int, default=1024, help="IP-Adapter MLP hidden dim")
     p.add_argument("--image-size", type=int, default=512, help="Target image resolution (pixels)")
     p.add_argument("--epochs", type=int, default=100)
     p.add_argument("--batch-size", type=int, default=32,
                    help="Logical gradient-update batch size (samples per optimizer step)")
-    p.add_argument("--micro-batch", type=int, default=4,
+    p.add_argument("--micro-batch", type=int, default=2,
                    help="Samples per FLUX forward pass — limited by GPU memory")
     p.add_argument("--lr", type=float, default=1e-3)
     p.add_argument("--weight-decay", type=float, default=1e-4)
