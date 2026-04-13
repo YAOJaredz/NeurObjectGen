@@ -60,5 +60,6 @@ $PYTHON scripts/train_ip_adapter.py \
     --hidden          "${HIDDEN}"   \
     --guidance-scale  3.5           \
     --epochs          100           \
-    --batch-size      4             \
+    --batch-size      32            \
+    --micro-batch     4             \
     --weight-decay    1e-4

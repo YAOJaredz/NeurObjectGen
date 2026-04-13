@@ -23,7 +23,7 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 from torch.optim import AdamW
-from torch.optim.lr_scheduler import CosineAnnealingLR
+from torch.optim.lr_scheduler import OneCycleLR
 from tqdm import tqdm
 
 from config_const import (
@@ -58,8 +58,15 @@ def prepare_latents(pipe, images: torch.Tensor, size: int, device) -> tuple[torc
         packed_latents:    (N, seq_len, 64) bfloat16 tensor.
         latent_image_ids:  (seq_len, 3) position ids shared across samples.
     """
-    # Resize to target size and shift to [-1, 1] for the VAE.
+    # Resize to target size.
     x = F.interpolate(images, size=(size, size), mode="bilinear", align_corners=False)
+    # The Rust stimuli are grayscale — collapse to luminance and replicate across
+    # RGB so the VAE sees a proper 3-channel input. This makes both the clean
+    # latents and the flow-matching target grayscale; the predicted velocity is
+    # regressed against grayscale content with no pixel-space decode needed.
+    gray = (0.2989 * x[:, 0:1] + 0.5870 * x[:, 1:2] + 0.1140 * x[:, 2:3])
+    x = gray.expand(-1, 3, -1, -1).contiguous()
+    # Shift to [-1, 1] for the VAE.
     x = x * 2 - 1
 
     n = x.shape[0]
@@ -203,98 +210,133 @@ def train(args):
     mask_sum = loss_mask.sum()
     print(f"loss_mask: {loss_mask.shape}  fraction active: {(mask_sum / loss_mask.numel()).item():.3f}")
 
-    # --- Precompute empty-prompt text conditioning (shared across samples) ---
+    # During training we pass ONLY the IP-Adapter tokens as encoder_hidden_states
+    # — no T5 context.  With empty T5 tokens FLUX already produces a usable
+    # baseline prediction that swamps the 4 adapter tokens, flattening their
+    # gradient signal.  Dropping T5 entirely forces all conditioning through the
+    # adapter and maximises gradient flow to the MLP.
+    # pooled_embeds (CLIP) is still needed by the transformer's pooled projection.
     with torch.no_grad():
-        prompt_embeds, pooled_embeds, text_ids = pipe.encode_prompt(
+        _, pooled_embeds, _ = pipe.encode_prompt(
             prompt="",
             prompt_2=None,
             device=device,
             num_images_per_prompt=1,
             max_sequence_length=512,
         )
-    # prompt_embeds: (1, 512, 4096)  pooled_embeds: (1, 768)  text_ids: (512, 3)
+    assert pooled_embeds is not None
+    # pooled_embeds: (1, 768)
 
-    # Offload text encoders — they're no longer needed and freeing ~9.6 GB
-    # gives enough headroom for batch_size=4 activation retention during backprop.
+    # Offload text encoders — no longer needed, frees ~9.6 GB.
     pipe.text_encoder.to("cpu")
     pipe.text_encoder_2.to("cpu")
     torch.cuda.empty_cache()
 
+    n_train = clean_latents.shape[0]
+    # Two-level batching:
+    #   micro_batch: samples processed concurrently in one FLUX forward (GPU-limited)
+    #   batch_size:  logical gradient-update size — grads accumulate over
+    #                (batch_size / micro_batch) forward passes before each optimizer step
+    micro_batch = args.micro_batch
+    assert args.batch_size % micro_batch == 0, \
+        f"batch_size ({args.batch_size}) must be divisible by micro_batch ({micro_batch})"
+    accum_steps = args.batch_size // micro_batch
+    bf16 = torch.bfloat16
+    mask = loss_mask.float()  # (1, seq, 1) — constant across steps
+
     # --- Optimizer ---
     optimizer = AdamW(ip_adapter.parameters(), lr=args.lr, weight_decay=args.weight_decay)
-    scheduler = CosineAnnealingLR(optimizer, T_max=args.epochs)
+    # OneCycleLR: warm up to args.lr, then cosine-anneal down. One scheduler
+    # step per optimizer step (= per logical batch of args.batch_size samples).
+    steps_per_epoch = (n_train + args.batch_size - 1) // args.batch_size
+    scheduler = OneCycleLR(
+        optimizer,
+        max_lr=args.lr,
+        epochs=args.epochs,
+        steps_per_epoch=steps_per_epoch,
+        pct_start=0.1,
+        anneal_strategy="cos",
+    )
 
     ckpt_dir = run_dir(args)
     ckpt_dir.mkdir(parents=True, exist_ok=True)
     print(f"Checkpoints -> {ckpt_dir}")
 
     best_loss = float("inf")
-    n_train = clean_latents.shape[0]
-    # Gradient accumulation: accumulate args.batch_size individual samples
-    # before each optimizer step (FLUX cannot hold multiple samples in memory).
-    accum_steps = args.batch_size
-    bf16 = torch.bfloat16
-    mask = loss_mask.float()  # (1, seq, 1) — constant across steps
+
+    # Shared constants across micro-batches — allocated once.
+    ip_ids = torch.zeros(
+        ip_adapter.n_tokens, 3, device=device, dtype=torch.bfloat16
+    )
 
     for epoch in range(1, args.epochs + 1):
         ip_adapter.train()
         perm_e = torch.randperm(n_train)
         epoch_loss = 0.0
+        n_micro = 0      # forward-pass count (for logging average)
         n_updates = 0
 
         optimizer.zero_grad()
-        pbar = tqdm(range(n_train), desc=f"epoch {epoch:3d}/{args.epochs}", leave=False)
-        for step, i in enumerate(pbar):
-            idx = perm_e[i : i + 1]  # one sample at a time through FLUX
+        n_forwards = (n_train + micro_batch - 1) // micro_batch
+        pbar = tqdm(range(n_forwards), desc=f"epoch {epoch:3d}/{args.epochs}", leave=False)
+        for step in pbar:
+            start = step * micro_batch
+            end = min(start + micro_batch, n_train)
+            idx = perm_e[start:end]
+            b = idx.shape[0]
 
-            x0 = clean_latents[idx].to(device, dtype=bf16)  # (1, seq, 64)
-            emb = siglip_embeds[idx]                         # (1, 1152)
+            x0 = clean_latents[idx].to(device, dtype=bf16)   # (b, seq, 64)
+            emb = siglip_embeds[idx]                         # (b, 1152)
 
-            # --- Flow matching ---
-            t = torch.rand(1, device=device, dtype=bf16)
+            # --- Flow matching with logit-normal timestep sampling ---
+            # SD3/FLUX-standard: t = sigmoid(N(0,1)) concentrates mass in the mid-
+            # noise regime where conditioning actually matters. Uniform sampling
+            # wastes capacity on t≈1 (pure noise, target ≈ noise, input-independent).
+            t = torch.sigmoid(torch.randn(b, device=device)).to(bf16)   # (b,)
             noise = torch.randn_like(x0)
             xt = (1 - t[:, None, None]) * x0 + t[:, None, None] * noise
             target = noise - x0
 
-            # --- IP-Adapter tokens ---
-            ip_tokens = ip_adapter(emb.float()).to(bf16)     # (1, n_tokens, 4096)
-            prompt_b = torch.cat([ip_tokens, prompt_embeds], dim=1)
-            ip_ids = torch.zeros(
-                ip_adapter.n_tokens, text_ids.shape[-1], device=device, dtype=text_ids.dtype
-            )
-            text_ids_b = torch.cat([ip_ids, text_ids], dim=0)
-            guidance = torch.full([1], args.guidance_scale, device=device, dtype=bf16)
+            ip_tokens = ip_adapter(emb.float()).to(bf16)     # (b, n_tokens, 4096)
+            guidance = torch.full([b], args.guidance_scale, device=device, dtype=bf16)
 
             pred = pipe.transformer(
                 hidden_states=xt,
                 timestep=t,
                 guidance=guidance,
-                encoder_hidden_states=prompt_b,
-                pooled_projections=pooled_embeds,
-                txt_ids=text_ids_b,
+                encoder_hidden_states=ip_tokens,
+                pooled_projections=pooled_embeds.expand(b, -1),
+                txt_ids=ip_ids,
                 img_ids=latent_image_ids,
                 joint_attention_kwargs=None,
                 return_dict=False,
             )[0]
 
-            sq_err = (pred.float() - target.float()) ** 2   # (1, seq, 64)
-            # Divide by accum_steps so gradients average over the logical batch.
-            loss = (sq_err * mask).sum() / (mask.sum() * sq_err.shape[-1] * accum_steps)
+            sq_err = (pred.float() - target.float()) ** 2    # (b, seq, 64)
+            # Masked mean over (seq, 64) per sample, then mean across b.
+            denom = mask.sum() * sq_err.shape[-1]
+            per_sample_loss = (sq_err * mask).sum(dim=(1, 2)) / denom  # (b,)
+            micro_loss = per_sample_loss.mean()
+            # Scale by (b / batch_size) so the summed gradient over one logical
+            # batch equals the mean gradient over batch_size samples.
+            loss = micro_loss * (b / args.batch_size)
             loss.backward()
 
-            epoch_loss += loss.item() * accum_steps          # log the un-scaled loss
-            is_last = (i == n_train - 1)
+            epoch_loss += micro_loss.item() * b
+            n_micro += b
+            is_last = (step == n_forwards - 1)
 
             if (step + 1) % accum_steps == 0 or is_last:
+                torch.nn.utils.clip_grad_norm_(ip_adapter.parameters(), 1.0)
                 optimizer.step()
+                scheduler.step()
                 optimizer.zero_grad()
                 n_updates += 1
-                avg = epoch_loss / (step + 1)
-                pbar.set_postfix(loss=f"{avg:.5f}")
+                pbar.set_postfix(loss=f"{epoch_loss / n_micro:.5f}")
 
-        scheduler.step()
         epoch_loss /= n_train
-        print(f"epoch {epoch:3d}/{args.epochs}  loss={epoch_loss:.5f}  lr={scheduler.get_last_lr()[0]:.2e}")
+        current_lr = optimizer.param_groups[0]["lr"]
+        print(f"epoch {epoch:3d}/{args.epochs}  loss={epoch_loss:.5f}  lr={current_lr:.2e}")
 
         torch.save(
             {
@@ -328,11 +370,14 @@ def parse_args():
     p.add_argument("--hidden", type=int, default=1024, help="IP-Adapter MLP hidden dim")
     p.add_argument("--image-size", type=int, default=512, help="Target image resolution (pixels)")
     p.add_argument("--epochs", type=int, default=100)
-    p.add_argument("--batch-size", type=int, default=4)
-    p.add_argument("--lr", type=float, default=1e-4)
+    p.add_argument("--batch-size", type=int, default=32,
+                   help="Logical gradient-update batch size (samples per optimizer step)")
+    p.add_argument("--micro-batch", type=int, default=4,
+                   help="Samples per FLUX forward pass — limited by GPU memory")
+    p.add_argument("--lr", type=float, default=1e-3)
     p.add_argument("--weight-decay", type=float, default=1e-4)
-    p.add_argument("--guidance-scale", type=float, default=1.0,
-                   help="FLUX distilled guidance passed at training time (1.0 = neutral)")
+    p.add_argument("--guidance-scale", type=float, default=3.5,
+                   help="FLUX distilled guidance passed at training time (3.5 matches distillation)")
     p.add_argument("--mask-center-frac", type=float, default=0.06,
                    help="Side of the excluded center square as a fraction of image_size")
     return p.parse_args()
