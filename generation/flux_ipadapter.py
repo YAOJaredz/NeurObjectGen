@@ -300,6 +300,7 @@ def generate_img2img(
     width: int = 512,
     num_inference_steps: int = 20,
     guidance_scale: float = 3.5,
+    cfg_scale: float = 1.0,
     seed: int = 0,
     ip_adapter_scale: float = 1.0,
     show_progress: bool = True,
@@ -309,6 +310,12 @@ def generate_img2img(
     Encodes ``init_image`` with the VAE, packs the latent into FLUX's sequence
     format, adds noise up to the timestep corresponding to ``strength``, then
     runs the remaining denoising steps conditioned on ``image_embedding``.
+
+    Two-pass classifier-free guidance is applied over the IP-Adapter tokens:
+    each denoising step runs one unconditional forward (null embedding) and one
+    conditional forward, then combines them as:
+        pred = pred_uncond + cfg_scale * (pred_cond - pred_uncond)
+    Set ``cfg_scale=1.0`` to disable (conditional only, one pass per step).
 
     Args:
         pipe:                Loaded FluxPipeline (weights frozen).
@@ -322,7 +329,9 @@ def generate_img2img(
         height:              Output image height in pixels.
         width:               Output image width in pixels.
         num_inference_steps: Total denoising steps in the full schedule.
-        guidance_scale:      FLUX distilled guidance scale.
+        guidance_scale:      FLUX distilled guidance scale (embedded in forward).
+        cfg_scale:           IP-Adapter CFG scale.  Values > 1 strengthen the
+                             embedding signal; 1.0 = conditional pass only.
         seed:                RNG seed.
         ip_adapter_scale:    Multiplier on the injected IP-Adapter tokens.
         show_progress:       Show tqdm progress bar.
@@ -341,14 +350,24 @@ def generate_img2img(
 
     # --- IP-Adapter tokens --------------------------------------------------
     ip_adapter.eval()
-    ip_dtype  = next(ip_adapter.parameters()).dtype
-    ip_tokens = ip_adapter(image_embedding.to(ip_dtype)).to(dtype) * ip_adapter_scale
-    ip_ids    = torch.zeros(ip_tokens.shape[1], 3, device=device, dtype=dtype)
+    ip_dtype = next(ip_adapter.parameters()).dtype
+
+    cond_tokens = ip_adapter(image_embedding.to(ip_dtype)).to(dtype) * ip_adapter_scale
+    # (1, n_tokens, 4096)
+
+    # Unconditional tokens: project the null (zero) embedding, matching the
+    # training-time dropout null condition.
+    null_embed   = torch.zeros_like(image_embedding.to(ip_dtype))
+    uncond_tokens = ip_adapter(null_embed).to(dtype) * ip_adapter_scale
+    # (1, n_tokens, 4096)
+
+    ip_ids = torch.zeros(cond_tokens.shape[1], 3, device=device, dtype=dtype)
 
     # --- Text encoding -------------------------------------------------------
     if prompt is None:
-        encoder_hidden_states = ip_tokens
-        text_ids = ip_ids
+        cond_hidden   = cond_tokens    # (1, n_tokens, 4096)
+        uncond_hidden = uncond_tokens
+        text_ids      = ip_ids
         _, pooled_prompt_embeds, _ = pipe.encode_prompt(
             prompt="", prompt_2=None, device=device,
             num_images_per_prompt=1, max_sequence_length=512,
@@ -358,8 +377,9 @@ def generate_img2img(
             prompt=prompt, prompt_2=None, device=device,
             num_images_per_prompt=1, max_sequence_length=512,
         )
-        encoder_hidden_states = torch.cat([ip_tokens, prompt_embeds], dim=1)
-        text_ids = torch.cat([ip_ids, t5_ids], dim=0)
+        cond_hidden   = torch.cat([cond_tokens,   prompt_embeds], dim=1)
+        uncond_hidden = torch.cat([uncond_tokens,  prompt_embeds], dim=1)
+        text_ids      = torch.cat([ip_ids, t5_ids], dim=0)
 
     # --- Encode init image into VAE latent space ----------------------------
     init_resized = init_image.resize((width, height), Image.LANCZOS)
@@ -402,20 +422,41 @@ def generate_img2img(
     guidance = torch.full([1], guidance_scale, device=device, dtype=dtype)
 
     # --- Denoising loop ------------------------------------------------------
+    do_cfg = cfg_scale != 1.0
     iterator = tqdm(enumerate(timesteps), total=len(timesteps)) if show_progress else enumerate(timesteps)
     for _, t in iterator:
         t_input = torch.as_tensor(t, device=device).expand(latents.shape[0]).to(latents.dtype)
-        noise_pred = pipe.transformer(
+
+        # Conditional forward pass
+        pred_cond = pipe.transformer(
             hidden_states=latents,
             timestep=t_input / 1000,
             guidance=guidance,
-            encoder_hidden_states=encoder_hidden_states,
+            encoder_hidden_states=cond_hidden,
             pooled_projections=pooled_prompt_embeds,
             txt_ids=text_ids,
             img_ids=latent_image_ids,
             joint_attention_kwargs=None,
             return_dict=False,
         )[0]
+
+        if do_cfg:
+            # Unconditional forward pass with null IP tokens
+            pred_uncond = pipe.transformer(
+                hidden_states=latents,
+                timestep=t_input / 1000,
+                guidance=guidance,
+                encoder_hidden_states=uncond_hidden,
+                pooled_projections=pooled_prompt_embeds,
+                txt_ids=text_ids,
+                img_ids=latent_image_ids,
+                joint_attention_kwargs=None,
+                return_dict=False,
+            )[0]
+            noise_pred = pred_uncond + cfg_scale * (pred_cond - pred_uncond)
+        else:
+            noise_pred = pred_cond
+
         latents = pipe.scheduler.step(noise_pred, t, latents, return_dict=False)[0]
 
     # --- Decode --------------------------------------------------------------

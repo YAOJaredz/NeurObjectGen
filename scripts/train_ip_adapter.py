@@ -367,7 +367,7 @@ def train(args):
 
 def parse_args():
     p = argparse.ArgumentParser()
-    p.add_argument("--n-tokens", type=int, default=128, help="Number of IP-Adapter text tokens")
+    p.add_argument("--n-tokens", type=int, default=16, help="Number of IP-Adapter text tokens")
     p.add_argument("--hidden", type=int, default=1024, help="IP-Adapter MLP hidden dim")
     p.add_argument("--image-size", type=int, default=512, help="Target image resolution (pixels)")
     p.add_argument("--epochs", type=int, default=100)

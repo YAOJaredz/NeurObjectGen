@@ -306,6 +306,10 @@ def train(args):
     pipe.text_encoder_2.to("cpu")
     torch.cuda.empty_cache()
 
+    # Null embedding for unconditional tokens — recomputed each forward pass
+    # from the current adapter weights so it stays consistent as the MLP trains.
+    null_embed = torch.zeros(1, train_embeds.shape[-1], device=device)
+
     n_train = clean_latents.shape[0]
     micro_batch = args.micro_batch
     assert args.batch_size % micro_batch == 0, \
@@ -361,11 +365,13 @@ def train(args):
             #    embeddings (train) and noisy neural-predicted embeddings (inference).
             if args.embed_noise_std > 0:
                 emb = emb + args.embed_noise_std * torch.randn_like(emb)
-            # 2. Embedding dropout: randomly zero the full embedding, forcing the
-            #    MLP to learn a meaningful null condition.
+            # 2. Embedding dropout: for dropped samples substitute the pre-computed
+            #    unconditional tokens directly rather than projecting a zero vector.
+            #    This gives the model a stable null anchor for CFG-style guidance.
             if args.embed_dropout > 0:
-                drop_mask = (torch.rand(emb.shape[0], 1, device=emb.device) > args.embed_dropout)
-                emb = emb * drop_mask
+                is_dropped = torch.rand(b, device=device) < args.embed_dropout  # (b,)
+            else:
+                is_dropped = torch.zeros(b, device=device, dtype=torch.bool)
 
             # --- img2img timestep sampling ---
             # Restrict t to [strength_min, strength_max] so training matches the
@@ -380,6 +386,12 @@ def train(args):
             xt     = (1 - t[:, None, None]) * x0 + t[:, None, None] * noise
 
             ip_tokens = ip_adapter(emb.float()).to(bf16)      # (b, n_tokens, 4096)
+            # Replace dropped samples with unconditional tokens — the projection
+            # of the null (zero) embedding under the current adapter weights.
+            if is_dropped.any():
+                uncond_tokens = ip_adapter(null_embed.float()).to(bf16)  # (1, n_tokens, 4096)
+                ip_tokens[is_dropped] = uncond_tokens.expand(is_dropped.sum(), -1, -1)
+
             guidance  = torch.full([b], args.guidance_scale, device=device, dtype=bf16)
 
             # pred is the velocity (noise - x0) as usual for FLUX
@@ -489,12 +501,12 @@ def train(args):
 
 def parse_args():
     p = argparse.ArgumentParser()
-    p.add_argument("--n-tokens",          type=int,   default=128)
+    p.add_argument("--n-tokens",          type=int,   default=16)
     p.add_argument("--hidden",            type=int,   default=1024)
     p.add_argument("--image-size",        type=int,   default=512)
     p.add_argument("--epochs",            type=int,   default=50)
     p.add_argument("--batch-size",        type=int,   default=32)
-    p.add_argument("--micro-batch",       type=int,   default=2)
+    p.add_argument("--micro-batch",       type=int,   default=4)
     p.add_argument("--lr",                type=float, default=1e-3)
     p.add_argument("--weight-decay",      type=float, default=1e-4)
     p.add_argument("--guidance-scale",    type=float, default=3.5)
