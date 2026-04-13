@@ -281,6 +281,145 @@ def generate(
 
 
 # ---------------------------------------------------------------------------
+# img2img: denoise from a noised stimulus latent
+# ---------------------------------------------------------------------------
+
+@torch.no_grad()
+def generate_img2img(
+    pipe: FluxPipeline,
+    ip_adapter: IPAdapterProjection,
+    init_image: Image.Image,
+    image_embedding: torch.Tensor,
+    strength: float = 0.75,
+    prompt: str | None = None,
+    height: int = 512,
+    width: int = 512,
+    num_inference_steps: int = 20,
+    guidance_scale: float = 3.5,
+    seed: int = 0,
+    ip_adapter_scale: float = 1.0,
+    show_progress: bool = True,
+) -> Image.Image:
+    """img2img generation: start from a noised stimulus latent instead of pure noise.
+
+    Encodes ``init_image`` with the VAE, packs the latent into FLUX's sequence
+    format, adds noise up to the timestep corresponding to ``strength``, then
+    runs the remaining denoising steps conditioned on ``image_embedding``.
+
+    Args:
+        pipe:                Loaded FluxPipeline (weights frozen).
+        ip_adapter:          Trained IPAdapterProjection.
+        init_image:          PIL image used as the starting latent (resized to
+                             height × width before encoding).
+        image_embedding:     (1, D) or (D,) SigLIP or neural embedding tensor.
+        strength:            Noise strength in [0, 1].  1.0 = pure noise (same
+                             as generate()); 0.0 = no denoising (VAE round-trip).
+        prompt:              Optional text prompt.
+        height:              Output image height in pixels.
+        width:               Output image width in pixels.
+        num_inference_steps: Total denoising steps in the full schedule.
+        guidance_scale:      FLUX distilled guidance scale.
+        seed:                RNG seed.
+        ip_adapter_scale:    Multiplier on the injected IP-Adapter tokens.
+        show_progress:       Show tqdm progress bar.
+
+    Returns:
+        Reconstructed PIL image.
+    """
+    device = pipe.device
+    dtype  = torch.bfloat16
+    generator = torch.Generator(device).manual_seed(seed)
+
+    # Normalise embedding shape to (1, D)
+    if image_embedding.dim() == 1:
+        image_embedding = image_embedding.unsqueeze(0)
+    image_embedding = image_embedding.to(device, dtype=dtype)
+
+    # --- IP-Adapter tokens --------------------------------------------------
+    ip_adapter.eval()
+    ip_dtype  = next(ip_adapter.parameters()).dtype
+    ip_tokens = ip_adapter(image_embedding.to(ip_dtype)).to(dtype) * ip_adapter_scale
+    ip_ids    = torch.zeros(ip_tokens.shape[1], 3, device=device, dtype=dtype)
+
+    # --- Text encoding -------------------------------------------------------
+    if prompt is None:
+        encoder_hidden_states = ip_tokens
+        text_ids = ip_ids
+        _, pooled_prompt_embeds, _ = pipe.encode_prompt(
+            prompt="", prompt_2=None, device=device,
+            num_images_per_prompt=1, max_sequence_length=512,
+        )
+    else:
+        prompt_embeds, pooled_prompt_embeds, t5_ids = pipe.encode_prompt(
+            prompt=prompt, prompt_2=None, device=device,
+            num_images_per_prompt=1, max_sequence_length=512,
+        )
+        encoder_hidden_states = torch.cat([ip_tokens, prompt_embeds], dim=1)
+        text_ids = torch.cat([ip_ids, t5_ids], dim=0)
+
+    # --- Encode init image into VAE latent space ----------------------------
+    init_resized = init_image.resize((width, height), Image.LANCZOS)
+    init_latent  = _encode_image(pipe, init_resized).to(device, dtype=dtype)
+
+    # prepare_latents skips packing when given a pre-encoded latent, so we
+    # must pack manually and compute latent_image_ids with the same arithmetic
+    # the txt2img path uses: height/width after vae_scale_factor*2 reduction.
+    h = 2 * (height // (pipe.vae_scale_factor * 2))
+    w = 2 * (width  // (pipe.vae_scale_factor * 2))
+    latent_channels = init_latent.shape[1]
+    init_latent_packed = pipe._pack_latents(init_latent, 1, latent_channels, h, w)
+    latent_image_ids   = pipe._prepare_latent_image_ids(1, h // 2, w // 2, device, dtype)
+
+    # --- Timestep schedule --------------------------------------------------
+    image_seq_len = init_latent_packed.shape[1]
+    mu = calculate_shift(
+        image_seq_len,
+        pipe.scheduler.config.base_image_seq_len,
+        pipe.scheduler.config.max_image_seq_len,
+        pipe.scheduler.config.base_shift,
+        pipe.scheduler.config.max_shift,
+    )
+    timesteps, _ = retrieve_timesteps(pipe.scheduler, num_inference_steps, device, mu=mu)
+
+    # Determine the start index based on strength
+    start_step = int(num_inference_steps * (1.0 - strength))
+    timesteps  = timesteps[start_step:]
+
+    # Tell the scheduler which step we're beginning from so scale_noise can
+    # look up the correct sigma index in its internal schedule.
+    pipe.scheduler.set_begin_index(start_step)
+
+    # Add noise to the init latent at the first active timestep.
+    # scale_noise expects the raw timestep value (not divided by 1000).
+    noise   = torch.randn(init_latent_packed.shape, dtype=dtype, device=device, generator=generator)
+    t_start = timesteps[0:1].to(dtype)
+    latents = pipe.scheduler.scale_noise(init_latent_packed, t_start, noise)
+
+    guidance = torch.full([1], guidance_scale, device=device, dtype=dtype)
+
+    # --- Denoising loop ------------------------------------------------------
+    iterator = tqdm(enumerate(timesteps), total=len(timesteps)) if show_progress else enumerate(timesteps)
+    for _, t in iterator:
+        t_input = torch.as_tensor(t, device=device).expand(latents.shape[0]).to(latents.dtype)
+        noise_pred = pipe.transformer(
+            hidden_states=latents,
+            timestep=t_input / 1000,
+            guidance=guidance,
+            encoder_hidden_states=encoder_hidden_states,
+            pooled_projections=pooled_prompt_embeds,
+            txt_ids=text_ids,
+            img_ids=latent_image_ids,
+            joint_attention_kwargs=None,
+            return_dict=False,
+        )[0]
+        latents = pipe.scheduler.step(noise_pred, t, latents, return_dict=False)[0]
+
+    # --- Decode --------------------------------------------------------------
+    latents = pipe._unpack_latents(latents, height, width, pipe.vae_scale_factor)
+    return decode_latent(pipe, latents)
+
+
+# ---------------------------------------------------------------------------
 # Batch generation helper
 # ---------------------------------------------------------------------------
 

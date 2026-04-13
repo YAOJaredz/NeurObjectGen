@@ -20,7 +20,7 @@ def caption_stimuli(
     model_name: str = "Salesforce/blip2-opt-2.7b",
     batch_size: int = 32,
     min_new_tokens: int = 0,
-    max_new_tokens: int = 100,
+    max_new_tokens: int = 77,
     force: bool = False,
     save_path: Path = BLIP2_CAPTIONS_PATH,
 ) -> dict[int, str]:
@@ -77,10 +77,10 @@ def caption_stimuli(
 
 
 if __name__ == "__main__":
-    caps = caption_stimuli(force=True)
+    # caps = caption_stimuli(force=True)
     detailed_caps = caption_stimuli(
-        force=True, min_new_tokens=40, save_path=BLIP2_DETAILED_CAPTIONS_PATH
+        force=True, min_new_tokens=60, save_path=BLIP2_DETAILED_CAPTIONS_PATH
     )
-    for i in range(min(5, len(caps))):
-        print(f"{i:04d}: {caps[i]}")
+    for i in range(min(5, len(detailed_caps))):
+        # print(f"{i:04d}: {caps[i]}")
         print(f"      {detailed_caps[i]}")
