@@ -1,5 +1,6 @@
-"""Reconstruction metrics: cosine similarity, SSIM, 2AFC identification."""
+"""Reconstruction metrics: cosine similarity, SSIM, 2AFC identification, R²."""
 
+import numpy as np
 import torch
 import torch.nn.functional as F
 from skimage.metrics import structural_similarity
@@ -81,3 +82,20 @@ def two_afc_identification(
         total += len(foils)
 
     return correct / total if total > 0 else 0.0
+
+
+def r2_per_component(pred: np.ndarray, target: np.ndarray) -> np.ndarray:
+    """R² for each output dimension independently.
+
+    Args:
+        pred:   (N, D) predicted values
+        target: (N, D) ground-truth values
+
+    Returns:
+        (D,) array of R² scores, one per dimension.
+    """
+    ss_res = ((pred - target) ** 2).sum(axis=0)
+    ss_tot = ((target - target.mean(axis=0)) ** 2).sum(axis=0)
+    with np.errstate(invalid="ignore"):
+        r2 = 1.0 - ss_res / ss_tot
+    return r2
