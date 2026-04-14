@@ -24,15 +24,21 @@ Formally, we seek a mapping **f : r → z**, where **r ∈ R^(N×T)** is the neu
 
 ## 3. Approach
 
-### Stage 1 — Neural Encoder
+### Stage 1 — Neural Decoders (Semantic + Spatial)
 
-We train a regularized encoder that maps pseudo-population firing rate vectors to the SigLIP image embedding space. Given the ratio of stimuli (300) to channels (potentially thousands), we compare three architectures:
+Stage 1 splits the neural signal into two complementary decoders that feed the two independent conditioning paths of the InstantX-wrapped FLUX pipeline. This mirrors the "what / where" decomposition that has been effective in prior fMRI reconstruction work [Takagi and Nishimoto, 2023]: a semantic head drives category/object identity, and a spatial head drives coarse layout and low-frequency structure.
+
+**Semantic decoder (→ SigLIP image embedding).** A regularized encoder maps pseudo-population firing-rate vectors to the frozen SigLIP-SO400M image embedding space. Given the ratio of stimuli (300) to channels (potentially thousands), we compare three architectures:
 
 - **Ridge regression** — baseline, no temporal structure
 - **Low-rank bottleneck MLP** — flattens the (N × T) response and projects through a small bottleneck
 - **Temporal LSTM / Transformer** — operates over the T time bins, treating each T-step as a token over N-dimensional neural activity
 
-All encoders are trained with an **InfoNCE contrastive loss** that aligns predicted embeddings with frozen SigLIP embeddings of the presented stimuli, improving data efficiency over direct regression. The best architecture is selected by 2AFC identification accuracy on a held-out validation set.
+All semantic encoders are trained with an **InfoNCE contrastive loss** that aligns predicted embeddings with frozen SigLIP embeddings of the presented stimuli, improving data efficiency over direct regression. The best architecture is selected by 2AFC identification accuracy on a held-out validation set. Its output feeds the IP-Adapter image path via `MLPProjModel`.
+
+**Spatial decoder (→ init-latent / structure).** A second ridge regressor maps the same pseudo-population vector to a low-dimensional spatial target that seeds the img2img init latent. We decode into a compressed representation of the FLUX-packed VAE latent of the stimulus — either directly onto PCA components of the packed latent, or onto a downsampled grayscale-luminance image that is then VAE-encoded on the fly. The decoded structure is used as the `init_image` passed into `generate_img2img(...)`, so the generator begins denoising from a neural estimate of where things are rather than from pure noise or the ground-truth stimulus. The spatial head uses plain ridge regression: the target dimensionality is small, the spatial signal in IT is weaker than the semantic signal, and a linear baseline is a more honest reference for what the spatial pathway contributes before investing in deeper models.
+
+The two decoders are trained independently on the same 200-stimulus training split and combined only at inference. This lets us ablate them separately: **semantic-only** (neural SigLIP + noise init), **spatial-only** (neural init + zero ip_scale), and **full** (neural SigLIP + neural init) — directly isolating which pathway is carrying stimulus-specific information.
 
 ### Stage 2 — Pretrained IP-Adapter (InstantX/FLUX.1-dev-IP-Adapter)
 
@@ -53,18 +59,20 @@ This preserves everything the earlier custom-adapter plan used the aperture mask
 At test time the single trained stage is chained into the pretrained generator:
 
 ```
-neural r (N×T) ──encoder──▶ ẑ ∈ R^1152 ──MLPProj──▶ image_emb (128×4096)
-                                                              │
-                          optional text prompt ──T5/CLIP──▶ encoder_hidden_states
-                                                              │
-                                                              ▼
-                                     FLUX.1-dev + per-block IPAFluxAttnProcessor
-                                                              │
-                                                              ▼
-                                                        reconstruction x̂
+                    ┌── semantic ridge ──▶ ẑ_sem ∈ R^1152 ──MLPProj──▶ image_emb (128×4096)
+neural r (N×T) ─────┤                                                        │
+                    └── spatial ridge  ──▶ ẑ_spa ──decode──▶ init latent     │
+                                                                  │          │
+                              optional text prompt ──T5/CLIP──▶ encoder_hidden_states
+                                                                  │          │
+                                                                  ▼          ▼
+                                            FLUX.1-dev + per-block IPAFluxAttnProcessor
+                                                                  │
+                                                                  ▼
+                                                            reconstruction x̂
 ```
 
-The neural encoder predicts a SigLIP-aligned embedding from held-out neural responses; the vendored InstantX `MLPProjModel` expands it into 128 image tokens at FLUX's cross-attention dimension; and each transformer block mixes those image tokens with standard T5/CLIP text conditioning through parallel IP key/value attention. A starting Rust stimulus (or a gray plate) is VAE-encoded, noised to a configurable `strength`, and denoised under adapter conditioning with per-step aperture compositing, so the untrained ring of the canvas stays pinned to the original while the trained aperture is repainted from the neural signal.
+The semantic decoder predicts a SigLIP-aligned embedding that the vendored InstantX `MLPProjModel` expands into 128 image tokens at FLUX's cross-attention dimension; the spatial decoder predicts a low-dimensional structural target that is decoded into a FLUX-packed init latent. Each transformer block mixes the image tokens with standard T5/CLIP text conditioning through parallel IP key/value attention, while the init latent is noised to a configurable `strength` and denoised with per-step aperture compositing so the untrained ring of the canvas stays pinned and the trained aperture is repainted from the neural signal.
 
 ### Text-Conditioned Hybrid
 
@@ -79,11 +87,12 @@ Before evaluating neural-decoded embeddings, we measure an **upper-bound recover
 ## 4. Deliverables & Evaluation
 
 **Deliverables:**
-1. A trained neural encoder mapping IT pseudo-population activity to SigLIP space
-2. An inference wrapper around the pretrained InstantX/FLUX.1-dev-IP-Adapter with Rust-specific grayscale VAE encoding and per-step aperture compositing
-3. A conditioned image generation pipeline producing reconstructions from held-out neural responses
-4. A sanity-ceiling recovery analysis using ground-truth embeddings + init latents to bound adapter-side error
-5. A systematic comparison across decoding conditions (neural-only, text-only, neural+text) with ablations
+1. A trained **semantic** neural decoder mapping IT pseudo-population activity to SigLIP space
+2. A trained **spatial** neural decoder mapping the same activity to a FLUX-packed init-latent target
+3. An inference wrapper around the pretrained InstantX/FLUX.1-dev-IP-Adapter with Rust-specific grayscale VAE encoding and per-step aperture compositing
+4. A conditioned image generation pipeline producing reconstructions from held-out neural responses by combining the two decoders
+5. A sanity-ceiling recovery analysis using ground-truth embeddings + init latents to bound adapter-side error
+6. A systematic comparison across decoding conditions (semantic-only, spatial-only, full, ± text) with ablations
 
 **Evaluation:** We will use a fixed 200/50/50 train/val/test split over the 300 image stimulus set. Metrics include:
 - **Semantic similarity** — embedding cosine similarity
@@ -98,7 +107,7 @@ Before evaluating neural-decoded embeddings, we measure an **upper-bound recover
 
 ## 5. Compute Plan
 
-**Stage 1 (neural encoder):** Lightweight — ridge regression, MLP, or LSTM on neural time series. Runs in minutes on a local machine or Colab. Hyperparameter sweeps run via SLURM on the Issa Lab cluster inside an Apptainer container.
+**Stage 1 (neural decoders):** Lightweight — ridge regression for the spatial head, and ridge / MLP / LSTM for the semantic head on neural time series. Both run in minutes on a local machine or Colab. Hyperparameter sweeps run via SLURM on the Issa Lab cluster inside an Apptainer container.
 
 **Stage 2 (IP-Adapter):** Inference only — no gradient updates. Requires GPU memory for the frozen FLUX.1-dev transformer (~24 GB bf16) plus the pretrained InstantX adapter weights (small, negligible). Switching from a custom-trained adapter to pretrained InstantX eliminates a full training loop and its hyperparameter sweeps from the compute budget.
 
