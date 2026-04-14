@@ -27,7 +27,7 @@ $PYTHON scripts/train_ip_adapter_img2img.py \
     --embedding-source siglip  \
     --patch-grid       14      \
     --lr               1e-3    \
-    --epochs           50      \
+    --epochs           60      \
     --batch-size       32      \
     --micro-batch      2       \
     --weight-decay     1e-4    \

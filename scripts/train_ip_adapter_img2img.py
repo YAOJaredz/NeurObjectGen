@@ -9,9 +9,9 @@ STRENGTH_MIN_END across training so the adapter first learns near the easy
 low-noise regime and progressively faces harder high-noise samples.
 
 Loss: x0-space MSE against the ground-truth clean latent. Implemented as
-weighted velocity MSE with weight (t/(1-t))^2, which is algebraically
-identical to ‖x0_pred - x0‖^2 but avoids the numerical blow-up of dividing
-by (1-t). Cancels the high-t gradient dominance that drives mean-seeking blur.
+weighted velocity MSE with weight t^2, since for flow matching
+xt = x0 + t*v implies x0_pred - x0 = -t*(v_pred - v), so
+‖x0_pred - x0‖^2 = t^2 * ‖v_pred - v‖^2.
 
 Embedding source is switchable via ``--embedding-source``:
   siglip  (default) — ground-truth SigLIP embeddings from cache
@@ -50,17 +50,19 @@ from config_const import (
     SIGLIP_PATCH14_PATH,
 )
 from data_utils.stimuli import load_rust_stimuli
-from generation.flux_ipadapter import load_pipeline
+from generation.flux_ipadapter import IP_TOKEN_GAIN, load_pipeline
 from get_device import get_device
 
 
 # --- Strength curriculum (hardcoded) ---------------------------------------
-# Linearly ramp the lower bound of the training timestep range from
-# STRENGTH_MIN_START at epoch 1 up to STRENGTH_MIN_END at the final epoch.
-# Upper bound STRENGTH_MAX is fixed.
-STRENGTH_MIN_START = 0.3
-STRENGTH_MIN_END   = 0.6
-STRENGTH_MAX       = 0.9
+# Warm up the lower bound of the training timestep range from
+# STRENGTH_MIN_START to STRENGTH_MIN_END over the first STRENGTH_WARMUP_EPOCHS
+# epochs, then hold at STRENGTH_MIN_END for the rest of training. The upper
+# bound STRENGTH_MAX is fixed.
+STRENGTH_MIN_START    = 0.3
+STRENGTH_MIN_END      = 0.5
+STRENGTH_MAX          = 0.8
+STRENGTH_WARMUP_EPOCHS = 10
 
 
 # ---------------------------------------------------------------------------
@@ -368,7 +370,10 @@ def train(args):
     ckpt_dir = run_dir(args)
     ckpt_dir.mkdir(parents=True, exist_ok=True)
     print(f"Checkpoints -> {ckpt_dir}")
-    print(f"Strength curriculum: t_lo {STRENGTH_MIN_START} -> {STRENGTH_MIN_END}, t_hi={STRENGTH_MAX}")
+    print(
+        f"Strength curriculum: t_lo {STRENGTH_MIN_START} -> {STRENGTH_MIN_END} "
+        f"over first {STRENGTH_WARMUP_EPOCHS} epochs, then held; t_hi={STRENGTH_MAX}"
+    )
 
     best_loss = float("inf")
     n_ip_tokens = ip_adapter.n_tokens
@@ -377,16 +382,23 @@ def train(args):
     t_hi = STRENGTH_MAX
 
     for epoch in range(1, args.epochs + 1):
-        # Linear curriculum on the lower strength bound.
-        if args.epochs > 1:
-            frac = (epoch - 1) / (args.epochs - 1)
+        # Warmup curriculum on the lower strength bound: ramp linearly across
+        # the first STRENGTH_WARMUP_EPOCHS, then hold at STRENGTH_MIN_END.
+        if STRENGTH_WARMUP_EPOCHS > 1 and epoch <= STRENGTH_WARMUP_EPOCHS:
+            frac = (epoch - 1) / (STRENGTH_WARMUP_EPOCHS - 1)
         else:
             frac = 1.0
         t_lo = STRENGTH_MIN_START + (STRENGTH_MIN_END - STRENGTH_MIN_START) * frac
+        # TEMP: fix training window to [0.5, 0.8] for loss-drop sanity check
+        t_lo = 0.5
+        t_hi = 0.8
 
         ip_adapter.train()
         perm_e = torch.randperm(n_train)
         epoch_loss = 0.0
+        epoch_vmse = 0.0
+        epoch_ip_norm = 0.0
+        epoch_grad_norm = 0.0
         n_micro = 0
         n_updates = 0
 
@@ -422,13 +434,13 @@ def train(args):
             noise  = torch.randn_like(x0)
             xt     = (1 - t[:, None, None]) * x0 + t[:, None, None] * noise
 
-            ip_tokens = ip_adapter(emb.float()).to(bf16)      # (b, n_tokens, 4096)
+            ip_tokens = (ip_adapter(emb.float()) * IP_TOKEN_GAIN).to(bf16)   # (b, n_tokens, 4096)
             # Replace dropped samples with unconditional tokens.
             if is_dropped.any():
                 if args.patch_grid is None:
-                    uncond_tokens = ip_adapter(null_embed.float()).to(bf16)  # (1, n_tokens, 4096)
+                    uncond_tokens = (ip_adapter(null_embed.float()) * IP_TOKEN_GAIN).to(bf16)
                 else:
-                    uncond_tokens = ip_adapter.null(1).to(bf16)              # (1, n_tokens, 4096)
+                    uncond_tokens = (ip_adapter.null(1) * IP_TOKEN_GAIN).to(bf16)
                 ip_tokens[is_dropped] = uncond_tokens.expand(is_dropped.sum(), -1, -1)
 
             guidance  = torch.full([b], args.guidance_scale, device=device, dtype=bf16)
@@ -447,24 +459,28 @@ def train(args):
             )[0]
 
             # Weighted velocity MSE ≡ x0-space MSE against the clean latent.
-            # ‖x0_pred - x0‖² = (t/(1-t))² · ‖pred - (noise - x0)‖²
+            # xt = x0 + t*v  ⇒  x0_pred - x0 = -t*(v_pred - v)
+            # ‖x0_pred - x0‖² = t² · ‖pred - (noise - x0)‖²
             target = (noise - x0).float()
             err    = (pred.float() - target) ** 2              # (b, seq, 64)
             t_f    = t.float()
-            x0_weight = (t_f / (1.0 - t_f)) ** 2               # (b,)
+            x0_weight = t_f ** 2                               # (b,)
             denom  = mask.sum() * err.shape[-1]
-            per_sample_loss = (err * mask).sum(dim=(1, 2)) / denom   # (b,)
-            per_sample_loss = per_sample_loss * x0_weight
+            per_sample_vmse = (err * mask).sum(dim=(1, 2)) / denom   # (b,)
+            per_sample_loss = per_sample_vmse * x0_weight
             micro_loss = per_sample_loss.mean()
             loss = micro_loss * (b / args.batch_size)
             loss.backward()
 
             epoch_loss += micro_loss.item() * b
+            epoch_vmse += per_sample_vmse.mean().item() * b
+            epoch_ip_norm += ip_tokens.float().norm(dim=-1).mean().item() * b
             n_micro += b
             is_last = (step == n_forwards - 1)
 
             if (step + 1) % accum_steps == 0 or is_last:
-                torch.nn.utils.clip_grad_norm_(ip_adapter.parameters(), 1.0)
+                gnorm = torch.nn.utils.clip_grad_norm_(ip_adapter.parameters(), 1.0)
+                epoch_grad_norm += gnorm.item()
                 optimizer.step()
                 scheduler.step()
                 optimizer.zero_grad()
@@ -472,6 +488,9 @@ def train(args):
                 pbar.set_postfix(loss=f"{epoch_loss / n_micro:.5f}")
 
         epoch_loss /= n_train
+        epoch_vmse /= n_train
+        epoch_ip_norm /= n_train
+        epoch_grad_norm = epoch_grad_norm / max(n_updates, 1)
 
         # --- Validation ---
         ip_adapter.eval()
@@ -491,7 +510,7 @@ def train(args):
                 noise = torch.randn_like(x0)
                 xt    = (1 - t[:, None, None]) * x0 + t[:, None, None] * noise
 
-                ip_tokens = ip_adapter(emb.float()).to(bf16)
+                ip_tokens = (ip_adapter(emb.float()) * IP_TOKEN_GAIN).to(bf16)
                 guidance  = torch.full([b], args.guidance_scale, device=device, dtype=bf16)
 
                 pred = pipe.transformer(
@@ -509,7 +528,7 @@ def train(args):
                 target = (noise - x0).float()
                 err    = (pred.float() - target) ** 2
                 t_f    = t.float()
-                x0_weight = (t_f / (1.0 - t_f)) ** 2
+                x0_weight = t_f ** 2
                 denom  = mask.sum() * err.shape[-1]
                 per_sample = (err * mask).sum(dim=(1, 2)) / denom
                 val_loss += (per_sample * x0_weight).sum().item()
@@ -519,8 +538,11 @@ def train(args):
         print(
             f"epoch {epoch:3d}/{args.epochs}"
             f"  train={epoch_loss:.5f}"
+            f"  vmse={epoch_vmse:.5f}"
             f"  val={val_loss:.5f}"
             f"  lr={current_lr:.2e}"
+            f"  ip_norm={epoch_ip_norm:.3f}"
+            f"  gnorm={epoch_grad_norm:.3f}"
             f"  t_lo={t_lo:.3f}"
         )
 
@@ -546,7 +568,7 @@ def parse_args():
     p.add_argument("--n-tokens",          type=int,   default=16)
     p.add_argument("--hidden",            type=int,   default=1024)
     p.add_argument("--image-size",        type=int,   default=512)
-    p.add_argument("--epochs",            type=int,   default=50)
+    p.add_argument("--epochs",            type=int,   default=60)
     p.add_argument("--batch-size",        type=int,   default=32)
     p.add_argument("--micro-batch",       type=int,   default=4)
     p.add_argument("--lr",                type=float, default=1e-3)

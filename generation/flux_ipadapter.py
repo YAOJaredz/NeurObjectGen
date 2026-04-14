@@ -42,6 +42,14 @@ def _load_packed_aperture_mask(
 # FLUX T5 encoder_hidden_states width — the dim of tokens fed to the transformer.
 FLUX_TEXT_DIM = 4096
 
+# Static gain applied to IP-adapter output tokens. FLUX's cross-attention was
+# trained against T5 encoder_hidden_states whose per-token L2 norm is ~20-40,
+# while a freshly-initialised IPAdapterProjection outputs tokens with norm ~1.
+# Without this gain the IP tokens are too small to influence attention, the
+# backward signal to the adapter is tiny, and training stalls. Keep train and
+# inference in sync by always multiplying the adapter output by this constant.
+IP_TOKEN_GAIN = 15.0
+
 
 # ---------------------------------------------------------------------------
 # IP-Adapter: project an image embedding into N extra text tokens that get
@@ -290,7 +298,7 @@ def generate(
     # --- 4. IP-Adapter: project image embedding into extra text tokens ------
     ip_adapter.eval()
     ip_dtype = next(ip_adapter.parameters()).dtype
-    ip_tokens = ip_adapter(image_embedding.to(ip_dtype)).to(dtype) * ip_adapter_scale
+    ip_tokens = ip_adapter(image_embedding.to(ip_dtype)).to(dtype) * (IP_TOKEN_GAIN * ip_adapter_scale)
     # (1, n_tokens, 4096)
     ip_ids = torch.zeros(ip_tokens.shape[1], 3, device=device, dtype=dtype)
 
@@ -449,17 +457,18 @@ def generate_img2img(
     ip_adapter.eval()
     ip_dtype = next(ip_adapter.parameters()).dtype
 
-    cond_tokens = ip_adapter(image_embedding.to(ip_dtype)).to(dtype) * ip_adapter_scale
+    gain = IP_TOKEN_GAIN * ip_adapter_scale
+    cond_tokens = ip_adapter(image_embedding.to(ip_dtype)).to(dtype) * gain
     # (1, n_tokens, 4096)
 
     # Unconditional tokens. For the patch adapter we use the learned null
     # parameter; for the global adapter we project a zero embedding (matches
     # the training-time dropout null).
     if is_patch_adapter:
-        uncond_tokens = ip_adapter.null(1).to(dtype) * ip_adapter_scale
+        uncond_tokens = ip_adapter.null(1).to(dtype) * gain
     else:
         null_embed   = torch.zeros_like(image_embedding.to(ip_dtype))
-        uncond_tokens = ip_adapter(null_embed).to(dtype) * ip_adapter_scale
+        uncond_tokens = ip_adapter(null_embed).to(dtype) * gain
     # (1, n_tokens, 4096)
 
     ip_ids = torch.zeros(cond_tokens.shape[1], 3, device=device, dtype=dtype)
