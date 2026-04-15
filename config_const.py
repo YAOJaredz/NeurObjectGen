@@ -30,4 +30,5 @@ N_TEST = 50
 RUST_TIME_WINDOW = (0, 250)
 
 SIGLIP_DIM = 1152  # google/siglip-so400m-patch14-384
+CLIP_DIM = 768     # FLUX CLIP pooled embedding dim
 CHECKPOINT_DIR = REPO_ROOT / "checkpoints"

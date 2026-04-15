@@ -6,7 +6,7 @@ from HexPred.object_response.get_rust_response import get_rust_responses
 # from HexPred.object_response.get_hvm_response import get_hvm_responses
 from HexPred.constants import ALL_MONKEYS
 
-from config_const import N_STIMULI, N_TRAIN, N_VAL, RUST_TIME_WINDOW, SEED, SIGLIP_EMBEDDINGS_PATH
+from config_const import N_STIMULI, N_TRAIN, N_VAL, RUST_TIME_WINDOW, SEED, SIGLIP_EMBEDDINGS_PATH, CLIP_EMBEDS_PATH
 from data_utils.stimuli import load_rust_stimuli
 
 
@@ -15,6 +15,7 @@ def make_rust_loader(
     seed: int = SEED,
     verbose: bool = True,
     use_embeddings: bool = False,
+    target: str = "siglip",
 ) -> tuple[DataLoader, DataLoader, DataLoader]:
     """Build train/val/test DataLoaders for neural-response → image reconstruction.
 
@@ -68,12 +69,16 @@ def make_rust_loader(
     neural_tensor = torch.from_numpy(object_responses).float()  # (N_STIMULI, neurons, time)
 
     if use_embeddings:
-        if not SIGLIP_EMBEDDINGS_PATH.exists():
-            raise FileNotFoundError(
-                f"SigLIP cache not found at {SIGLIP_EMBEDDINGS_PATH}. "
-                "Run: python scripts/cache_siglip.py"
-            )
-        target_tensor = torch.load(SIGLIP_EMBEDDINGS_PATH, weights_only=True)  # (N_STIMULI, D)
+        _EMBED_PATHS = {
+            "siglip": (SIGLIP_EMBEDDINGS_PATH, "python scripts/cache_siglip.py"),
+            "clip":   (CLIP_EMBEDS_PATH,        "python scripts/cache_text_embeds.py --device cuda"),
+        }
+        if target not in _EMBED_PATHS:
+            raise ValueError(f"Unknown target '{target}'. Choose from: {list(_EMBED_PATHS)}")
+        embed_path, hint = _EMBED_PATHS[target]
+        if not embed_path.exists():
+            raise FileNotFoundError(f"{target} cache not found at {embed_path}. Run: {hint}")
+        target_tensor = torch.load(embed_path, weights_only=True)  # (N_STIMULI, D)
     else:
         target_tensor = load_rust_stimuli()  # (N_STIMULI, 3, 224, 224)
 

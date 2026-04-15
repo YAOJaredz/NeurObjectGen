@@ -23,7 +23,9 @@ from torch.optim.lr_scheduler import CosineAnnealingLR
 REPO_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPO_ROOT))
 
-from config_const import SEED, SIGLIP_DIM, CHECKPOINT_DIR
+from config_const import SEED, SIGLIP_DIM, CLIP_DIM, CHECKPOINT_DIR
+
+TARGET_DIMS = {"siglip": SIGLIP_DIM, "clip": CLIP_DIM}
 from data_utils.rust_loader import make_rust_loader
 from encoders import BottleneckMLP, TemporalLSTM, TemporalTransformer
 from eval.metrics import two_afc_identification
@@ -49,8 +51,8 @@ def run_name(args) -> str:
 
 
 def run_dir(args) -> Path:
-    """checkpoints/<model>/<run_name>/"""
-    return CHECKPOINT_DIR / args.model / run_name(args)
+    """checkpoints/<model>/<target>/<run_name>/"""
+    return CHECKPOINT_DIR / args.model / args.target / run_name(args)
 
 
 def save_checkpoint(path: Path, model, optimizer, scheduler, epoch: int, metrics: dict, args):
@@ -95,16 +97,16 @@ def infonce_loss(pred: torch.Tensor, target: torch.Tensor, temperature: float = 
 # Model factory
 # ---------------------------------------------------------------------------
 
-def build_model(args, n_neurons: int, n_time: int) -> torch.nn.Module:
+def build_model(args, n_neurons: int, n_time: int, out_dim: int) -> torch.nn.Module:
     if args.model == "mlp":
         in_dim = n_neurons * n_time
-        return BottleneckMLP(in_dim=in_dim, bottleneck=args.bottleneck, out_dim=SIGLIP_DIM, dropout=args.dropout)
+        return BottleneckMLP(in_dim=in_dim, bottleneck=args.bottleneck, out_dim=out_dim, dropout=args.dropout)
     elif args.model == "lstm":
-        return TemporalLSTM(n_neurons=n_neurons, hidden=args.hidden, out_dim=SIGLIP_DIM, dropout=args.dropout)
+        return TemporalLSTM(n_neurons=n_neurons, hidden=args.hidden, out_dim=out_dim, dropout=args.dropout)
     elif args.model == "transformer":
         return TemporalTransformer(
             n_neurons=n_neurons, d_model=args.d_model, n_heads=args.n_heads,
-            n_layers=args.n_layers, out_dim=SIGLIP_DIM, dropout=args.dropout,
+            n_layers=args.n_layers, out_dim=out_dim, dropout=args.dropout,
         )
     else:
         raise ValueError(f"unknown model: {args.model}")
@@ -126,8 +128,10 @@ def train_with_embeddings(args):
     torch.manual_seed(SEED)
     device = get_device()
 
+    out_dim = TARGET_DIMS[args.target]
+
     train_loader, val_loader, test_loader = make_rust_loader(
-        batch_size=args.batch_size, use_embeddings=True,
+        batch_size=args.batch_size, use_embeddings=True, target=args.target,
     )
 
     sample_neural, _ = next(iter(train_loader))
@@ -143,7 +147,7 @@ def train_with_embeddings(args):
     if args.batch_size < 2:
         raise ValueError("batch_size must be >= 2 for InfoNCE loss.")
 
-    model = build_model(args, n_neurons, n_time).to(device)
+    model = build_model(args, n_neurons, n_time, out_dim).to(device)
     print(f"Model: {model.__class__.__name__} | params: {sum(p.numel() for p in model.parameters() if p.requires_grad):,}")
 
     optimizer = AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
@@ -223,6 +227,8 @@ def train_with_embeddings(args):
 def parse_args():
     p = argparse.ArgumentParser()
     p.add_argument("--model", choices=["mlp", "lstm", "transformer"], default="mlp")
+    p.add_argument("--target", choices=["siglip", "clip"], default="siglip",
+                   help="Embedding space to predict: siglip (1152-d) or clip (768-d)")
 
     # MLP
     p.add_argument("--bottleneck", type=int, default=256)
