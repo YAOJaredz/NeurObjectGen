@@ -11,19 +11,24 @@ class TemporalLSTM(nn.Module):
     Input shape:  (B, T, N_neurons) — batch of population responses over time.
     Output shape: (B, out_dim)      — L2-normalised SigLIP embedding.
 
-    The final hidden state of the LSTM is projected to out_dim.
+    The final hidden state of the top LSTM layer is projected to out_dim.
 
     Args:
         n_neurons: Number of neurons (input features at each time step).
         hidden:    LSTM hidden size.
-        out_dim:   SigLIP embedding dimension (1152 for so400m-patch14-384).
-        dropout:   Dropout probability applied to the LSTM output before projection.
+        out_dim:   Embedding output dimension.
+        n_layers:  Number of stacked LSTM layers (default 1).
+        dropout:   Dropout probability applied between LSTM layers and before projection.
     """
 
-    def __init__(self, n_neurons: int, hidden: int, out_dim: int, dropout: float = 0.0):
+    def __init__(self, n_neurons: int, hidden: int, out_dim: int, n_layers: int = 1, dropout: float = 0.0):
         super().__init__()
         self.input_norm = nn.LayerNorm(n_neurons)
-        self.lstm = nn.LSTM(input_size=n_neurons, hidden_size=hidden, batch_first=True)
+        self.lstm = nn.LSTM(
+            input_size=n_neurons, hidden_size=hidden,
+            num_layers=n_layers, batch_first=True,
+            dropout=dropout if n_layers > 1 else 0.0,
+        )
         self.drop = nn.Dropout(dropout)
         self.proj = nn.Linear(hidden, out_dim)
 
@@ -36,6 +41,6 @@ class TemporalLSTM(nn.Module):
             (B, out_dim) L2-normalised embedding tensor.
         """
         x = self.input_norm(x)                              # normalise across neurons at each time step
-        _, (h_n, _) = self.lstm(x)                         # h_n: (1, B, hidden)
-        out = self.proj(self.drop(h_n.squeeze(0)))          # (B, out_dim)
+        _, (h_n, _) = self.lstm(x)                         # h_n: (n_layers, B, hidden)
+        out = self.proj(self.drop(h_n[-1]))                 # top layer: (B, hidden)
         return F.normalize(out, dim=-1)

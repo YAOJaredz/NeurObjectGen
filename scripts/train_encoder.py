@@ -45,7 +45,7 @@ def run_name(args) -> str:
     if args.model == "mlp":
         return f"bn{args.bottleneck}_{shared}"
     elif args.model == "lstm":
-        return f"h{args.hidden}_{shared}"
+        return f"h{args.hidden}_nl{args.n_layers}_{shared}"
     else:
         return f"d{args.d_model}_nh{args.n_heads}_nl{args.n_layers}_{shared}"
 
@@ -102,7 +102,7 @@ def build_model(args, n_neurons: int, n_time: int, out_dim: int) -> torch.nn.Mod
         in_dim = n_neurons * n_time
         return BottleneckMLP(in_dim=in_dim, bottleneck=args.bottleneck, out_dim=out_dim, dropout=args.dropout)
     elif args.model == "lstm":
-        return TemporalLSTM(n_neurons=n_neurons, hidden=args.hidden, out_dim=out_dim, dropout=args.dropout)
+        return TemporalLSTM(n_neurons=n_neurons, hidden=args.hidden, out_dim=out_dim, n_layers=args.n_layers, dropout=args.dropout)
     elif args.model == "transformer":
         return TemporalTransformer(
             n_neurons=n_neurons, d_model=args.d_model, n_heads=args.n_heads,
