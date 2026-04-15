@@ -1,6 +1,6 @@
 #!/bin/bash
 # Sweep MLP encoder over both embedding targets (siglip, clip).
-# Grid: 2 targets x 3 bottlenecks x 2 dropouts x 2 lrs x 2 wds = 48 jobs.
+# Grid: 2 targets x 3 bottlenecks x 2 dropouts = 12 jobs.
 
 #SBATCH --job-name=mlp_target_sweep
 #SBATCH --account=yy3658
@@ -12,7 +12,7 @@
 #SBATCH --partition=issa
 #SBATCH --exclude=ax09,ax10,ax11
 #SBATCH --output=/home/yy3658/NeurObjectGen/jobs/logs/mlp_target_sweep_%A_%a.log
-#SBATCH --array=0-47%6   # 2 targets x 3 bottlenecks x 2 dropouts x 2 lrs x 2 wds = 48
+#SBATCH --array=0-11%6   # 2 targets x 3 bottlenecks x 2 dropouts = 12
 
 # ---------------------------------------------------------------------------
 # Environment
@@ -32,21 +32,19 @@ $PYTHON -V
 TARGETS=(siglip clip)
 BOTTLENECKS=(64 128 256)
 DROPOUTS=(0.1 0.3)
-LRS=(1e-3 3e-4)
-WEIGHT_DECAYS=(1e-2 1e-1)
+
+# fixed
+LR=3e-4
+WD=1e-1
 
 N_TG=${#TARGETS[@]}          # 2
 N_BN=${#BOTTLENECKS[@]}      # 3
 N_DO=${#DROPOUTS[@]}         # 2
-N_LR=${#LRS[@]}              # 2
-N_WD=${#WEIGHT_DECAYS[@]}    # 2
 
-# 2 x 3 x 2 x 2 x 2 = 48 total
+# 2 x 3 x 2 = 12 total
 TASK_ID=${SLURM_ARRAY_TASK_ID:-0}
 
 idx=$TASK_ID
-WD_IDX=$((idx % N_WD));   idx=$((idx / N_WD))
-LR_IDX=$((idx % N_LR));   idx=$((idx / N_LR))
 DO_IDX=$((idx % N_DO));   idx=$((idx / N_DO))
 BN_IDX=$((idx % N_BN));   idx=$((idx / N_BN))
 TG_IDX=$((idx % N_TG))
@@ -54,10 +52,8 @@ TG_IDX=$((idx % N_TG))
 TARGET=${TARGETS[$TG_IDX]}
 BOTTLENECK=${BOTTLENECKS[$BN_IDX]}
 DROPOUT=${DROPOUTS[$DO_IDX]}
-LR=${LRS[$LR_IDX]}
-WD=${WEIGHT_DECAYS[$WD_IDX]}
 
-echo "Task ${SLURM_ARRAY_TASK_ID}: target=${TARGET} bottleneck=${BOTTLENECK} dropout=${DROPOUT} lr=${LR} wd=${WD}"
+echo "Task ${SLURM_ARRAY_TASK_ID}: target=${TARGET} bottleneck=${BOTTLENECK} dropout=${DROPOUT}"
 
 # ---------------------------------------------------------------------------
 # Train

@@ -157,7 +157,7 @@ def train_with_embeddings(args):
     ckpt_dir.mkdir(parents=True, exist_ok=True)
     print(f"Checkpoints -> {ckpt_dir}")
 
-    best_val_loss = float("inf")
+    best_val_2afc = 0.0
 
     for epoch in range(1, args.epochs + 1):
         # --- train ---
@@ -210,8 +210,8 @@ def train_with_embeddings(args):
         metrics = {"epoch": epoch, "train_loss": train_loss, "val_loss": val_loss, "val_2afc": afc}
 
         save_checkpoint(ckpt_dir / "last.pt", model, optimizer, scheduler, epoch, metrics, args)
-        if val_loss < best_val_loss:
-            best_val_loss = val_loss
+        if afc > best_val_2afc:
+            best_val_2afc = afc
             save_checkpoint(ckpt_dir / "best.pt", model, optimizer, scheduler, epoch, metrics, args)
 
     # restore best weights for the returned model
