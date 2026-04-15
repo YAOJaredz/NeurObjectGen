@@ -1,37 +1,50 @@
-"""Train a ridge regression decoder mapping IT responses -> spatial latent targets.
+"""Train a ridge regression decoder mapping IT responses -> spatial targets.
 
-The spatial target is a PCA-compressed representation of the FLUX VAE packed latent
-of each stimulus.  At inference the predicted PCA codes are projected back into latent
-space and used as the init_image for generate_img2img(..., ip_adapter_scale=<semantic>).
+Two target modes:
+
+  pixel  (default)
+    Downsample each stimulus to `--image-size` grayscale pixels, flatten to
+    (N, H*W), fit PCA, then ridge. At inference, predicted PCA codes are
+    reconstructed to a grayscale image and upsampled to the full resolution
+    before being passed as init_image to generate_img2img.
+
+  latent
+    Use the FLUX VAE packed latent as the target (original behaviour).
+    (cached to cache/spatial_latents_<size>.pt via generation/latent_cache.py)
 
 Pipeline:
-  1. Encode every training stimulus with the FLUX VAE -> packed latent (1, L, C).
-     (cached to cache/spatial_latents_<size>.pt via generation/latent_cache.py)
-  2. Flatten to (N, L*C) and fit PCA on the training split.
-  3. Project all splits to n_components PCA codes.
-  4. Fit closed-form ridge regression: X_neural (N, neurons*time) -> Z_pca (N, K).
-  5. Evaluate on val/test: report per-component R² and 2AFC identification in PCA space.
+  1. Build targets: pixel array (N, H*W) or VAE latents (N, L*C).
+  2. Fit PCA on the training split -> n_components codes.
+  3. Fit closed-form ridge regression: X_neural -> Z_pca.
+  4. Evaluate: per-component R² and 2AFC on train/val/test.
 
 Usage:
     python scripts/train_spatial_ridge.py
-    python scripts/train_spatial_ridge.py --n-components 64 --alpha 1e4
-    python scripts/train_spatial_ridge.py --image-size 256 --no-cache
+    python scripts/train_spatial_ridge.py --target pixel --image-size 32 --n-components 64
+    python scripts/train_spatial_ridge.py --target latent --image-size 512 --alpha 1e8
 """
 
 import argparse
 import sys
-from pathlib import Path
 
 import numpy as np
 import torch
+from PIL import Image
 
 sys.path.insert(0, '.')
 
 from config_const import CHECKPOINT_DIR, N_STIMULI, N_TRAIN, N_VAL, SEED
 from data_utils.rust_loader import make_rust_loader
 from eval.metrics import r2_per_component, two_afc_identification
-from generation.latent_cache import load_latent_cache
-from spatial_decoder.ridge import fit_ridge, decode_spatial_ridge  # noqa: F401  (re-exported for callers)
+from generation.latent_cache import build_pixel_targets, load_latent_cache
+from spatial_decoder.ridge import fit_ridge
+
+
+def _load_targets(args) -> torch.Tensor:
+    if args.target == "pixel":
+        return build_pixel_targets(args.image_size)
+    else:
+        return load_latent_cache(args.image_size, args.device, force=args.no_cache)
 
 
 def train(args):
@@ -53,8 +66,19 @@ def train(args):
 
     print(f"Neural features: train={X_train.shape}, val={X_val.shape}, test={X_test.shape}")
 
-    # --- spatial latent targets ---
-    latents_flat = load_latent_cache(args.image_size, args.device, force=args.no_cache)
+    # --- optional neural PCA ---
+    if args.n_neural_pcs > 0:
+        print(f"Fitting neural PCA: {X_train.shape[1]} -> {args.n_neural_pcs} components...")
+        X_mean = X_train.mean(axis=0, keepdims=True)
+        _, _, Vt_x = np.linalg.svd(X_train - X_mean, full_matrices=False)
+        V_x = Vt_x[:args.n_neural_pcs].T   # (d_in, n_neural_pcs)
+        X_train = (X_train - X_mean) @ V_x
+        X_val   = (X_val   - X_mean) @ V_x
+        X_test  = (X_test  - X_mean) @ V_x
+        print(f"Neural features after PCA: {X_train.shape}")
+
+    # --- targets ---
+    targets_flat = _load_targets(args)
 
     rng = np.random.default_rng(SEED)
     perm = rng.permutation(N_STIMULI)
@@ -62,7 +86,7 @@ def train(args):
     val_idx   = perm[N_TRAIN:N_TRAIN + N_VAL]
     test_idx  = perm[N_TRAIN + N_VAL:]
 
-    Z_all   = latents_flat.numpy()
+    Z_all   = targets_flat.numpy()
     Z_train = Z_all[train_idx]
     Z_val   = Z_all[val_idx]
     Z_test  = Z_all[test_idx]
@@ -71,7 +95,7 @@ def train(args):
     print(f"Fitting PCA: {Z_train.shape[1]} -> {args.n_components} components...")
     Z_mean = Z_train.mean(axis=0, keepdims=True)
     _, S, Vt = np.linalg.svd(Z_train - Z_mean, full_matrices=False)
-    V = Vt[:args.n_components].T   # (D_latent, K)
+    V = Vt[:args.n_components].T   # (D, K)
 
     explained = (S[:args.n_components] ** 2).sum() / (S ** 2).sum()
     print(f"PCA explained variance: {explained*100:.1f}% with {args.n_components} components")
@@ -85,15 +109,19 @@ def train(args):
     W = fit_ridge(X_train, Y_train, alpha=args.alpha)
 
     # --- evaluate ---
-    Y_val_pred  = X_val  @ W
-    Y_test_pred = X_test @ W
+    Y_train_pred = X_train @ W
+    Y_val_pred   = X_val   @ W
+    Y_test_pred  = X_test  @ W
 
-    r2_val  = r2_per_component(Y_val_pred,  Y_val)
-    r2_test = r2_per_component(Y_test_pred, Y_test)
+    r2_train = r2_per_component(Y_train_pred, Y_train)
+    r2_val   = r2_per_component(Y_val_pred,   Y_val)
+    r2_test  = r2_per_component(Y_test_pred,  Y_test)
 
-    print(f"\nVal  R²: mean={r2_val.mean():.4f}  median={np.median(r2_val):.4f}  "
+    print(f"\nTrain R²: mean={r2_train.mean():.4f}  median={np.median(r2_train):.4f}  "
+          f"frac>0={(r2_train > 0).mean()*100:.1f}%")
+    print(f"Val   R²: mean={r2_val.mean():.4f}  median={np.median(r2_val):.4f}  "
           f"frac>0={(r2_val > 0).mean()*100:.1f}%")
-    print(f"Test R²: mean={r2_test.mean():.4f}  median={np.median(r2_test):.4f}  "
+    print(f"Test  R²: mean={r2_test.mean():.4f}  median={np.median(r2_test):.4f}  "
           f"frac>0={(r2_test > 0).mean()*100:.1f}%")
 
     afc_val  = two_afc_identification(
@@ -110,15 +138,24 @@ def train(args):
     ckpt_dir = CHECKPOINT_DIR / "spatial_ridge"
     ckpt_dir.mkdir(parents=True, exist_ok=True)
 
-    save_path = ckpt_dir / f"ridge_K{args.n_components}_a{args.alpha:.0e}.npz"
+    save_path = ckpt_dir / f"ridge_{args.target}_K{args.n_components}_a{args.alpha:.0e}.npz"
+    extras = {}
+    if args.n_neural_pcs > 0:
+        extras["neural_pca_mean"] = X_mean
+        extras["neural_pca_V"]    = V_x
+
     np.savez(
         save_path,
         W=W,
         pca_mean=Z_mean,
         pca_V=V,
+        target=np.array([args.target]),
         image_size=np.array([args.image_size]),
         alpha=np.array([args.alpha]),
         n_components=np.array([args.n_components]),
+        n_neural_pcs=np.array([args.n_neural_pcs]),
+        **extras,
+        train_r2_mean=np.array([r2_train.mean()]),
         val_r2_mean=np.array([r2_val.mean()]),
         test_r2_mean=np.array([r2_test.mean()]),
         val_2afc=np.array([afc_val]),
@@ -128,14 +165,51 @@ def train(args):
     return save_path
 
 
+def project_neural(neural_flat: np.ndarray, ckpt: dict) -> np.ndarray:
+    """Apply neural PCA projection from checkpoint if present."""
+    if "neural_pca_mean" in ckpt:
+        neural_flat = (neural_flat - ckpt["neural_pca_mean"]) @ ckpt["neural_pca_V"]
+    return neural_flat
+
+
+def decode_to_pil(pca_codes: np.ndarray, ckpt: dict, output_size: int = 512) -> list[Image.Image]:
+    """Reconstruct predicted pixel images from PCA codes and upsample.
+
+    Args:
+        pca_codes:   (N, K) predicted PCA codes from ridge
+        ckpt:        loaded .npz checkpoint dict
+        output_size: final PIL image size (upsampled from image_size)
+
+    Returns:
+        List of N PIL RGB images ready for generate_img2img as init_image.
+    """
+    Z_mean = ckpt["pca_mean"]   # (1, H*W)
+    V      = ckpt["pca_V"]      # (H*W, K)
+    hw     = int(ckpt["image_size"][0])
+
+    pixels = pca_codes @ V.T + Z_mean   # (N, H*W)
+    pixels = np.clip(pixels, 0.0, 1.0)
+
+    images = []
+    for px in pixels:
+        gray = Image.fromarray((px.reshape(hw, hw) * 255).astype(np.uint8), mode="L")
+        images.append(gray.convert("RGB").resize((output_size, output_size), Image.LANCZOS))
+    return images
+
+
 def parse_args():
     p = argparse.ArgumentParser()
-    p.add_argument("--n-components", type=int, default=128)
+    p.add_argument("--target", choices=["pixel", "latent"], default="pixel")
+    p.add_argument("--n-neural-pcs", type=int, default=100,
+                   help="PCA on neural features before ridge. 0 = disabled.")
+    p.add_argument("--n-components", type=int, default=64)
     p.add_argument("--alpha", type=float, default=1e4)
-    p.add_argument("--image-size", type=int, default=512)
-    p.add_argument("--device", default="cuda")
+    p.add_argument("--image-size", type=int, default=32,
+                   help="Pixel target: downsample size. Latent target: VAE encode size.")
+    p.add_argument("--device", default="cuda",
+                   help="Used only for latent target VAE encoding.")
     p.add_argument("--no-cache", action="store_true",
-                   help="Re-encode stimuli even if a latent cache already exists")
+                   help="Re-encode stimuli even if a latent cache already exists (latent target only).")
     return p.parse_args()
 
 

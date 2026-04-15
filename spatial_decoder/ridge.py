@@ -9,7 +9,11 @@ import torch
 
 
 def fit_ridge(X: np.ndarray, Y: np.ndarray, alpha: float) -> np.ndarray:
-    """Closed-form ridge: W = (X^T X + alpha I)^{-1} X^T Y.
+    """Closed-form ridge regression, solved in whichever space is smaller.
+
+    When d_in > N (over-determined features) uses the dual form:
+        W = X^T (X X^T + alpha I)^{-1} Y
+    which only requires an N×N solve instead of d_in×d_in.
 
     Args:
         X:     (N, d_in)  neural features
@@ -19,10 +23,18 @@ def fit_ridge(X: np.ndarray, Y: np.ndarray, alpha: float) -> np.ndarray:
     Returns:
         W: (d_in, d_out) weight matrix
     """
-    XtX = X.T @ X
-    XtX_reg = XtX + alpha * np.eye(XtX.shape[0])
-    XtY = X.T @ Y
-    return np.linalg.solve(XtX_reg, XtY)
+    N, d_in = X.shape
+    if d_in > N:
+        # dual form: solve (K + alpha I) C = Y, then W = X^T C
+        K = X @ X.T                          # (N, N)
+        K_reg = K + alpha * np.eye(N)
+        C = np.linalg.solve(K_reg, Y)        # (N, d_out)
+        return X.T @ C                       # (d_in, d_out)
+    else:
+        XtX = X.T @ X
+        XtX_reg = XtX + alpha * np.eye(d_in)
+        XtY = X.T @ Y
+        return np.linalg.solve(XtX_reg, XtY)
 
 
 def decode_spatial_ridge(
