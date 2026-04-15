@@ -356,6 +356,44 @@ def _siglip_to_image_emb(
     return emb
 
 
+def encode_text_embeds(
+    pipe: FluxPipeline,
+    prompts: list[str],
+    max_sequence_length: int = 512,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Encode a list of prompts into FLUX text embeddings using the loaded pipeline.
+
+    Runs the CLIP and T5 encoders that are already resident in ``pipe`` — no
+    extra model loading required.  Both encoders are called on CPU-offloaded
+    weights if the pipeline is in that mode, so VRAM usage is minimal.
+
+    Args:
+        pipe:                The loaded FluxPipeline (must have text_encoder and
+                             text_encoder_2 available).
+        prompts:             List of N prompt strings.
+        max_sequence_length: T5 sequence length (default 512, matching training).
+
+    Returns:
+        clip_embeds: (N, 768)        CLIP pooled embeddings, float32, on CPU.
+        t5_embeds:   (N, seq, 4096)  T5 sequence embeddings, float32, on CPU.
+    """
+    device = pipe.device
+    clip_list, t5_list = [], []
+
+    for prompt in prompts:
+        pe, pooled, _ = pipe.encode_prompt(
+            prompt=prompt,
+            prompt_2=None,
+            device=device,
+            num_images_per_prompt=1,
+            max_sequence_length=max_sequence_length,
+        )
+        t5_list.append(pe.cpu().float())        # (1, seq, 4096)
+        clip_list.append(pooled.cpu().float())  # (1, 768)
+
+    return torch.cat(clip_list, dim=0), torch.cat(t5_list, dim=0)
+
+
 # ---------------------------------------------------------------------------
 # Generation.
 # ---------------------------------------------------------------------------
@@ -451,6 +489,8 @@ def generate_img2img(
     *,
     strength: float = 0.75,
     prompt: str | None = None,
+    prompt_embeds: torch.Tensor | None = None,
+    pooled_prompt_embeds: torch.Tensor | None = None,
     height: int = 512,
     width: int = 512,
     num_inference_steps: int = 20,
@@ -467,6 +507,11 @@ def generate_img2img(
     the installed InstantX IP-Adapter, and (if ``aperture_composite``)
     pastes a freshly re-noised version of the original init latent into
     the untrained ring outside the Rust aperture at every step.
+
+    Text conditioning accepts either a ``prompt`` string (encoded on the fly)
+    or pre-computed ``prompt_embeds`` (T5, shape (1, seq, 4096)) and
+    ``pooled_prompt_embeds`` (CLIP, shape (1, 768)) from ``encode_text_embeds``.
+    Pre-computed embeds take precedence over ``prompt`` when both are supplied.
     """
     device = pipe.device
     dtype = torch.bfloat16
@@ -475,13 +520,19 @@ def generate_img2img(
 
     image_emb = _siglip_to_image_emb(image_proj, siglip_embedding, device, dtype)
 
-    prompt_embeds, pooled_embeds, text_ids = pipe.encode_prompt(
-        prompt=prompt or "",
-        prompt_2=None,
-        device=device,
-        num_images_per_prompt=1,
-        max_sequence_length=512,
-    )
+    if prompt_embeds is not None:
+        # Pre-computed path: move to device/dtype, derive text_ids from seq length.
+        prompt_embeds = prompt_embeds.to(device=device, dtype=dtype)
+        pooled_embeds = pooled_prompt_embeds.to(device=device, dtype=dtype)
+        text_ids = torch.zeros(prompt_embeds.shape[1], 3, device=device, dtype=dtype)
+    else:
+        prompt_embeds, pooled_embeds, text_ids = pipe.encode_prompt(
+            prompt=prompt or "",
+            prompt_2=None,
+            device=device,
+            num_images_per_prompt=1,
+            max_sequence_length=512,
+        )
 
     init_resized = init_image.resize((width, height), Image.LANCZOS)
     init_latent = encode_image(pipe, init_resized).to(device=device, dtype=dtype)

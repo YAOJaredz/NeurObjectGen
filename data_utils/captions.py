@@ -13,7 +13,7 @@ from config_const import N_STIMULI, RUST_STIM_DIR, BLIP2_CAPTIONS_PATH, BLIP2_DE
 from get_device import get_device
 
 
-_PROMPT = "a color photograph of"
+_PROMPT = "a grayscale photograph of"
 
 
 def caption_stimuli(
@@ -77,10 +77,10 @@ def caption_stimuli(
 
 
 if __name__ == "__main__":
-    # caps = caption_stimuli(force=True)
+    caps = caption_stimuli(force=True)
     detailed_caps = caption_stimuli(
         force=True, min_new_tokens=60, save_path=BLIP2_DETAILED_CAPTIONS_PATH
     )
     for i in range(min(5, len(detailed_caps))):
-        # print(f"{i:04d}: {caps[i]}")
+        print(f"{i:04d}: {caps[i]}")
         print(f"      {detailed_caps[i]}")

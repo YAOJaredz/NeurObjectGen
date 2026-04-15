@@ -9,7 +9,10 @@ RUST_SRC_NAME = "20231025_Rust_NaturalImages300_300ms"
 RUST_DST_NAME = "rust_cropped"
 RUST_STIM_DIR = STIMULI_ROOT / RUST_DST_NAME
 RUST_BG_THRESHOLD = 5  # pixels <= this on all channels are background (black)
+CLIP_EMBEDS_PATH       = CACHE_DIR / "clip_embeds.pt"       # (300, 768)      CLIP pooled
+T5_EMBEDS_PATH         = CACHE_DIR / "t5_embeds.pt"         # (300, 512, 4096) T5 sequence
 SIGLIP_EMBEDDINGS_PATH = CACHE_DIR / "siglip_embeddings.pt"
+SIGLIP_STRIPPED_PATH   = CACHE_DIR / "siglip_stripped.pt"  # (300, 1152) aperture-stripped
 SIGLIP_PATCH14_PATH    = CACHE_DIR / "siglip_patch14.pt"   # (300, 196, 1152)
 SIGLIP_PATCH8_PATH     = CACHE_DIR / "siglip_patch8.pt"    # (300,  64, 1152)
 SIGLIP_PATCH_TOKENS    = {14: 196, 8: 64}
