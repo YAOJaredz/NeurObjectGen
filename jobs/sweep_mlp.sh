@@ -65,4 +65,4 @@ $PYTHON scripts/train_encoder.py \
     --weight-decay "${WD}" \
     --epochs       150 \
     --batch-size   64 \
-    --temperature  0.07
+    --temperature 0.07

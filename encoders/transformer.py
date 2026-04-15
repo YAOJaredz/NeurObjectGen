@@ -48,6 +48,8 @@ class TemporalTransformer(nn.Module):
             norm_first=True,  # Pre-LN
         )
         self.encoder = nn.TransformerEncoder(encoder_layer, num_layers=n_layers)
+        # Temporal attention pooling over time-step tokens (excludes CLS)
+        self.attn = nn.Linear(d_model, 1, bias=False)
         self.proj = nn.Linear(d_model, out_dim)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
@@ -62,5 +64,9 @@ class TemporalTransformer(nn.Module):
         cls = self.cls_token.expand(x.size(0), -1, -1)  # (B, 1, d_model)
         x = torch.cat([cls, x], dim=1)                  # (B, T+1, d_model)
         x = self.encoder(x)                             # (B, T+1, d_model)
-        out = self.proj(x[:, 0])                        # (B, out_dim) — CLS token
+        # Attention-pool over time tokens; CLS token at index 0 provides global context
+        # but learned weights decide the final mixture across all T+1 positions
+        w = torch.softmax(self.attn(x), dim=1)          # (B, T+1, 1)
+        pooled = (w * x).sum(dim=1)                     # (B, d_model)
+        out = self.proj(pooled)                         # (B, out_dim)
         return F.normalize(out, dim=-1)

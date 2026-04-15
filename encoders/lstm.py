@@ -30,6 +30,8 @@ class TemporalLSTM(nn.Module):
             dropout=dropout if n_layers > 1 else 0.0,
         )
         self.drop = nn.Dropout(dropout)
+        # Temporal attention pooling: learn to weight each time step
+        self.attn = nn.Linear(hidden, 1, bias=False)
         self.proj = nn.Linear(hidden, out_dim)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
@@ -41,6 +43,9 @@ class TemporalLSTM(nn.Module):
             (B, out_dim) L2-normalised embedding tensor.
         """
         x = self.input_norm(x)                              # normalise across neurons at each time step
-        _, (h_n, _) = self.lstm(x)                         # h_n: (n_layers, B, hidden)
-        out = self.proj(self.drop(h_n[-1]))                 # top layer: (B, hidden)
+        all_h, _ = self.lstm(x)                             # all_h: (B, T, hidden)
+        # Learned temporal attention pooling over all time steps
+        w = torch.softmax(self.attn(all_h), dim=1)          # (B, T, 1)
+        pooled = (w * all_h).sum(dim=1)                     # (B, hidden)
+        out = self.proj(self.drop(pooled))
         return F.normalize(out, dim=-1)

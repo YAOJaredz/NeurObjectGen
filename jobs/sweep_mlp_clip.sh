@@ -8,7 +8,7 @@
 #SBATCH --ntasks=1
 #SBATCH --cpus-per-task=4
 #SBATCH --mem=48gb
-#SBATCH --time=0-02:00:00
+#SBATCH --time=0-04:00:00
 #SBATCH --partition=issa
 #SBATCH --exclude=ax09,ax10,ax11
 #SBATCH --output=/home/yy3658/NeurObjectGen/jobs/logs/mlp_clip_sweep_%A_%a.log
@@ -67,4 +67,4 @@ $PYTHON scripts/train_encoder.py \
     --weight-decay "${WD}" \
     --epochs       150 \
     --batch-size   64 \
-    --temperature  0.07
+    --temperature 0.07

@@ -2,7 +2,12 @@
 
 Loss: InfoNCE (NT-Xent) contrastive loss aligning predicted embeddings with
       frozen SigLIP image embeddings of the presented stimuli.
-Regularisation: L2 weight decay via AdamW (set with --weight-decay).
+      Negatives are augmented with a full-dataset memory bank so every batch
+      sees all training embeddings as negatives, not just intra-batch pairs.
+Regularisation:
+  - L2 weight decay via AdamW (--weight-decay).
+  - Uniformity loss on predicted embeddings (--uniformity-weight) to prevent
+    collapse onto a low-dimensional submanifold of the hypersphere.
 
 Usage examples:
     python scripts/train_encoder.py --model mlp --bottleneck 256 --dropout 0.1
@@ -41,7 +46,7 @@ def run_name(args) -> str:
 
     Structure: checkpoints/<model>/<run_name>/
     """
-    shared = f"do{args.dropout}_lr{args.lr}_wd{args.weight_decay}_tn{args.target_noise}_bs{args.batch_size}_t{args.temperature}"
+    shared = f"do{args.dropout}_lr{args.lr}_wd{args.weight_decay}_tn{args.target_noise}_bs{args.batch_size}_t{args.temperature}_uw{args.uniformity_weight}"
     if args.model == "mlp":
         return f"bn{args.bottleneck}_{shared}"
     elif args.model == "lstm":
@@ -80,17 +85,58 @@ def load_checkpoint(path: Path, model, optimizer=None, scheduler=None):
 # Loss
 # ---------------------------------------------------------------------------
 
-def infonce_loss(pred: torch.Tensor, target: torch.Tensor, temperature: float = 0.07) -> torch.Tensor:
-    """Symmetric InfoNCE (NT-Xent) between predicted and target embeddings.
+def infonce_loss(
+    pred: torch.Tensor,
+    target: torch.Tensor,
+    temperature: float,
+    memory_bank: torch.Tensor | None = None,
+) -> torch.Tensor:
+    """Symmetric InfoNCE with optional memory-bank negative augmentation.
 
-    Both pred and target are assumed L2-normalised (shape B x D).
-    Each sample is its own positive; all others in the batch are negatives.
+    Args:
+        pred:        (B, D) L2-normalised predicted embeddings.
+        target:      (B, D) L2-normalised target embeddings (positives).
+        temperature: Scalar temperature for logit scaling.
+        memory_bank: (M, D) all training target embeddings. When provided,
+                     each query is evaluated against its in-batch positive
+                     plus all M bank embeddings as negatives. The bank should
+                     NOT be in the computation graph (detached).
+
+    Both pred→target and target→pred directions are averaged.
     """
-    logits = pred @ target.T / temperature  # (B, B)
-    labels = torch.arange(len(pred), device=pred.device)
-    loss_p = F.cross_entropy(logits, labels)
-    loss_t = F.cross_entropy(logits.T, labels)
+    if memory_bank is not None:
+        # pred side: logits over [in-batch targets | bank]
+        # Positive for sample i is target[i]; negatives are all of bank + other in-batch targets.
+        # We build a combined key matrix: (B + M, D), labels point into [0..B-1].
+        keys = torch.cat([target, memory_bank], dim=0)   # (B+M, D)
+        logits_p = pred @ keys.T / temperature            # (B, B+M)
+        labels = torch.arange(len(pred), device=pred.device)
+        loss_p = F.cross_entropy(logits_p, labels)
+
+        # target side: each target embedding retrieves its own neural prediction
+        logits_t = target @ pred.T / temperature          # (B, B) — symmetric within batch only
+        loss_t = F.cross_entropy(logits_t, labels)
+    else:
+        logits = pred @ target.T / temperature            # (B, B)
+        labels = torch.arange(len(pred), device=pred.device)
+        loss_p = F.cross_entropy(logits, labels)
+        loss_t = F.cross_entropy(logits.T, labels)
+
     return (loss_p + loss_t) / 2
+
+
+def uniformity_loss(z: torch.Tensor, t: float = 2.0) -> torch.Tensor:
+    """Uniformity loss (Wang & Isola 2020) on L2-normalised embeddings.
+
+    Encourages predicted embeddings to spread uniformly over the hypersphere,
+    preventing collapse onto a low-dimensional submanifold.
+
+    Args:
+        z: (B, D) L2-normalised embeddings.
+        t: bandwidth parameter (default 2).
+    """
+    sq_pdist = torch.pdist(z, p=2).pow(2)
+    return sq_pdist.mul(-t).exp().mean().log()
 
 
 # ---------------------------------------------------------------------------
@@ -157,6 +203,10 @@ def train_with_embeddings(args):
     ckpt_dir.mkdir(parents=True, exist_ok=True)
     print(f"Checkpoints -> {ckpt_dir}")
 
+    # --- Build static memory bank from all training target embeddings ---
+    # Collect all training targets once (they're frozen SigLIP embeds, no grad needed).
+    all_train_targets = torch.cat([t for _, t in train_loader], dim=0).to(device)  # (N_train, D)
+
     best_val_2afc = 0.0
 
     for epoch in range(1, args.epochs + 1):
@@ -169,15 +219,22 @@ def train_with_embeddings(args):
 
             x    = prepare_input(neural, args.model)
             pred = model(x)
+
             if args.target_noise > 0.0:
                 siglip = F.normalize(siglip + torch.randn_like(siglip) * args.target_noise, dim=-1)
-            loss = infonce_loss(pred, siglip, temperature=args.temperature)
+
+            # Memory bank: detach so bank doesn't contribute gradients
+            bank = all_train_targets.detach()
+            loss = infonce_loss(pred, siglip, temperature=args.temperature, memory_bank=bank)
+
+            if args.uniformity_weight > 0.0:
+                loss = loss + args.uniformity_weight * uniformity_loss(pred)
 
             if torch.isnan(loss):
                 raise RuntimeError(
                     f"NaN loss at epoch {epoch}. "
                     "Likely causes: NaN in inputs, embeddings not L2-normalised, "
-                    "or temperature too low. Try --temperature 0.1 or higher."
+                    "or temperature too low. Try --temp-max 0.1 or higher."
                 )
 
             optimizer.zero_grad()
@@ -242,7 +299,7 @@ def parse_args():
 
     # shared
     p.add_argument("--dropout", type=float, default=0.1)
-    p.add_argument("--target-noise", type=float, default=0.0,
+    p.add_argument("--target-noise", type=float, default=0.02,
                    help="Std of Gaussian noise added to SigLIP targets during training (re-normalised after)")
 
     # optimisation
@@ -253,6 +310,8 @@ def parse_args():
                    help="L2 regularisation via AdamW weight decay")
     p.add_argument("--temperature", type=float, default=0.07,
                    help="InfoNCE temperature")
+    p.add_argument("--uniformity-weight", type=float, default=0.1,
+                   help="Weight of uniformity loss on predicted embeddings (0 to disable)")
 
     return p.parse_args()
 
