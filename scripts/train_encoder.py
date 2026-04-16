@@ -21,8 +21,10 @@ from pathlib import Path
 
 import torch
 import torch.nn.functional as F
+import math
+
 from torch.optim import AdamW
-from torch.optim.lr_scheduler import CosineAnnealingLR
+from torch.optim.lr_scheduler import LambdaLR
 
 # make repo root importable when run as a script
 REPO_ROOT = Path(__file__).resolve().parent.parent
@@ -143,9 +145,13 @@ def uniformity_loss(z: torch.Tensor, t: float = 2.0) -> torch.Tensor:
 # Model factory
 # ---------------------------------------------------------------------------
 
+MLP_TIME_SLICE = slice(5, 20)  # 50-200 ms window, 15 bins
+MLP_N_BINS = MLP_TIME_SLICE.stop - MLP_TIME_SLICE.start  # 15
+
+
 def build_model(args, n_neurons: int, n_time: int, out_dim: int) -> torch.nn.Module:
     if args.model == "mlp":
-        in_dim = n_neurons * n_time
+        in_dim = n_neurons * MLP_N_BINS  # 15 bins, not full n_time
         return BottleneckMLP(in_dim=in_dim, bottleneck=args.bottleneck, out_dim=out_dim, dropout=args.dropout)
     elif args.model == "lstm":
         return TemporalLSTM(n_neurons=n_neurons, hidden=args.hidden, out_dim=out_dim, n_layers=args.n_layers, dropout=args.dropout)
@@ -159,11 +165,15 @@ def build_model(args, n_neurons: int, n_time: int, out_dim: int) -> torch.nn.Mod
 
 
 def prepare_input(neural: torch.Tensor, model_name: str) -> torch.Tensor:
-    """neural: (B, N_neurons, T) -> model-specific shape."""
+    """neural: (B, N_neurons, T) -> model-specific shape.
+
+    For MLP, only the 50-200 ms window (bins 5:20) is used to reduce the
+    input dimensionality from N*25 to N*15.
+    """
     if model_name == "mlp":
-        return neural.flatten(1)        # (B, N*T)
+        return neural[:, :, MLP_TIME_SLICE].flatten(1)  # (B, N*15)
     else:
-        return neural.permute(0, 2, 1)  # (B, T, N) for LSTM / Transformer
+        return neural.permute(0, 2, 1)        # (B, T, N) for LSTM / Transformer
 
 
 # ---------------------------------------------------------------------------
@@ -197,7 +207,18 @@ def train_with_embeddings(args):
     print(f"Model: {model.__class__.__name__} | params: {sum(p.numel() for p in model.parameters() if p.requires_grad):,}")
 
     optimizer = AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
-    scheduler = CosineAnnealingLR(optimizer, T_max=args.epochs)
+    # Linear warmup for the first `warmup_epochs` epochs, then cosine decay to 0.
+    warmup_epochs = max(1, int(args.epochs * args.warmup_frac)) if args.warmup_frac > 0 else 0
+
+    def lr_lambda(epoch: int) -> float:
+        if epoch < warmup_epochs:
+            # Linear ramp from ~0 -> 1 across warmup_epochs
+            return (epoch + 1) / warmup_epochs
+        # Cosine decay from 1 -> 0 over the remaining epochs
+        progress = (epoch - warmup_epochs) / max(1, args.epochs - warmup_epochs)
+        return 0.5 * (1.0 + math.cos(math.pi * progress))
+
+    scheduler = LambdaLR(optimizer, lr_lambda=lr_lambda)
 
     ckpt_dir = run_dir(args)
     ckpt_dir.mkdir(parents=True, exist_ok=True)
@@ -308,6 +329,8 @@ def parse_args():
     p.add_argument("--lr", type=float, default=1e-3)
     p.add_argument("--weight-decay", type=float, default=1e-2,
                    help="L2 regularisation via AdamW weight decay")
+    p.add_argument("--warmup-frac", type=float, default=0.1,
+                   help="Fraction of epochs used for linear LR warmup (0 to disable)")
     p.add_argument("--temperature", type=float, default=0.07,
                    help="InfoNCE temperature")
     p.add_argument("--uniformity-weight", type=float, default=0.1,
