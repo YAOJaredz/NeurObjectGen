@@ -6,7 +6,7 @@ from HexPred.object_response.get_rust_response import get_rust_responses
 # from HexPred.object_response.get_hvm_response import get_hvm_responses
 from HexPred.constants import ALL_MONKEYS
 
-from config_const import N_STIMULI, N_TRAIN, N_VAL, RUST_TIME_WINDOW, SEED, SIGLIP_EMBEDDINGS_PATH, CLIP_EMBEDS_PATH
+from config_const import N_STIMULI, N_TRAIN, N_VAL, RUST_TIME_WINDOW, SEED, SIGLIP_EMBEDDINGS_PATH, CLIP_DETAILED_EMBEDS_PATH
 from data_utils.stimuli import load_rust_stimuli
 
 
@@ -70,8 +70,8 @@ def make_rust_loader(
 
     if use_embeddings:
         _EMBED_PATHS = {
-            "siglip": (SIGLIP_EMBEDDINGS_PATH, "python scripts/cache_siglip.py"),
-            "clip":   (CLIP_EMBEDS_PATH,        "python scripts/cache_text_embeds.py --device cuda"),
+            "siglip": (SIGLIP_EMBEDDINGS_PATH,   "python scripts/cache_siglip.py"),
+            "clip":   (CLIP_DETAILED_EMBEDS_PATH, "python scripts/cache_text_embeds.py --device cuda"),
         }
         if target not in _EMBED_PATHS:
             raise ValueError(f"Unknown target '{target}'. Choose from: {list(_EMBED_PATHS)}")

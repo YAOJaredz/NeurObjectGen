@@ -1,6 +1,6 @@
 #!/bin/bash
 # Sweep MLP encoder — siglip target.
-# Grid: 3 bottlenecks x 2 dropouts x 2 lrs x 2 wds = 24 jobs.
+# Grid: 3 bottlenecks x 1 dropout x 2 lrs x 2 wds = 12 jobs.
 
 #SBATCH --job-name=mlp_siglip_sweep
 #SBATCH --account=yy3658
@@ -12,7 +12,7 @@
 #SBATCH --partition=issa
 #SBATCH --exclude=ax09,ax10,ax11
 #SBATCH --output=/home/yy3658/NeurObjectGen/jobs/logs/mlp_siglip_sweep_%A_%a.log
-#SBATCH --array=0-23%6   # 3 bottlenecks x 2 dropouts x 2 lrs x 2 wds = 24
+#SBATCH --array=0-11%6   # 3 bottlenecks x 1 dropout x 2 lrs x 2 wds = 12
 
 # ---------------------------------------------------------------------------
 # Environment
@@ -30,16 +30,16 @@ $PYTHON -V
 # Hyperparameter grid
 # ---------------------------------------------------------------------------
 BOTTLENECKS=(64 128 256)
-DROPOUTS=(0.1 0.3)
+DROPOUTS=(0.1)
 LRS=(1e-3 3e-4)
 WEIGHT_DECAYS=(1e-2 1e-1)
 
 N_BN=${#BOTTLENECKS[@]}      # 3
-N_DO=${#DROPOUTS[@]}         # 2
+N_DO=${#DROPOUTS[@]}         # 1
 N_LR=${#LRS[@]}              # 2
 N_WD=${#WEIGHT_DECAYS[@]}    # 2
 
-# 3 x 2 x 2 x 2 = 24 total
+# 3 x 1 x 2 x 2 = 12 total
 TASK_ID=${SLURM_ARRAY_TASK_ID:-0}
 
 idx=$TASK_ID

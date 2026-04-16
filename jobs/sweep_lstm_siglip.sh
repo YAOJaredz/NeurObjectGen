@@ -1,6 +1,6 @@
 #!/bin/bash
 # Sweep LSTM encoder — siglip target.
-# Grid: 3 hiddens x 2 n_layers x 2 lrs x 2 dropouts x 2 wds = 48 jobs.
+# Grid: 3 hiddens x 2 n_layers x 1 dropout x 2 lrs x 2 wds = 24 jobs.
 
 #SBATCH --job-name=lstm_siglip_sweep
 #SBATCH --account=yy3658
@@ -12,7 +12,7 @@
 #SBATCH --partition=issa
 #SBATCH --exclude=ax09,ax10,ax11
 #SBATCH --output=/home/yy3658/NeurObjectGen/jobs/logs/lstm_siglip_sweep_%A_%a.log
-#SBATCH --array=0-47%8   # 3 hiddens x 2 n_layers x 2 lrs x 2 dropouts x 2 wds = 48
+#SBATCH --array=0-23%8   # 3 hiddens x 2 n_layers x 1 dropout x 2 lrs x 2 wds = 24
 
 # ---------------------------------------------------------------------------
 # Environment
@@ -32,16 +32,16 @@ $PYTHON -V
 HIDDENS=(64 128 256)
 N_LAYERS=(1 2)
 LRS=(1e-3 3e-4)
-DROPOUTS=(0.1 0.3)
+DROPOUTS=(0.1)
 WEIGHT_DECAYS=(1e-2 1e-1)
 
 N_H=${#HIDDENS[@]}           # 3
 N_NL=${#N_LAYERS[@]}         # 2
 N_LR=${#LRS[@]}              # 2
-N_DO=${#DROPOUTS[@]}         # 2
+N_DO=${#DROPOUTS[@]}         # 1
 N_WD=${#WEIGHT_DECAYS[@]}    # 2
 
-# 3 x 2 x 2 x 2 x 2 = 48 total
+# 3 x 2 x 1 x 2 x 2 = 24 total
 TASK_ID=${SLURM_ARRAY_TASK_ID:-0}
 
 idx=$TASK_ID

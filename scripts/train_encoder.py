@@ -306,7 +306,7 @@ def parse_args():
     p = argparse.ArgumentParser()
     p.add_argument("--model", choices=["mlp", "lstm", "transformer"], default="mlp")
     p.add_argument("--target", choices=["siglip", "clip"], default="siglip",
-                   help="Embedding space to predict: siglip (1152-d) or clip (768-d)")
+                   help="Embedding space to predict: siglip (1152-d) or clip (768-d, detailed captions)")
 
     # MLP
     p.add_argument("--bottleneck", type=int, default=256)
