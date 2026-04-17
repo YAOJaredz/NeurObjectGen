@@ -1,12 +1,17 @@
 import numpy as np
 import torch
-from torch.utils.data import TensorDataset, DataLoader
+import torch.nn.functional as F
+from torch.utils.data import TensorDataset, DataLoader, Dataset
 
 from HexPred.object_response.get_rust_response import get_rust_responses
 # from HexPred.object_response.get_hvm_response import get_hvm_responses
 from HexPred.constants import ALL_MONKEYS
 
-from config_const import N_STIMULI, N_TRAIN, N_VAL, RUST_TIME_WINDOW, SEED, SIGLIP_EMBEDDINGS_PATH, CLIP_DETAILED_EMBEDS_PATH
+from config_const import (
+    N_STIMULI, N_TRAIN, N_VAL, RUST_TIME_WINDOW, SEED,
+    SIGLIP_EMBEDDINGS_PATH, CLIP_DETAILED_EMBEDS_PATH,
+    T5_PCA_COORDS_PATH,
+)
 from data_utils.stimuli import load_rust_stimuli
 
 
@@ -108,6 +113,95 @@ def make_rust_loader(
             f"neurons={object_responses.shape[1]}, "
             f"time={object_responses.shape[2]}, "
             f"target={target_shape}"
+        )
+
+    return train_loader, val_loader, test_loader
+
+
+class MultiHeadDataset(Dataset):
+    """Dataset yielding (neural, target_dict) for multi-head training."""
+
+    def __init__(self, neural: torch.Tensor, siglip: torch.Tensor, clip: torch.Tensor, t5_pca: torch.Tensor):
+        self.neural  = neural
+        self.targets = {"siglip": siglip, "clip": clip, "t5_pca": t5_pca}
+
+    def __len__(self) -> int:
+        return len(self.neural)
+
+    def __getitem__(self, i: int):
+        return self.neural[i], {k: v[i] for k, v in self.targets.items()}
+
+
+def make_multihead_loader(
+    batch_size: int = 64,
+    seed: int = SEED,
+    verbose: bool = True,
+) -> tuple[DataLoader, DataLoader, DataLoader]:
+    """Build train/val/test DataLoaders for multi-head neural encoding.
+
+    Yields (neural, target_dict) where target_dict has keys:
+      - "siglip":  (1152,) L2-normalised SigLIP embedding
+      - "clip":    (768,)  L2-normalised CLIP embedding (detailed captions)
+      - "t5_pca":  (K,)    raw T5 PCA coordinates
+
+    Neural data loading and split permutation are identical to make_rust_loader
+    to ensure test sets are directly comparable with single-head baselines.
+    """
+    if not T5_PCA_COORDS_PATH.exists():
+        raise FileNotFoundError(
+            f"T5 PCA coords not found at {T5_PCA_COORDS_PATH}. "
+            "Run: python scripts/precompute_t5_pca.py"
+        )
+
+    monkey_responses = []
+    for monkey in ALL_MONKEYS:
+        rsp, _ = get_rust_responses(
+            mode='area', area='all', monkey=monkey, time_window=RUST_TIME_WINDOW
+        )
+        monkey_responses.append(rsp)
+
+    object_responses = np.concatenate(monkey_responses, axis=1)
+
+    dead_neuron = (
+        np.all((object_responses == 0) | np.isnan(object_responses), axis=(0, 2))
+        | np.any(np.isnan(object_responses), axis=(0, 2))
+    )
+    object_responses = object_responses[:, ~dead_neuron, :]
+    assert not np.isnan(object_responses).any()
+    assert object_responses.shape[0] == N_STIMULI
+
+    neural_tensor = torch.from_numpy(object_responses).float()  # (300, neurons, time)
+
+    siglip_t = torch.load(SIGLIP_EMBEDDINGS_PATH, weights_only=True)        # (300, 1152) already L2-normed
+    clip_t   = F.normalize(torch.load(CLIP_DETAILED_EMBEDS_PATH, weights_only=True), dim=-1)  # (300, 768)
+    t5_pca_t = torch.load(T5_PCA_COORDS_PATH, weights_only=True)            # (300, K)
+
+    rng = np.random.default_rng(seed)
+    perm = rng.permutation(N_STIMULI)
+    train_idx = torch.from_numpy(perm[:N_TRAIN]).long()
+    val_idx   = torch.from_numpy(perm[N_TRAIN:N_TRAIN + N_VAL]).long()
+    test_idx  = torch.from_numpy(perm[N_TRAIN + N_VAL:]).long()
+
+    def make(idx, shuffle):
+        ds = MultiHeadDataset(
+            neural_tensor[idx],
+            siglip_t[idx],
+            clip_t[idx],
+            t5_pca_t[idx],
+        )
+        return DataLoader(ds, batch_size=batch_size, shuffle=shuffle)
+
+    train_loader = make(train_idx, shuffle=True)
+    val_loader   = make(val_idx,   shuffle=False)
+    test_loader  = make(test_idx,  shuffle=False)
+
+    if verbose:
+        k = t5_pca_t.shape[1]
+        print(
+            f"Multihead RUST loaders: "
+            f"train={len(train_idx)}, val={len(val_idx)}, test={len(test_idx)}, "
+            f"neurons={object_responses.shape[1]}, time={object_responses.shape[2]}, "
+            f"targets=(siglip=1152, clip=768, t5_pca={k})"
         )
 
     return train_loader, val_loader, test_loader

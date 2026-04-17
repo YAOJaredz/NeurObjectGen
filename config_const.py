@@ -34,3 +34,8 @@ RUST_TIME_WINDOW = (0, 250)
 SIGLIP_DIM = 1152  # google/siglip-so400m-patch14-384
 CLIP_DIM = 768     # FLUX CLIP pooled embedding dim
 CHECKPOINT_DIR = REPO_ROOT / "checkpoints"
+
+T5_PCA_K          = 64
+T5_PCA_BASIS_PATH = CACHE_DIR / f"t5_pca_basis_k{T5_PCA_K}.pt"   # (K, 4096)
+T5_PCA_COORDS_PATH= CACHE_DIR / f"t5_pca_coords_k{T5_PCA_K}.pt"  # (300, K)
+T5_PCA_MEAN_PATH  = CACHE_DIR / f"t5_pca_mean_k{T5_PCA_K}.pt"    # (4096,)
