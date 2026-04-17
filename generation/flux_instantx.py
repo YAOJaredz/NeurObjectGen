@@ -578,9 +578,10 @@ def generate_img2img(
     ip_adapter_scale: float = 1.0,
     ip_adapter_schedule: dict[str, float] | None = None,
     use_rf_inversion: bool = False,
-    rf_gamma: float = 0.5,
-    rf_eta: float = 0.7,
+    rf_gamma: float = 0.0,
+    rf_eta: float = 0.15,
     rf_inversion_steps: int | None = None,
+    rf_noise_blend: float = 0.0,
     seed: int = 0,
     aperture_composite: bool = True,
     show_progress: bool = True,
@@ -609,6 +610,11 @@ def generate_img2img(
         rf_eta: Generation eta — controls image-faithful correction strength.
         rf_inversion_steps: Steps for the inversion ODE (defaults to
             num_inference_steps).
+        rf_noise_blend: Linear blend of the inverted latent with fresh Gaussian
+            noise before denoising. 0.0 = pure inverted (tries to reconstruct
+            original), 1.0 = pure noise (RF structure discarded). Intermediate
+            values keep the structural skeleton while giving the IP-adapter
+            room to repaint content instead of fighting a deterministic ODE.
     """
     device = pipe.device
     dtype = torch.bfloat16
@@ -665,6 +671,11 @@ def generate_img2img(
             gamma=rf_gamma,
             guidance_scale=guidance_scale,
         )
+        if rf_noise_blend > 0.0:
+            blend_noise = torch.randn(
+                latents.shape, dtype=dtype, device=device, generator=generator,
+            )
+            latents = (1.0 - rf_noise_blend) * latents + rf_noise_blend * blend_noise
         image_latents = init_latent_packed  # y_0 for RF correction term
         # invert_image calls retrieve_timesteps internally, resetting pipe.scheduler
         # sigmas and begin_index — restore generation schedule state.
