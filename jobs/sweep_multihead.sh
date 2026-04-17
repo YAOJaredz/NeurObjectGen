@@ -22,7 +22,7 @@
 #SBATCH --partition=issa
 #SBATCH --exclude=ax09,ax10,ax11
 #SBATCH --output=/home/yy3658/NeurObjectGen/jobs/logs/multihead_sweep_%A_%a.log
-#SBATCH --array=0-47%6        # 48 runs, max 8 concurrent
+#SBATCH --array=0-71%6        # 72 runs, max 8 concurrent
 
 # ---------------------------------------------------------------------------
 # Environment
@@ -41,17 +41,17 @@ $PYTHON -V
 # ---------------------------------------------------------------------------
 LOSS_WEIGHT_T5S=(0.0 0.1 0.5)
 D_MODELS=(64 128)
-N_LAYERS=(1 2)
+N_LAYERS=(1 2 4)
 SHARED_DIMS=(256 512)
 DROPOUTS=(0.1 0.3)
 
 N_WT=${#LOSS_WEIGHT_T5S[@]}   # 3
 N_DM=${#D_MODELS[@]}          # 2
-N_NL=${#N_LAYERS[@]}          # 2
+N_NL=${#N_LAYERS[@]}          # 3
 N_SD=${#SHARED_DIMS[@]}       # 2
 N_DO=${#DROPOUTS[@]}          # 2
 
-# 3 x 2 x 2 x 2 x 2 = 48 total
+# 3 x 2 x 3 x 2 x 2 = 72 total
 # n_heads=4 divides both d_model=64 and d_model=128
 N_HEADS=4
 
