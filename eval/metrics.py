@@ -84,6 +84,37 @@ def two_afc_identification(
     return correct / total if total > 0 else 0.0
 
 
+def retrieval_accuracy(
+    pred_embeddings: torch.Tensor,
+    target_embeddings: torch.Tensor,
+    k: int | list[int] = (1, 5, 10),
+) -> dict[int, float]:
+    """Top-k retrieval accuracy: fraction of samples whose correct target is
+    ranked in the top-k by cosine similarity.
+
+    Args:
+        pred_embeddings:   (N, D) predicted embeddings
+        target_embeddings: (N, D) ground-truth embeddings; target_embeddings[i]
+                           is the correct match for pred_embeddings[i]
+        k: single int or list of ints
+
+    Returns:
+        Dict mapping each k to accuracy in [0, 1].
+    """
+    ks = [k] if isinstance(k, int) else list(k)
+    pred_norm   = F.normalize(pred_embeddings, dim=-1)
+    target_norm = F.normalize(target_embeddings, dim=-1)
+
+    sim = pred_norm @ target_norm.T  # (N, N)
+    N = sim.size(0)
+
+    # rank each row descending; correct match is the diagonal
+    ranks = sim.argsort(dim=1, descending=True)  # (N, N)
+    correct_rank = (ranks == torch.arange(N, device=sim.device).unsqueeze(1)).nonzero(as_tuple=False)[:, 1]
+
+    return {ki: float((correct_rank < ki).float().mean().item()) for ki in ks}
+
+
 def r2_per_component(pred: np.ndarray, target: np.ndarray) -> np.ndarray:
     """R² for each output dimension independently.
 

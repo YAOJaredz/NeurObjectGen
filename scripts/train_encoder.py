@@ -39,7 +39,7 @@ from config_const import SEED, SIGLIP_DIM, CLIP_DIM, CHECKPOINT_DIR
 TARGET_DIMS = {"siglip": SIGLIP_DIM, "clip": CLIP_DIM}
 from data_utils.rust_loader import make_rust_loader
 from encoders import BottleneckMLP, TemporalLSTM, TemporalTransformer
-from eval.metrics import two_afc_identification
+from eval.metrics import two_afc_identification, retrieval_accuracy
 from get_device import get_device
 
 
@@ -316,6 +316,44 @@ def train_with_embeddings(args):
 
     # restore best weights for the returned model
     load_checkpoint(ckpt_dir / "best.pt", model)
+
+    # --- test-set retrieval evaluation ---
+    model.eval()
+    test_preds, test_targets = [], []
+    with torch.no_grad():
+        for neural, siglip in test_loader:
+            neural = neural.to(device)
+            x      = prepare_input(neural, args.model)
+            pred   = model(x)
+            test_preds.append(pred.cpu())
+            test_targets.append(siglip)
+
+    test_preds_t   = torch.cat(test_preds)
+    test_targets_t = torch.cat(test_targets)
+
+    test_2afc = two_afc_identification(test_preds_t, test_targets_t)
+    test_topk = retrieval_accuracy(test_preds_t, test_targets_t, k=[1, 5, 10])
+    test_cos  = F.cosine_similarity(test_preds_t, test_targets_t, dim=-1).mean().item()
+
+    print(
+        f"\nTest set (N={len(test_preds_t)}):"
+        f"  2AFC={test_2afc:.3f}"
+        f"  top-1={test_topk[1]:.3f}"
+        f"  top-5={test_topk[5]:.3f}"
+        f"  top-10={test_topk[10]:.3f}"
+        f"  cos={test_cos:.4f}"
+    )
+
+    test_metrics = {
+        "test_2afc": test_2afc,
+        "test_top1": test_topk[1],
+        "test_top5": test_topk[5],
+        "test_top10": test_topk[10],
+        "test_cos_sim": test_cos,
+    }
+    best_ckpt = torch.load(ckpt_dir / "best.pt", weights_only=False)
+    best_ckpt["test_metrics"] = test_metrics
+    torch.save(best_ckpt, ckpt_dir / "best.pt")
 
     return model, test_loader
 
