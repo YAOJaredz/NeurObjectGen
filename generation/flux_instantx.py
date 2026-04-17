@@ -481,6 +481,86 @@ def generate(
 
 
 @torch.no_grad()
+def invert_image(
+    pipe: FluxPipeline,
+    init_latent_packed: torch.Tensor,
+    latent_image_ids: torch.Tensor,
+    prompt_embeds: torch.Tensor,
+    pooled_embeds: torch.Tensor,
+    text_ids: torch.Tensor,
+    *,
+    num_inversion_steps: int = 28,
+    gamma: float = 0.5,
+    guidance_scale: float = 3.5,
+    seed: int = 0,
+) -> torch.Tensor:
+    """Forward ODE inversion (RF-Inversion): maps init_latent -> inverted_latent.
+
+    Follows diffusers' `pipeline_flux_rf_inversion.py`:
+
+        u_hat = u_transformer + gamma * (u_cond_to_noise - u_transformer)
+        u_cond_to_noise = (y_1 - Y_t) / (1 - t_i)          # deterministic pull toward y_1
+        Y_t_next = Y_t + u_hat * (sigmas[i] - sigmas[i+1])
+
+    At i=0, Y_t = y_0 (clean image latent) and sigmas[0] ≈ 1.
+    After N-1 steps, Y_t ≈ y_1 (structured noise at sigma ≈ 1/N).
+
+    Args:
+        init_latent_packed: (1, seq, C) packed VAE latent on device.
+        gamma: Balance between editability (0.0, pure transformer ODE) and
+            faithfulness (1.0, deterministic linear interp to y_1).
+    """
+    device = init_latent_packed.device
+    dtype = init_latent_packed.dtype
+    guidance = torch.full([1], guidance_scale, device=device, dtype=dtype)
+
+    image_seq_len = init_latent_packed.shape[1]
+    mu = calculate_shift(
+        image_seq_len,
+        pipe.scheduler.config.base_image_seq_len,
+        pipe.scheduler.config.max_image_seq_len,
+        pipe.scheduler.config.base_shift,
+        pipe.scheduler.config.max_shift,
+    )
+    retrieve_timesteps(pipe.scheduler, num_inversion_steps, device, mu=mu)
+    # scheduler.sigmas: length N+1, decreasing from ~1 down to 0 (generation order).
+    sigmas = pipe.scheduler.sigmas.to(device=device, dtype=dtype)
+
+    generator = torch.Generator(device).manual_seed(seed)
+    y_1 = torch.randn(init_latent_packed.shape, dtype=dtype, device=device, generator=generator)
+
+    Y_t = init_latent_packed.clone()
+    N = num_inversion_steps
+
+    for i in range(N):
+        t_i = torch.tensor(i / N, device=device, dtype=dtype)
+        t_input = t_i.expand(Y_t.shape[0])
+
+        u_t = pipe.transformer(
+            hidden_states=Y_t,
+            timestep=t_input,
+            guidance=guidance,
+            encoder_hidden_states=prompt_embeds,
+            pooled_projections=pooled_embeds,
+            txt_ids=text_ids,
+            img_ids=latent_image_ids,
+            joint_attention_kwargs={},
+            return_dict=False,
+        )[0]
+
+        if gamma > 0.0:
+            u_t_cond = (y_1 - Y_t) / (1.0 - t_i + 1e-8)
+            u_hat = u_t + gamma * (u_t_cond - u_t)
+        else:
+            u_hat = u_t
+
+        # sigmas[i] > sigmas[i+1]; step is positive, pushing Y_t toward noise.
+        Y_t = Y_t + u_hat * (sigmas[i] - sigmas[i + 1])
+
+    return Y_t
+
+
+@torch.no_grad()
 def generate_img2img(
     pipe: FluxPipeline,
     image_proj: MLPProjModel,
@@ -496,6 +576,11 @@ def generate_img2img(
     num_inference_steps: int = 20,
     guidance_scale: float = 3.5,
     ip_adapter_scale: float = 1.0,
+    ip_adapter_schedule: dict[str, float] | None = None,
+    use_rf_inversion: bool = False,
+    rf_gamma: float = 0.5,
+    rf_eta: float = 0.7,
+    rf_inversion_steps: int | None = None,
     seed: int = 0,
     aperture_composite: bool = True,
     show_progress: bool = True,
@@ -512,11 +597,25 @@ def generate_img2img(
     or pre-computed ``prompt_embeds`` (T5, shape (1, seq, 4096)) and
     ``pooled_prompt_embeds`` (CLIP, shape (1, 768)) from ``encode_text_embeds``.
     Pre-computed embeds take precedence over ``prompt`` when both are supplied.
+
+    Args:
+        ip_adapter_schedule: Optional dict with keys "high"/"mid"/"low" mapping
+            timestep fractions (t/1000 > 0.7 / 0.4–0.7 / ≤0.4) to IP scale
+            values. When set, overrides ``ip_adapter_scale`` dynamically each
+            step. ``ip_adapter_scale`` is used as a fallback for missing keys.
+        use_rf_inversion: If True, replace simple scale_noise init with
+            RF-Inversion (forward ODE) for a lossless structured noise latent.
+        rf_gamma: Inversion gamma — 0.5 balances faithfulness vs editability.
+        rf_eta: Generation eta — controls image-faithful correction strength.
+        rf_inversion_steps: Steps for the inversion ODE (defaults to
+            num_inference_steps).
     """
     device = pipe.device
     dtype = torch.bfloat16
     generator = torch.Generator(device).manual_seed(seed)
-    set_ip_adapter_scale(pipe, ip_adapter_scale)
+
+    if ip_adapter_schedule is None:
+        set_ip_adapter_scale(pipe, ip_adapter_scale)
 
     image_emb = _siglip_to_image_emb(image_proj, siglip_embedding, device, dtype)
 
@@ -557,9 +656,25 @@ def generate_img2img(
     timesteps = timesteps[start_step:]
     pipe.scheduler.set_begin_index(start_step)
 
-    noise = torch.randn(init_latent_packed.shape, dtype=dtype, device=device, generator=generator)
-    t_start = timesteps[0:1].to(dtype)
-    latents = pipe.scheduler.scale_noise(init_latent_packed, t_start, noise)
+    # --- Init latent preparation ---
+    if use_rf_inversion:
+        latents = invert_image(
+            pipe, init_latent_packed, latent_image_ids,
+            prompt_embeds, pooled_embeds, text_ids,
+            num_inversion_steps=rf_inversion_steps or num_inference_steps,
+            gamma=rf_gamma,
+            guidance_scale=guidance_scale,
+        )
+        image_latents = init_latent_packed  # y_0 for RF correction term
+        # invert_image calls retrieve_timesteps internally, resetting pipe.scheduler
+        # sigmas and begin_index — restore generation schedule state.
+        retrieve_timesteps(pipe.scheduler, num_inference_steps, device, mu=mu)
+        pipe.scheduler.set_begin_index(start_step)
+    else:
+        noise = torch.randn(init_latent_packed.shape, dtype=dtype, device=device, generator=generator)
+        t_start = timesteps[0:1].to(dtype)
+        latents = pipe.scheduler.scale_noise(init_latent_packed, t_start, noise)
+        image_latents = None
 
     aperture_mask = None
     if aperture_composite:
@@ -568,10 +683,26 @@ def generate_img2img(
             f"mask seq {aperture_mask.shape[1]} != latent seq {init_latent_packed.shape[1]}"
         )
 
+    # Aperture compositing re-noises the init latent at each step; RF path needs
+    # a fresh noise tensor since scale_noise is not called during init.
+    if use_rf_inversion:
+        noise = torch.randn(init_latent_packed.shape, dtype=dtype, device=device, generator=generator)
+
     guidance = torch.full([1], guidance_scale, device=device, dtype=dtype)
 
     iterator = tqdm(enumerate(timesteps), total=len(timesteps)) if show_progress else enumerate(timesteps)
-    for _, t in iterator:
+    for step_idx, t in iterator:
+        # Timestep-aware IP scale
+        if ip_adapter_schedule is not None:
+            t_frac = t.item() / 1000.0
+            if t_frac > 0.7:
+                scale = ip_adapter_schedule.get("high", ip_adapter_scale)
+            elif t_frac > 0.4:
+                scale = ip_adapter_schedule.get("mid", ip_adapter_scale)
+            else:
+                scale = ip_adapter_schedule.get("low", ip_adapter_scale)
+            set_ip_adapter_scale(pipe, scale)
+
         t_input = torch.as_tensor(t, device=device).expand(latents.shape[0]).to(latents.dtype)
         noise_pred = pipe.transformer(
             hidden_states=latents,
@@ -584,10 +715,22 @@ def generate_img2img(
             joint_attention_kwargs={"image_emb": image_emb},
             return_dict=False,
         )[0]
-        latents = pipe.scheduler.step(noise_pred, t, latents, return_dict=False)[0]
+
+        if use_rf_inversion:
+            # RF-Inversion reverse step: eta-weighted blend of denoising direction
+            # and image-faithful correction toward y_0. Paper: v_t_cond = (y_0 - latents)/(1 - t_i)
+            # with t_i = 1 - t/1000, so (1 - t_i) = t/1000 = sigma_curr in FLUX convention.
+            sigma_curr = t.to(dtype) / 1000.0
+            sigma_next = (timesteps[step_idx + 1].to(dtype) / 1000.0
+                          if step_idx + 1 < len(timesteps) else torch.zeros(1, device=device, dtype=dtype))
+            v_t = -noise_pred
+            v_t_cond = (image_latents - latents) / (sigma_curr + 1e-3)
+            v_hat = v_t + rf_eta * (v_t_cond - v_t)
+            latents = latents + v_hat * (sigma_curr - sigma_next)
+        else:
+            latents = pipe.scheduler.step(noise_pred, t, latents, return_dict=False)[0]
 
         if aperture_mask is not None:
-            step_idx = (timesteps == t).nonzero(as_tuple=True)[0].item()
             if step_idx + 1 < len(timesteps):
                 t_next = timesteps[step_idx + 1 : step_idx + 2].to(dtype)
                 init_noisy = pipe.scheduler.scale_noise(init_latent_packed, t_next, noise)
