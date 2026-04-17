@@ -1,9 +1,12 @@
 """Train a neural encoder (MLP, LSTM, or Transformer) to map IT responses -> SigLIP.
 
-Loss: InfoNCE (NT-Xent) contrastive loss aligning predicted embeddings with
-      frozen SigLIP image embeddings of the presented stimuli.
-      Negatives are augmented with a full-dataset memory bank so every batch
-      sees all training embeddings as negatives, not just intra-batch pairs.
+Loss (--loss):
+  infonce (default): Symmetric InfoNCE (NT-Xent) contrastive loss. Negatives are
+      augmented with a full-dataset memory bank so every batch sees all training
+      embeddings as negatives, not just intra-batch pairs.
+  cosine: Mean cosine distance (1 - cos_sim) + uniformity regularisation to
+      prevent collapse. Directly optimises embedding proximity, which better
+      matches the downstream image-generation objective.
 Regularisation:
   - L2 weight decay via AdamW (--weight-decay).
   - Uniformity loss on predicted embeddings (--uniformity-weight) to prevent
@@ -13,6 +16,7 @@ Usage examples:
     python scripts/train_encoder.py --model mlp --bottleneck 256 --dropout 0.1
     python scripts/train_encoder.py --model lstm --hidden 128 --dropout 0.1
     python scripts/train_encoder.py --model transformer --d-model 128 --n-heads 4 --n-layers 1
+    python scripts/train_encoder.py --model transformer --loss cosine --uniformity-weight 0.1
 """
 
 import argparse
@@ -48,7 +52,8 @@ def run_name(args) -> str:
 
     Structure: checkpoints/<model>/<run_name>/
     """
-    shared = f"do{args.dropout}_lr{args.lr}_wd{args.weight_decay}_tn{args.target_noise}_bs{args.batch_size}_t{args.temperature}_uw{args.uniformity_weight}"
+    loss_tag = f"loss{args.loss}_" if args.loss != "cosine" else ""
+    shared = f"{loss_tag}do{args.dropout}_lr{args.lr}_wd{args.weight_decay}_tn{args.target_noise}_bs{args.batch_size}_t{args.temperature}_uw{args.uniformity_weight}"
     if args.model == "mlp":
         return f"bn{args.bottleneck}_{shared}"
     elif args.model == "lstm":
@@ -127,6 +132,15 @@ def infonce_loss(
     return (loss_p + loss_t) / 2
 
 
+def cosine_loss(pred: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
+    """Mean cosine distance between predicted and target embeddings.
+
+    Both inputs should be L2-normalised. Returns a scalar in [0, 2].
+    Pair this with uniformity_loss to prevent collapse.
+    """
+    return (1.0 - F.cosine_similarity(pred, target, dim=-1)).mean()
+
+
 def uniformity_loss(z: torch.Tensor, t: float = 2.0) -> torch.Tensor:
     """Uniformity loss (Wang & Isola 2020) on L2-normalised embeddings.
 
@@ -200,7 +214,7 @@ def train_with_embeddings(args):
         raise ValueError("NaN values detected in neural input — check dead-neuron filtering in rust_loader.")
 
     # 2. batch too small for InfoNCE
-    if args.batch_size < 2:
+    if args.loss == "infonce" and args.batch_size < 2:
         raise ValueError("batch_size must be >= 2 for InfoNCE loss.")
 
     model = build_model(args, n_neurons, n_time, out_dim).to(device)
@@ -244,9 +258,11 @@ def train_with_embeddings(args):
             if args.target_noise > 0.0:
                 siglip = F.normalize(siglip + torch.randn_like(siglip) * args.target_noise, dim=-1)
 
-            # Memory bank: detach so bank doesn't contribute gradients
-            bank = all_train_targets.detach()
-            loss = infonce_loss(pred, siglip, temperature=args.temperature, memory_bank=bank)
+            if args.loss == "cosine":
+                loss = cosine_loss(pred, siglip)
+            else:
+                bank = all_train_targets.detach()
+                loss = infonce_loss(pred, siglip, temperature=args.temperature, memory_bank=bank)
 
             if args.uniformity_weight > 0.0:
                 loss = loss + args.uniformity_weight * uniformity_loss(pred)
@@ -276,16 +292,22 @@ def train_with_embeddings(args):
                 siglip = siglip.to(device)
                 x      = prepare_input(neural, args.model)
                 pred   = model(x)
-                val_loss += infonce_loss(pred, siglip, temperature=args.temperature).item()
+                if args.loss == "cosine":
+                    val_loss += cosine_loss(pred, siglip).item()
+                else:
+                    val_loss += infonce_loss(pred, siglip, temperature=args.temperature).item()
                 all_preds.append(pred.cpu())
                 all_targets.append(siglip.cpu())
 
         val_loss /= len(val_loader)
-        afc = two_afc_identification(torch.cat(all_preds), torch.cat(all_targets))
+        all_preds_t  = torch.cat(all_preds)
+        all_targets_t = torch.cat(all_targets)
+        afc     = two_afc_identification(all_preds_t, all_targets_t)
+        cos_sim = F.cosine_similarity(all_preds_t, all_targets_t, dim=-1).mean().item()
 
-        print(f"epoch {epoch:3d}/{args.epochs}  train={train_loss:.4f}  val={val_loss:.4f}  2AFC={afc:.3f}")
+        print(f"epoch {epoch:3d}/{args.epochs}  train={train_loss:.4f}  val={val_loss:.4f}  2AFC={afc:.3f}  cos={cos_sim:.4f}")
 
-        metrics = {"epoch": epoch, "train_loss": train_loss, "val_loss": val_loss, "val_2afc": afc}
+        metrics = {"epoch": epoch, "train_loss": train_loss, "val_loss": val_loss, "val_2afc": afc, "val_cos_sim": cos_sim}
 
         save_checkpoint(ckpt_dir / "last.pt", model, optimizer, scheduler, epoch, metrics, args)
         if afc > best_val_2afc:
@@ -307,6 +329,9 @@ def parse_args():
     p.add_argument("--model", choices=["mlp", "lstm", "transformer"], default="mlp")
     p.add_argument("--target", choices=["siglip", "clip"], default="siglip",
                    help="Embedding space to predict: siglip (1152-d) or clip (768-d, detailed captions)")
+    p.add_argument("--loss", choices=["infonce", "cosine"], default="cosine",
+                   help="infonce: contrastive (default); cosine: cosine distance + uniformity, "
+                        "optimises direct embedding proximity for generation")
 
     # MLP
     p.add_argument("--bottleneck", type=int, default=256)
