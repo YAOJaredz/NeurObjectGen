@@ -11,7 +11,7 @@ from config_const import (
     N_STIMULI, N_TRAIN, N_VAL, RUST_TIME_WINDOW, SEED,
     SIGLIP_EMBEDDINGS_PATH,
     CLIP_EMBEDS_PATH, CLIP_DETAILED_EMBEDS_PATH,
-    T5_EMBEDS_PATH, T5_PCA_K, CACHE_DIR,
+    T5_XXL_POOLED_PATH, T5_PCA_K, CACHE_DIR,
 )
 from data_utils.stimuli import load_rust_stimuli
 
@@ -183,11 +183,9 @@ def make_multihead_loader(
 
     t5_basis = torch.load(t5_pca_basis_path, weights_only=True).float()   # (K, 4096)
     t5_mean  = torch.load(t5_pca_mean_path,  weights_only=True).float()   # (4096,)
-    t5_short_raw = torch.load(T5_EMBEDS_PATH, weights_only=True).float()  # (300, 512, 4096)
-    norms = t5_short_raw.norm(dim=-1)                                      # (300, 512)
-    weights = torch.softmax(norms, dim=-1).unsqueeze(-1)                   # (300, 512, 1)
-    t5_short_pooled = (weights * t5_short_raw).sum(dim=1) - t5_mean       # (300, 4096)
-    t5_pca_t = t5_short_pooled @ t5_basis.T                               # (300, K) short captions
+    t5_pooled_raw = torch.load(T5_XXL_POOLED_PATH, weights_only=True).float()  # (300, 4096)
+    t5_pooled     = t5_pooled_raw - t5_mean                                    # (300, 4096) centered
+    t5_pca_t      = t5_pooled @ t5_basis.T                                     # (300, K)
 
     rng = np.random.default_rng(seed)
     perm = rng.permutation(N_STIMULI)

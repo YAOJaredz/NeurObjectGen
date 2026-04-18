@@ -158,7 +158,7 @@ def train(args):
 
             l_sig  = head_loss(pred["siglip"], sig_tgt,  args.nce_weight, args.nce_temperature)
             l_clip = head_loss(pred["clip"],   clip_tgt, args.nce_weight, args.nce_temperature)
-            l_t5   = head_loss(pred["t5_pca"], t5_tgt,   args.nce_weight, args.nce_temperature)
+            l_t5   = F.mse_loss(pred["t5_pca"], t5_tgt)
             if args.uniformity_weight > 0.0:
                 l_unif = (uniformity_loss(pred["shared"])
                           + uniformity_loss(F.normalize(pred["siglip"], dim=-1))
@@ -215,14 +215,15 @@ def train(args):
         afc_clip = two_afc_identification(preds_clip_t, gt_clip_t)
         cos_sig  = F.cosine_similarity(preds_sig_t,  gt_sig_t,  dim=-1).mean().item()
         cos_clip = F.cosine_similarity(preds_clip_t, gt_clip_t, dim=-1).mean().item()
-        mean_2afc = (afc_sig + afc_clip) / 2.0
+        mean_2afc = (afc_sig + afc_clip + val_cos_t5) / 3.0
         mean_cos  = (cos_sig + cos_clip) / 2.0
 
         print(
             f"epoch {epoch:3d}/{args.epochs}  "
             f"loss={train_loss:.4f} (sig={train_l_sig:.3f} clip={train_l_clip:.3f} t5={train_l_t5:.3f})  "
             f"val: sig_cos={cos_sig:.3f} clip_cos={cos_clip:.3f} "
-            f"sig_2afc={afc_sig:.3f} clip_2afc={afc_clip:.3f} t5_cos={val_cos_t5:.4f}"
+            f"sig_2afc={afc_sig:.3f} clip_2afc={afc_clip:.3f} "
+            f"t5_cos={val_cos_t5:.4f}  crit={mean_2afc:.4f}"
         )
 
         metrics = {
@@ -302,7 +303,7 @@ def parse_args():
     p.add_argument("--n-layers",   type=int,   default=1)
     p.add_argument("--shared-dim", type=int,   default=512,
                    help="Shared latent dimension before the three heads")
-    p.add_argument("--t5-pca-k",   type=int,   default=64,
+    p.add_argument("--t5-pca-k",   type=int,   default=128,
                    help="Number of T5 PCA components to predict")
     p.add_argument("--dropout",    type=float, default=0.1)
 

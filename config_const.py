@@ -13,6 +13,7 @@ CLIP_EMBEDS_PATH          = CACHE_DIR / "clip_embeds.pt"          # (300, 768)  
 T5_EMBEDS_PATH            = CACHE_DIR / "t5_embeds.pt"            # (300, 512, 4096)  T5 sequence, short captions
 CLIP_DETAILED_EMBEDS_PATH = CACHE_DIR / "clip_detailed_embeds.pt" # (300, 768)       CLIP pooled, detailed captions
 T5_DETAILED_EMBEDS_PATH   = CACHE_DIR / "t5_detailed_embeds.pt"   # (300, 512, 4096)  T5 sequence, detailed captions
+T5_XXL_POOLED_PATH        = CACHE_DIR / "t5_xxl_pooled_detailed.pt"  # (300, 4096) mean-pooled, standalone google/t5-v1_1-xxl
 SIGLIP_EMBEDDINGS_PATH = CACHE_DIR / "siglip_embeddings.pt"
 SIGLIP_STRIPPED_PATH   = CACHE_DIR / "siglip_stripped.pt"  # (300, 1152) aperture-stripped
 SIGLIP_PATCH14_PATH    = CACHE_DIR / "siglip_patch14.pt"   # (300, 196, 1152)
@@ -35,7 +36,7 @@ SIGLIP_DIM = 1152  # google/siglip-so400m-patch14-384
 CLIP_DIM = 768     # FLUX CLIP pooled embedding dim
 CHECKPOINT_DIR = REPO_ROOT / "checkpoints"
 
-T5_PCA_K          = 64
+T5_PCA_K          = 128
 T5_PCA_BASIS_PATH = CACHE_DIR / f"t5_pca_basis_k{T5_PCA_K}.pt"   # (K, 4096)
 T5_PCA_COORDS_PATH= CACHE_DIR / f"t5_pca_coords_k{T5_PCA_K}.pt"  # (300, K)
 T5_PCA_MEAN_PATH  = CACHE_DIR / f"t5_pca_mean_k{T5_PCA_K}.pt"    # (4096,)

@@ -11,7 +11,7 @@ class MultiHeadTransformer(nn.Module):
     A single forward pass produces embeddings for all three target spaces:
       - siglip:  (B, 1152) L2-normalised
       - clip:    (B, 768)  L2-normalised
-      - t5_pca:  (B, t5_pca_k)  raw PCA coordinates (cosine target)
+      - t5_pca:  (B, t5_pca_k)  raw PCA coordinates (MSE target)
       - shared:  (B, shared_dim) L2-normalised shared latent (for uniformity loss)
 
     The backbone is identical to TemporalTransformer up to temporal attention
@@ -68,12 +68,7 @@ class MultiHeadTransformer(nn.Module):
         # Three task heads
         self.siglip_head = nn.Linear(shared_dim, 1152)
         self.clip_head   = nn.Linear(shared_dim, 768)
-        self.t5_head     = nn.Sequential(
-            nn.Linear(shared_dim, shared_dim),
-            nn.LayerNorm(shared_dim),
-            nn.GELU(),
-            nn.Linear(shared_dim, t5_pca_k),
-        )
+        self.t5_head     = nn.Linear(shared_dim, t5_pca_k)
 
     def forward(self, x: torch.Tensor) -> dict[str, torch.Tensor]:
         """
