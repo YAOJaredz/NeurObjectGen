@@ -9,8 +9,9 @@ from HexPred.constants import ALL_MONKEYS
 
 from config_const import (
     N_STIMULI, N_TRAIN, N_VAL, RUST_TIME_WINDOW, SEED,
-    SIGLIP_EMBEDDINGS_PATH, CLIP_DETAILED_EMBEDS_PATH,
-    T5_PCA_COORDS_PATH,
+    SIGLIP_EMBEDDINGS_PATH,
+    CLIP_EMBEDS_PATH, CLIP_DETAILED_EMBEDS_PATH,
+    T5_EMBEDS_PATH, T5_PCA_K, CACHE_DIR,
 )
 from data_utils.stimuli import load_rust_stimuli
 
@@ -136,20 +137,24 @@ def make_multihead_loader(
     batch_size: int = 64,
     seed: int = SEED,
     verbose: bool = True,
+    t5_pca_k: int = T5_PCA_K,
 ) -> tuple[DataLoader, DataLoader, DataLoader]:
     """Build train/val/test DataLoaders for multi-head neural encoding.
 
     Yields (neural, target_dict) where target_dict has keys:
       - "siglip":  (1152,) L2-normalised SigLIP embedding
-      - "clip":    (768,)  L2-normalised CLIP embedding (detailed captions)
-      - "t5_pca":  (K,)    raw T5 PCA coordinates
+      - "clip":    (768,)  L2-normalised CLIP embedding (short captions)
+      - "t5_pca":  (K,)    T5 PCA coordinates (short captions)
 
     Neural data loading and split permutation are identical to make_rust_loader
     to ensure test sets are directly comparable with single-head baselines.
     """
-    if not T5_PCA_COORDS_PATH.exists():
+    t5_pca_basis_path = CACHE_DIR / f"t5_pca_basis_k{t5_pca_k}.pt"
+    t5_pca_mean_path  = CACHE_DIR / f"t5_pca_mean_k{t5_pca_k}.pt"
+
+    if not t5_pca_basis_path.exists():
         raise FileNotFoundError(
-            f"T5 PCA coords not found at {T5_PCA_COORDS_PATH}. "
+            f"T5 PCA basis not found at {t5_pca_basis_path}. "
             "Run: python scripts/precompute_t5_pca.py"
         )
 
@@ -173,8 +178,16 @@ def make_multihead_loader(
     neural_tensor = torch.from_numpy(object_responses).float()  # (300, neurons, time)
 
     siglip_t = torch.load(SIGLIP_EMBEDDINGS_PATH, weights_only=True)        # (300, 1152) already L2-normed
-    clip_t   = F.normalize(torch.load(CLIP_DETAILED_EMBEDS_PATH, weights_only=True), dim=-1)  # (300, 768)
-    t5_pca_t = torch.load(T5_PCA_COORDS_PATH, weights_only=True)            # (300, K)
+
+    clip_t = F.normalize(torch.load(CLIP_EMBEDS_PATH, weights_only=True), dim=-1)  # (300, 768) short captions
+
+    t5_basis = torch.load(t5_pca_basis_path, weights_only=True).float()   # (K, 4096)
+    t5_mean  = torch.load(t5_pca_mean_path,  weights_only=True).float()   # (4096,)
+    t5_short_raw = torch.load(T5_EMBEDS_PATH, weights_only=True).float()  # (300, 512, 4096)
+    norms = t5_short_raw.norm(dim=-1)                                      # (300, 512)
+    weights = torch.softmax(norms, dim=-1).unsqueeze(-1)                   # (300, 512, 1)
+    t5_short_pooled = (weights * t5_short_raw).sum(dim=1) - t5_mean       # (300, 4096)
+    t5_pca_t = t5_short_pooled @ t5_basis.T                               # (300, K) short captions
 
     rng = np.random.default_rng(seed)
     perm = rng.permutation(N_STIMULI)

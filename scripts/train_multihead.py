@@ -42,6 +42,24 @@ def cosine_loss(pred: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
     return (1.0 - F.cosine_similarity(pred, target, dim=-1)).mean()
 
 
+def info_nce_loss(pred: torch.Tensor, target: torch.Tensor, temperature: float = 0.07) -> torch.Tensor:
+    """Symmetric InfoNCE (CLIP-style). Directly optimises 2-AFC-like discrimination."""
+    pred_n = F.normalize(pred, dim=-1)
+    tgt_n  = F.normalize(target, dim=-1)
+    logits = (pred_n @ tgt_n.T) / temperature
+    labels = torch.arange(logits.size(0), device=logits.device)
+    return 0.5 * (F.cross_entropy(logits, labels) + F.cross_entropy(logits.T, labels))
+
+
+def head_loss(pred, target, nce_weight: float, temperature: float) -> torch.Tensor:
+    """InfoNCE (primary) + small cosine regulariser on magnitude/direction."""
+    l_cos = cosine_loss(pred, target)
+    if nce_weight > 0.0 and pred.size(0) > 1:
+        l_nce = info_nce_loss(pred, target, temperature)
+        return nce_weight * l_nce + (1.0 - nce_weight) * l_cos
+    return l_cos
+
+
 def uniformity_loss(z: torch.Tensor, t: float = 2.0) -> torch.Tensor:
     sq_pdist = torch.pdist(z, p=2).pow(2)
     return sq_pdist.mul(-t).exp().mean().log()
@@ -59,6 +77,7 @@ def run_name(args) -> str:
         f"_tn{args.target_noise}_bs{args.batch_size}"
         f"_ws{args.loss_weight_siglip}_wc{args.loss_weight_clip}"
         f"_wt{args.loss_weight_t5}_uw{args.uniformity_weight}"
+        f"_nw{args.nce_weight}_nt{args.nce_temperature}"
     )
 
 
@@ -85,7 +104,7 @@ def train(args):
     torch.manual_seed(SEED)
     device = get_device()
 
-    train_loader, val_loader, test_loader = make_multihead_loader(batch_size=args.batch_size)
+    train_loader, val_loader, test_loader = make_multihead_loader(batch_size=args.batch_size, t5_pca_k=args.t5_pca_k)
 
     sample_neural, _ = next(iter(train_loader))
     _, n_neurons, n_time = sample_neural.shape
@@ -118,7 +137,7 @@ def train(args):
     ckpt_dir.mkdir(parents=True, exist_ok=True)
     print(f"Checkpoints -> {ckpt_dir}")
 
-    best_mean_cos = -1.0
+    best_mean_2afc = -1.0
 
     for epoch in range(1, args.epochs + 1):
         # --- train ---
@@ -137,10 +156,15 @@ def train(args):
                 sig_tgt  = F.normalize(sig_tgt  + torch.randn_like(sig_tgt)  * args.target_noise, dim=-1)
                 clip_tgt = F.normalize(clip_tgt + torch.randn_like(clip_tgt) * args.target_noise, dim=-1)
 
-            l_sig  = cosine_loss(pred["siglip"], sig_tgt)
-            l_clip = cosine_loss(pred["clip"],   clip_tgt)
-            l_t5   = F.mse_loss(pred["t5_pca"],  t5_tgt)
-            l_unif = uniformity_loss(pred["shared"]) if args.uniformity_weight > 0.0 else torch.tensor(0.0)
+            l_sig  = head_loss(pred["siglip"], sig_tgt,  args.nce_weight, args.nce_temperature)
+            l_clip = head_loss(pred["clip"],   clip_tgt, args.nce_weight, args.nce_temperature)
+            l_t5   = head_loss(pred["t5_pca"], t5_tgt,   args.nce_weight, args.nce_temperature)
+            if args.uniformity_weight > 0.0:
+                l_unif = (uniformity_loss(pred["shared"])
+                          + uniformity_loss(F.normalize(pred["siglip"], dim=-1))
+                          + uniformity_loss(F.normalize(pred["clip"], dim=-1))) / 3.0
+            else:
+                l_unif = torch.tensor(0.0)
 
             loss = (args.loss_weight_siglip * l_sig
                   + args.loss_weight_clip   * l_clip
@@ -169,7 +193,7 @@ def train(args):
         # --- val ---
         model.eval()
         preds_sig, preds_clip, gt_sig, gt_clip = [], [], [], []
-        val_mse_t5 = 0.0
+        val_cos_t5 = 0.0
 
         with torch.no_grad():
             for neural, tgt in val_loader:
@@ -179,9 +203,9 @@ def train(args):
                 preds_clip.append(pred["clip"].cpu())
                 gt_sig.append(tgt["siglip"])
                 gt_clip.append(tgt["clip"])
-                val_mse_t5 += F.mse_loss(pred["t5_pca"], tgt["t5_pca"].to(device)).item()
+                val_cos_t5 += (1.0 - cosine_loss(pred["t5_pca"], tgt["t5_pca"].to(device))).item()
 
-        val_mse_t5 /= len(val_loader)
+        val_cos_t5 /= len(val_loader)
         preds_sig_t  = torch.cat(preds_sig)
         preds_clip_t = torch.cat(preds_clip)
         gt_sig_t     = torch.cat(gt_sig)
@@ -198,7 +222,7 @@ def train(args):
             f"epoch {epoch:3d}/{args.epochs}  "
             f"loss={train_loss:.4f} (sig={train_l_sig:.3f} clip={train_l_clip:.3f} t5={train_l_t5:.3f})  "
             f"val: sig_cos={cos_sig:.3f} clip_cos={cos_clip:.3f} "
-            f"sig_2afc={afc_sig:.3f} clip_2afc={afc_clip:.3f} t5_mse={val_mse_t5:.4f}"
+            f"sig_2afc={afc_sig:.3f} clip_2afc={afc_clip:.3f} t5_cos={val_cos_t5:.4f}"
         )
 
         metrics = {
@@ -209,13 +233,13 @@ def train(args):
             "val_mean_2afc": mean_2afc,
             "val_cos_siglip": cos_sig, "val_cos_clip": cos_clip,
             "val_mean_cos": mean_cos,
-            "val_mse_t5": val_mse_t5,
+            "val_cos_t5": val_cos_t5,
         }
 
         save_checkpoint(ckpt_dir / "last.pt", model, optimizer, scheduler, epoch, metrics, args)
         # Guard against noisy early-epoch cos_sim: only checkpoint after warmup
-        if epoch > warmup_epochs and mean_cos > best_mean_cos:
-            best_mean_cos = mean_cos
+        if epoch > warmup_epochs and mean_2afc > best_mean_2afc:
+            best_mean_2afc = mean_2afc
             save_checkpoint(ckpt_dir / "best.pt", model, optimizer, scheduler, epoch, metrics, args)
 
     # --- test ---
@@ -290,6 +314,11 @@ def parse_args():
     p.add_argument("--uniformity-weight",  type=float, default=0.1)
     p.add_argument("--target-noise",       type=float, default=0.02,
                    help="Gaussian noise std added to SigLIP/CLIP targets (re-normalised after)")
+    p.add_argument("--nce-weight",         type=float, default=0.8,
+                   help="Mix between InfoNCE (primary) and cosine (regulariser) in each head loss. "
+                        "0.0 = pure cosine (old behaviour), 1.0 = pure InfoNCE.")
+    p.add_argument("--nce-temperature",    type=float, default=0.07,
+                   help="InfoNCE softmax temperature. Lower → sharper discrimination.")
 
     # Optimisation
     p.add_argument("--epochs",       type=int,   default=200)
