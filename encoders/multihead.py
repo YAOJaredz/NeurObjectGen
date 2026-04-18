@@ -11,7 +11,7 @@ class MultiHeadTransformer(nn.Module):
     A single forward pass produces embeddings for all three target spaces:
       - siglip:  (B, 1152) L2-normalised
       - clip:    (B, 768)  L2-normalised
-      - t5_pca:  (B, t5_pca_k)  raw PCA coordinates (MSE target)
+      - t5_pca:  (B, t5_pca_k)  L2-normalised PCA coordinates (cosine target)
       - shared:  (B, shared_dim) L2-normalised shared latent (for uniformity loss)
 
     The backbone is identical to TemporalTransformer up to temporal attention
@@ -78,7 +78,7 @@ class MultiHeadTransformer(nn.Module):
         Returns dict with keys:
             siglip:  (B, 1152) L2-normalised
             clip:    (B, 768)  L2-normalised
-            t5_pca:  (B, t5_pca_k) raw PCA coords (cosine loss target)
+            t5_pca:  (B, t5_pca_k) L2-normalised PCA coords
             shared:  (B, shared_dim) L2-normalised (for uniformity loss)
         """
         x = self.input_norm(x)
@@ -102,6 +102,6 @@ class MultiHeadTransformer(nn.Module):
         return {
             "siglip": F.normalize(self.siglip_head(shared), dim=-1),
             "clip":   F.normalize(self.clip_head(shared),   dim=-1),
-            "t5_pca": self.t5_head(shared),
+            "t5_pca": F.normalize(self.t5_head(shared), dim=-1),
             "shared": F.normalize(shared, dim=-1),
         }

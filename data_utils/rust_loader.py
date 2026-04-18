@@ -185,7 +185,7 @@ def make_multihead_loader(
     t5_mean  = torch.load(t5_pca_mean_path,  weights_only=True).float()   # (4096,)
     t5_pooled_raw = torch.load(T5_XXL_POOLED_PATH, weights_only=True).float()  # (300, 4096)
     t5_pooled     = t5_pooled_raw - t5_mean                                    # (300, 4096) centered
-    t5_pca_t      = t5_pooled @ t5_basis.T                                     # (300, K)
+    t5_pca_t      = F.normalize(t5_pooled @ t5_basis.T, dim=-1)                # (300, K) L2-normed
 
     rng = np.random.default_rng(seed)
     perm = rng.permutation(N_STIMULI)

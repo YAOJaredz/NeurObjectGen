@@ -8,7 +8,7 @@
 #   shared_dim:     256, 512
 #   t5_pca_k:       128, 256
 #
-# T5 head uses MSE loss. nce_weight fixed at 0.8 (InfoNCE primary for SigLIP/CLIP heads).
+# All heads use InfoNCE+cosine loss (nce_weight=0.8). T5 PCA targets are L2-normalised.
 # Checkpoint criterion: (sig_2afc + clip_2afc + val_cos_t5) / 3
 #
 # Fixed: lr=3e-4, n_heads=4, weight_decay=0.01, dropout=0.1,
@@ -25,7 +25,7 @@
 #SBATCH --partition=issa
 #SBATCH --exclude=ax09,ax10,ax11
 #SBATCH --output=/home/yy3658/NeurObjectGen/jobs/logs/multihead_sweep_%A_%a.log
-#SBATCH --array=0-47%16        # 48 runs, max 16 concurrent
+#SBATCH --array=0-31%16        # 48 runs, max 16 concurrent
 
 # ---------------------------------------------------------------------------
 # Environment
@@ -42,16 +42,16 @@ $PYTHON -V
 # ---------------------------------------------------------------------------
 # Hyperparameter grid
 # ---------------------------------------------------------------------------
-LOSS_WEIGHT_T5S=(0.0 0.1 0.5)
+LOSS_WEIGHT_T5S=(0.5 1.0)
 D_MODELS=(64 128)
 N_LAYERS=(2 4)
 SHARED_DIMS=(256 512)
 T5_PCA_KS=(128 256)
 DROPOUT=0.1
-NCE_WEIGHT=0.8   # fixed
+NCE_WEIGHT=0.05   # fixed
 NCE_TEMP=0.07
 
-N_WT=${#LOSS_WEIGHT_T5S[@]}   # 3
+N_WT=${#LOSS_WEIGHT_T5S[@]}   # 2
 N_DM=${#D_MODELS[@]}          # 2
 N_NL=${#N_LAYERS[@]}          # 2
 N_SD=${#SHARED_DIMS[@]}       # 2

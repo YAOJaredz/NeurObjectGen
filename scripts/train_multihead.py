@@ -3,7 +3,7 @@
 Loss:
   L = w_siglip * cosine_loss(pred_siglip, tgt_siglip)
     + w_clip   * cosine_loss(pred_clip,   tgt_clip)
-    + w_t5     * mse_loss(pred_t5_pca,    tgt_t5_pca)
+    + w_t5     * head_loss(pred_t5_pca,   tgt_t5_pca)  # same InfoNCE+cosine as other heads
     + w_unif   * uniformity_loss(shared_latent)
 
 Checkpoint criterion: best mean 2-AFC across SigLIP and CLIP heads.
@@ -158,7 +158,7 @@ def train(args):
 
             l_sig  = head_loss(pred["siglip"], sig_tgt,  args.nce_weight, args.nce_temperature)
             l_clip = head_loss(pred["clip"],   clip_tgt, args.nce_weight, args.nce_temperature)
-            l_t5   = F.mse_loss(pred["t5_pca"], t5_tgt)
+            l_t5   = head_loss(pred["t5_pca"], t5_tgt, args.nce_weight, args.nce_temperature)
             if args.uniformity_weight > 0.0:
                 l_unif = (uniformity_loss(pred["shared"])
                           + uniformity_loss(F.normalize(pred["siglip"], dim=-1))
