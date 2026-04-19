@@ -1,4 +1,4 @@
-"""Multi-head transformer encoder: shared backbone → SigLIP, CLIP, and T5-PCA heads."""
+"""Multi-head transformer encoder: shared backbone → SigLIP and CLIP heads."""
 
 import torch
 import torch.nn as nn
@@ -6,17 +6,16 @@ import torch.nn.functional as F
 
 
 class MultiHeadTransformer(nn.Module):
-    """Shared Pre-LN transformer backbone with three projection heads.
+    """Shared Pre-LN transformer backbone with two projection heads.
 
-    A single forward pass produces embeddings for all three target spaces:
+    A single forward pass produces embeddings for both target spaces:
       - siglip:  (B, 1152) L2-normalised
       - clip:    (B, 768)  L2-normalised
-      - t5_pca:  (B, t5_pca_k)  L2-normalised PCA coordinates (cosine target)
       - shared:  (B, shared_dim) L2-normalised shared latent (for uniformity loss)
 
     The backbone is identical to TemporalTransformer up to temporal attention
     pooling. After pooling, a shared projection maps d_model → shared_dim before
-    branching into the three task-specific linear heads.
+    branching into the two task-specific linear heads.
 
     Args:
         n_neurons:   Number of input neurons.
@@ -24,7 +23,6 @@ class MultiHeadTransformer(nn.Module):
         n_heads:     Attention heads (must divide d_model).
         n_layers:    Transformer encoder layers.
         shared_dim:  Bottleneck dimension shared across all heads (default 512).
-        t5_pca_k:    Number of T5 PCA components the t5_head predicts.
         dropout:     Dropout inside the transformer encoder layers.
         max_time:    Maximum number of time steps (for positional embeddings).
     """
@@ -36,7 +34,6 @@ class MultiHeadTransformer(nn.Module):
         n_heads: int = 4,
         n_layers: int = 1,
         shared_dim: int = 512,
-        t5_pca_k: int = 64,
         dropout: float = 0.1,
         max_time: int = 32,
     ):
@@ -65,10 +62,9 @@ class MultiHeadTransformer(nn.Module):
         # Shared projection: temporal pooled (d_model) → shared latent (shared_dim)
         self.shared_proj = nn.Linear(d_model, shared_dim)
 
-        # Three task heads
+        # Two task heads
         self.siglip_head = nn.Linear(shared_dim, 1152)
         self.clip_head   = nn.Linear(shared_dim, 768)
-        self.t5_head     = nn.Linear(shared_dim, t5_pca_k)
 
     def forward(self, x: torch.Tensor) -> dict[str, torch.Tensor]:
         """
@@ -78,7 +74,6 @@ class MultiHeadTransformer(nn.Module):
         Returns dict with keys:
             siglip:  (B, 1152) L2-normalised
             clip:    (B, 768)  L2-normalised
-            t5_pca:  (B, t5_pca_k) L2-normalised PCA coords
             shared:  (B, shared_dim) L2-normalised (for uniformity loss)
         """
         x = self.input_norm(x)
@@ -102,6 +97,5 @@ class MultiHeadTransformer(nn.Module):
         return {
             "siglip": F.normalize(self.siglip_head(shared), dim=-1),
             "clip":   F.normalize(self.clip_head(shared),   dim=-1),
-            "t5_pca": F.normalize(self.t5_head(shared), dim=-1),
             "shared": F.normalize(shared, dim=-1),
         }

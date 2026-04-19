@@ -1,19 +1,18 @@
 #!/bin/bash
 # Sweep MultiHeadTransformer hyperparameters via SLURM job arrays.
 #
-# Grid: loss_weight_t5 x d_model x n_layers x shared_dim x t5_pca_k = 3x2x2x2x2 = 48 runs
-#   loss_weight_t5: 0.0 (2-head ablation), 0.1, 0.5
-#   d_model:        64, 128
-#   n_layers:       2, 4
-#   shared_dim:     256, 512
-#   t5_pca_k:       128, 256
+# Grid: nce_weight x d_model x n_layers x shared_dim = 3x2x2x2 = 24 runs
+#   nce_weight: 0.0 (pure cosine), 0.5, 0.8 (InfoNCE-heavy)
+#   d_model:    64, 128
+#   n_layers:   2, 4
+#   shared_dim: 256, 512
 #
-# All heads use InfoNCE+cosine loss (nce_weight=0.8). T5 PCA targets are L2-normalised.
-# Checkpoint criterion: (sig_2afc + clip_2afc + val_cos_t5) / 3
+# Two heads only (SigLIP + CLIP), no T5.
+# Checkpoint criterion: (sig_2afc + clip_2afc) / 2
 #
 # Fixed: lr=3e-4, n_heads=4, weight_decay=0.01, dropout=0.1,
 #        loss_weight_siglip=1.0, loss_weight_clip=1.0, uniformity_weight=0.1,
-#        target_noise=0.02, nce_weight=0.8, nce_temperature=0.07, epochs=200, batch_size=64
+#        target_noise=0.02, nce_temperature=0.07, epochs=200, batch_size=64
 
 #SBATCH --job-name=multihead_sweep
 #SBATCH --account=yy3658
@@ -25,7 +24,7 @@
 #SBATCH --partition=issa
 #SBATCH --exclude=ax09,ax10,ax11
 #SBATCH --output=/home/yy3658/NeurObjectGen/jobs/logs/multihead_sweep_%A_%a.log
-#SBATCH --array=0-31%16        # 48 runs, max 16 concurrent
+#SBATCH --array=0-23%12        # 24 runs, max 12 concurrent
 
 # ---------------------------------------------------------------------------
 # Environment
@@ -42,41 +41,36 @@ $PYTHON -V
 # ---------------------------------------------------------------------------
 # Hyperparameter grid
 # ---------------------------------------------------------------------------
-LOSS_WEIGHT_T5S=(0.5 1.0)
+NCE_WEIGHTS=(0.1 0.5 0.8)
 D_MODELS=(64 128)
 N_LAYERS=(2 4)
 SHARED_DIMS=(256 512)
-T5_PCA_KS=(128 256)
 DROPOUT=0.1
-NCE_WEIGHT=0.05   # fixed
 NCE_TEMP=0.07
 
-N_WT=${#LOSS_WEIGHT_T5S[@]}   # 2
+N_NW=${#NCE_WEIGHTS[@]}       # 3
 N_DM=${#D_MODELS[@]}          # 2
 N_NL=${#N_LAYERS[@]}          # 2
 N_SD=${#SHARED_DIMS[@]}       # 2
-N_PK=${#T5_PCA_KS[@]}         # 2
 
-# 3 x 2 x 2 x 2 x 2 = 48 total
+# 3 x 2 x 2 x 2 = 24 total
 # n_heads=4 divides both d_model=64 and d_model=128
 N_HEADS=4
 
 TASK_ID=${SLURM_ARRAY_TASK_ID:-0}
 
 idx=$TASK_ID
-PK_IDX=$((idx % N_PK));  idx=$((idx / N_PK))
 SD_IDX=$((idx % N_SD));  idx=$((idx / N_SD))
 NL_IDX=$((idx % N_NL));  idx=$((idx / N_NL))
 DM_IDX=$((idx % N_DM));  idx=$((idx / N_DM))
-WT_IDX=$((idx % N_WT))
+NW_IDX=$((idx % N_NW))
 
-LOSS_WEIGHT_T5=${LOSS_WEIGHT_T5S[$WT_IDX]}
+NCE_WEIGHT=${NCE_WEIGHTS[$NW_IDX]}
 D_MODEL=${D_MODELS[$DM_IDX]}
 N_LAYER=${N_LAYERS[$NL_IDX]}
 SHARED_DIM=${SHARED_DIMS[$SD_IDX]}
-T5_PCA_K=${T5_PCA_KS[$PK_IDX]}
 
-echo "Task ${SLURM_ARRAY_TASK_ID}: loss_weight_t5=${LOSS_WEIGHT_T5} d_model=${D_MODEL} n_layers=${N_LAYER} shared_dim=${SHARED_DIM} t5_pca_k=${T5_PCA_K} nce_weight=${NCE_WEIGHT}"
+echo "Task ${SLURM_ARRAY_TASK_ID}: nce_weight=${NCE_WEIGHT} d_model=${D_MODEL} n_layers=${N_LAYER} shared_dim=${SHARED_DIM}"
 
 # ---------------------------------------------------------------------------
 # Train
@@ -89,8 +83,6 @@ $PYTHON scripts/train_multihead.py \
     --dropout          "${DROPOUT}"           \
     --lr               3e-4                  \
     --weight-decay     1e-2                  \
-    --t5-pca-k         "${T5_PCA_K}"          \
-    --loss-weight-t5   "${LOSS_WEIGHT_T5}"   \
     --loss-weight-siglip 1.0                 \
     --loss-weight-clip   1.0                 \
     --uniformity-weight  0.1                 \
@@ -98,4 +90,4 @@ $PYTHON scripts/train_multihead.py \
     --nce-weight       "${NCE_WEIGHT}"       \
     --nce-temperature  "${NCE_TEMP}"         \
     --epochs           200                   \
-    --batch-size       64
+    --batch-size       128

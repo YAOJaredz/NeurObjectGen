@@ -122,9 +122,9 @@ def make_rust_loader(
 class MultiHeadDataset(Dataset):
     """Dataset yielding (neural, target_dict) for multi-head training."""
 
-    def __init__(self, neural: torch.Tensor, siglip: torch.Tensor, clip: torch.Tensor, t5_pca: torch.Tensor):
+    def __init__(self, neural: torch.Tensor, siglip: torch.Tensor, clip: torch.Tensor):
         self.neural  = neural
-        self.targets = {"siglip": siglip, "clip": clip, "t5_pca": t5_pca}
+        self.targets = {"siglip": siglip, "clip": clip}
 
     def __len__(self) -> int:
         return len(self.neural)
@@ -137,27 +137,16 @@ def make_multihead_loader(
     batch_size: int = 64,
     seed: int = SEED,
     verbose: bool = True,
-    t5_pca_k: int = T5_PCA_K,
 ) -> tuple[DataLoader, DataLoader, DataLoader]:
     """Build train/val/test DataLoaders for multi-head neural encoding.
 
     Yields (neural, target_dict) where target_dict has keys:
       - "siglip":  (1152,) L2-normalised SigLIP embedding
       - "clip":    (768,)  L2-normalised CLIP embedding (short captions)
-      - "t5_pca":  (K,)    T5 PCA coordinates (short captions)
 
     Neural data loading and split permutation are identical to make_rust_loader
     to ensure test sets are directly comparable with single-head baselines.
     """
-    t5_pca_basis_path = CACHE_DIR / f"t5_pca_basis_k{t5_pca_k}.pt"
-    t5_pca_mean_path  = CACHE_DIR / f"t5_pca_mean_k{t5_pca_k}.pt"
-
-    if not t5_pca_basis_path.exists():
-        raise FileNotFoundError(
-            f"T5 PCA basis not found at {t5_pca_basis_path}. "
-            "Run: python scripts/precompute_t5_pca.py"
-        )
-
     monkey_responses = []
     for monkey in ALL_MONKEYS:
         rsp, _ = get_rust_responses(
@@ -178,14 +167,7 @@ def make_multihead_loader(
     neural_tensor = torch.from_numpy(object_responses).float()  # (300, neurons, time)
 
     siglip_t = torch.load(SIGLIP_EMBEDDINGS_PATH, weights_only=True)        # (300, 1152) already L2-normed
-
     clip_t = F.normalize(torch.load(CLIP_EMBEDS_PATH, weights_only=True), dim=-1)  # (300, 768) short captions
-
-    t5_basis = torch.load(t5_pca_basis_path, weights_only=True).float()   # (K, 4096)
-    t5_mean  = torch.load(t5_pca_mean_path,  weights_only=True).float()   # (4096,)
-    t5_pooled_raw = torch.load(T5_XXL_POOLED_PATH, weights_only=True).float()  # (300, 4096)
-    t5_pooled     = t5_pooled_raw - t5_mean                                    # (300, 4096) centered
-    t5_pca_t      = F.normalize(t5_pooled @ t5_basis.T, dim=-1)                # (300, K) L2-normed
 
     rng = np.random.default_rng(seed)
     perm = rng.permutation(N_STIMULI)
@@ -194,12 +176,7 @@ def make_multihead_loader(
     test_idx  = torch.from_numpy(perm[N_TRAIN + N_VAL:]).long()
 
     def make(idx, shuffle):
-        ds = MultiHeadDataset(
-            neural_tensor[idx],
-            siglip_t[idx],
-            clip_t[idx],
-            t5_pca_t[idx],
-        )
+        ds = MultiHeadDataset(neural_tensor[idx], siglip_t[idx], clip_t[idx])
         return DataLoader(ds, batch_size=batch_size, shuffle=shuffle)
 
     train_loader = make(train_idx, shuffle=True)
@@ -207,12 +184,11 @@ def make_multihead_loader(
     test_loader  = make(test_idx,  shuffle=False)
 
     if verbose:
-        k = t5_pca_t.shape[1]
         print(
             f"Multihead RUST loaders: "
             f"train={len(train_idx)}, val={len(val_idx)}, test={len(test_idx)}, "
             f"neurons={object_responses.shape[1]}, time={object_responses.shape[2]}, "
-            f"targets=(siglip=1152, clip=768, t5_pca={k})"
+            f"targets=(siglip=1152, clip=768)"
         )
 
     return train_loader, val_loader, test_loader
