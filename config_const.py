@@ -31,6 +31,19 @@ N_VAL = 50
 N_TEST = 50
 
 RUST_TIME_WINDOW = (0, 250)
+HVM_TIME_WINDOW  = (0, 250)
+
+HVM_N_STIMULI  = 450
+HVM_CATEGORIES = ('apple', 'bear', 'car', 'chair', 'dog', 'elephant', 'head', 'plane', 'table', 'turtle')
+HVM_N_CAT      = 10
+HVM_N_VAR      = 45   # variations per category
+HVM_N_TRAIN    = 270  # 27 per category × 10
+HVM_N_VAL      = 90   # 9 per category × 10
+HVM_N_TEST     = 90   # 9 per category × 10
+
+HVM_SRC_DIR  = Path('/mnt/smb/locker/issa-locker/Data/West/Saved_Images/E8')
+HVM_RAW_DIR  = STIMULI_ROOT / 'hvm'
+HVM_STIM_DIR = STIMULI_ROOT / 'hvm_cropped'
 
 SIGLIP_DIM = 1152  # google/siglip-so400m-patch14-384
 CLIP_DIM = 768     # FLUX CLIP pooled embedding dim
