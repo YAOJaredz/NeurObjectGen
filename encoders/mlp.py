@@ -22,22 +22,35 @@ class BottleneckMLP(nn.Module):
         dropout:    Dropout probability applied after the hidden activation.
     """
 
-    def __init__(self, in_dim: int, bottleneck: int, out_dim: int, dropout: float = 0.0):
+    def __init__(
+        self,
+        in_dim: int,
+        bottleneck: int,
+        out_dim: int,
+        dropout: float = 0.0,
+        n_categories: int = 0,
+    ):
         super().__init__()
         self.fc1 = nn.Linear(in_dim, bottleneck)
         self.norm = nn.LayerNorm(bottleneck)
         self.drop = nn.Dropout(dropout)
         self.fc2 = nn.Linear(bottleneck, out_dim)
+        self.use_cat = n_categories > 0
+        if self.use_cat:
+            self.cat_emb = nn.Embedding(n_categories, bottleneck)
+            nn.init.zeros_(self.cat_emb.weight)
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+    def forward(self, x: torch.Tensor, cat: torch.Tensor | None = None) -> torch.Tensor:
         """Map neural activity to a L2-normalised SigLIP embedding.
 
         Args:
-            x: (B, in_dim) float tensor of neural firing rates.
+            x:   (B, in_dim) float tensor of neural firing rates.
+            cat: (B,) integer category indices, or None for unconditioned.
 
         Returns:
             (B, out_dim) L2-normalised embedding tensor.
         """
-        x = self.drop(F.gelu(self.norm(self.fc1(x))))
-        x = self.fc2(x)
-        return F.normalize(x, dim=-1)
+        h = self.drop(F.gelu(self.norm(self.fc1(x))))
+        if self.use_cat and cat is not None:
+            h = h + self.cat_emb(cat)
+        return F.normalize(self.fc2(h), dim=-1)

@@ -36,6 +36,7 @@ class MultiHeadTransformer(nn.Module):
         shared_dim: int = 512,
         dropout: float = 0.1,
         max_time: int = 32,
+        n_categories: int = 0,
     ):
         super().__init__()
 
@@ -66,10 +67,16 @@ class MultiHeadTransformer(nn.Module):
         self.siglip_head = nn.Linear(shared_dim, 1152)
         self.clip_head   = nn.Linear(shared_dim, 768)
 
-    def forward(self, x: torch.Tensor) -> dict[str, torch.Tensor]:
+        self.use_cat = n_categories > 0
+        if self.use_cat:
+            self.cat_emb = nn.Embedding(n_categories, shared_dim)
+            nn.init.zeros_(self.cat_emb.weight)
+
+    def forward(self, x: torch.Tensor, cat: torch.Tensor | None = None) -> dict[str, torch.Tensor]:
         """
         Args:
-            x: (B, T, N_neurons) neural firing rates.
+            x:   (B, T, N_neurons) neural firing rates.
+            cat: (B,) integer category indices, or None for unconditioned.
 
         Returns dict with keys:
             siglip:  (B, 1152) L2-normalised
@@ -93,6 +100,8 @@ class MultiHeadTransformer(nn.Module):
         pooled = (w * x).sum(dim=1)                          # (B, d_model)
 
         shared = F.gelu(self.shared_proj(pooled))            # (B, shared_dim)
+        if self.use_cat and cat is not None:
+            shared = shared + self.cat_emb(cat)
 
         return {
             "siglip": F.normalize(self.siglip_head(shared), dim=-1),

@@ -33,6 +33,7 @@ class TemporalTransformer(nn.Module):
         out_dim: int,
         dropout: float = 0.1,
         max_time: int = 32,
+        n_categories: int = 0,
     ):
         super().__init__()
         # Normalise the 6802-d neural vector at each time step before projection.
@@ -60,11 +61,16 @@ class TemporalTransformer(nn.Module):
         # Temporal attention pooling over time-step tokens (excludes CLS)
         self.attn = nn.Linear(d_model, 1, bias=False)
         self.proj = nn.Linear(d_model, out_dim)
+        self.use_cat = n_categories > 0
+        if self.use_cat:
+            self.cat_emb = nn.Embedding(n_categories, d_model)
+            nn.init.zeros_(self.cat_emb.weight)
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+    def forward(self, x: torch.Tensor, cat: torch.Tensor | None = None) -> torch.Tensor:
         """
         Args:
-            x: (B, T, N_neurons) float tensor of neural firing rates.
+            x:   (B, T, N_neurons) float tensor of neural firing rates.
+            cat: (B,) integer category indices, or None for unconditioned.
 
         Returns:
             (B, out_dim) L2-normalised embedding tensor.
@@ -85,5 +91,7 @@ class TemporalTransformer(nn.Module):
         # but learned weights decide the final mixture across all T+1 positions
         w = torch.softmax(self.attn(x), dim=1)          # (B, T+1, 1)
         pooled = (w * x).sum(dim=1)                     # (B, d_model)
+        if self.use_cat and cat is not None:
+            pooled = pooled + self.cat_emb(cat)
         out = self.proj(pooled)                         # (B, out_dim)
         return F.normalize(out, dim=-1)

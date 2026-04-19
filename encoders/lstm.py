@@ -21,7 +21,15 @@ class TemporalLSTM(nn.Module):
         dropout:   Dropout probability applied between LSTM layers and before projection.
     """
 
-    def __init__(self, n_neurons: int, hidden: int, out_dim: int, n_layers: int = 1, dropout: float = 0.0):
+    def __init__(
+        self,
+        n_neurons: int,
+        hidden: int,
+        out_dim: int,
+        n_layers: int = 1,
+        dropout: float = 0.0,
+        n_categories: int = 0,
+    ):
         super().__init__()
         self.input_norm = nn.LayerNorm(n_neurons)
         self.lstm = nn.LSTM(
@@ -33,11 +41,16 @@ class TemporalLSTM(nn.Module):
         # Temporal attention pooling: learn to weight each time step
         self.attn = nn.Linear(hidden, 1, bias=False)
         self.proj = nn.Linear(hidden, out_dim)
+        self.use_cat = n_categories > 0
+        if self.use_cat:
+            self.cat_emb = nn.Embedding(n_categories, hidden)
+            nn.init.zeros_(self.cat_emb.weight)
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+    def forward(self, x: torch.Tensor, cat: torch.Tensor | None = None) -> torch.Tensor:
         """
         Args:
-            x: (B, T, N_neurons) float tensor of neural firing rates.
+            x:   (B, T, N_neurons) float tensor of neural firing rates.
+            cat: (B,) integer category indices, or None for unconditioned.
 
         Returns:
             (B, out_dim) L2-normalised embedding tensor.
@@ -47,5 +60,7 @@ class TemporalLSTM(nn.Module):
         # Learned temporal attention pooling over all time steps
         w = torch.softmax(self.attn(all_h), dim=1)          # (B, T, 1)
         pooled = (w * all_h).sum(dim=1)                     # (B, hidden)
+        if self.use_cat and cat is not None:
+            pooled = pooled + self.cat_emb(cat)
         out = self.proj(self.drop(pooled))
         return F.normalize(out, dim=-1)

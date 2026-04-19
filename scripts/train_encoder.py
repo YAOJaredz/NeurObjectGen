@@ -34,10 +34,11 @@ from torch.optim.lr_scheduler import LambdaLR
 REPO_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPO_ROOT))
 
-from config_const import SEED, SIGLIP_DIM, CLIP_DIM, CHECKPOINT_DIR
+from config_const import SEED, SIGLIP_DIM, CLIP_DIM, CHECKPOINT_DIR, HVM_N_CAT
 
 TARGET_DIMS = {"siglip": SIGLIP_DIM, "clip": CLIP_DIM}
 from data_utils.rust_loader import make_rust_loader
+from data_utils.hvm_loader import make_hvm_loader
 from encoders import BottleneckMLP, TemporalLSTM, TemporalTransformer
 from eval.metrics import two_afc_identification, retrieval_accuracy
 from get_device import get_device
@@ -53,17 +54,21 @@ def run_name(args) -> str:
     Structure: checkpoints/<model>/<run_name>/
     """
     loss_tag = f"loss{args.loss}_" if args.loss != "cosine" else ""
+    cat_tag  = "_cat" if getattr(args, "use_category", False) else ""
     shared = f"{loss_tag}do{args.dropout}_lr{args.lr}_wd{args.weight_decay}_tn{args.target_noise}_bs{args.batch_size}_t{args.temperature}_uw{args.uniformity_weight}"
     if args.model == "mlp":
-        return f"bn{args.bottleneck}_{shared}"
+        return f"bn{args.bottleneck}_{shared}{cat_tag}"
     elif args.model == "lstm":
-        return f"h{args.hidden}_nl{args.n_layers}_{shared}"
+        return f"h{args.hidden}_nl{args.n_layers}_{shared}{cat_tag}"
     else:
-        return f"d{args.d_model}_nh{args.n_heads}_nl{args.n_layers}_{shared}"
+        return f"d{args.d_model}_nh{args.n_heads}_nl{args.n_layers}_{shared}{cat_tag}"
 
 
 def run_dir(args) -> Path:
-    """checkpoints/<model>/<target>/<run_name>/"""
+    """checkpoints/<dataset>/<model>/<target>/<run_name>/"""
+    dataset = getattr(args, "dataset", "rust")
+    if dataset == "hvm":
+        return CHECKPOINT_DIR / "hvm" / args.model / args.target / run_name(args)
     return CHECKPOINT_DIR / args.model / args.target / run_name(args)
 
 
@@ -163,16 +168,17 @@ MLP_TIME_SLICE = slice(5, 20)  # 50-200 ms window, 15 bins
 MLP_N_BINS = MLP_TIME_SLICE.stop - MLP_TIME_SLICE.start  # 15
 
 
-def build_model(args, n_neurons: int, n_time: int, out_dim: int) -> torch.nn.Module:
+def build_model(args, n_neurons: int, n_time: int, out_dim: int, n_categories: int = 0) -> torch.nn.Module:
     if args.model == "mlp":
         in_dim = n_neurons * MLP_N_BINS  # 15 bins, not full n_time
-        return BottleneckMLP(in_dim=in_dim, bottleneck=args.bottleneck, out_dim=out_dim, dropout=args.dropout)
+        return BottleneckMLP(in_dim=in_dim, bottleneck=args.bottleneck, out_dim=out_dim, dropout=args.dropout, n_categories=n_categories)
     elif args.model == "lstm":
-        return TemporalLSTM(n_neurons=n_neurons, hidden=args.hidden, out_dim=out_dim, n_layers=args.n_layers, dropout=args.dropout)
+        return TemporalLSTM(n_neurons=n_neurons, hidden=args.hidden, out_dim=out_dim, n_layers=args.n_layers, dropout=args.dropout, n_categories=n_categories)
     elif args.model == "transformer":
         return TemporalTransformer(
             n_neurons=n_neurons, d_model=args.d_model, n_heads=args.n_heads,
             n_layers=args.n_layers, out_dim=out_dim, dropout=args.dropout,
+            n_categories=n_categories,
         )
     else:
         raise ValueError(f"unknown model: {args.model}")
@@ -200,11 +206,18 @@ def train_with_embeddings(args):
 
     out_dim = TARGET_DIMS[args.target]
 
-    train_loader, val_loader, test_loader = make_rust_loader(
-        batch_size=args.batch_size, use_embeddings=True, target=args.target,
-    )
+    if args.dataset == "hvm":
+        train_loader, val_loader, test_loader = make_hvm_loader(
+            batch_size=args.batch_size, use_embeddings=True, target=args.target,
+            use_categories=args.use_category,
+        )
+    else:
+        train_loader, val_loader, test_loader = make_rust_loader(
+            batch_size=args.batch_size, use_embeddings=True, target=args.target,
+        )
 
-    sample_neural, _ = next(iter(train_loader))
+    sample_batch = next(iter(train_loader))
+    sample_neural = sample_batch[0]
     _, n_neurons, n_time = sample_neural.shape
 
     # --- sanity checks before training ---
@@ -217,7 +230,8 @@ def train_with_embeddings(args):
     if args.loss == "infonce" and args.batch_size < 2:
         raise ValueError("batch_size must be >= 2 for InfoNCE loss.")
 
-    model = build_model(args, n_neurons, n_time, out_dim).to(device)
+    n_cat = HVM_N_CAT if (args.dataset == "hvm" and args.use_category) else 0
+    model = build_model(args, n_neurons, n_time, out_dim, n_categories=n_cat).to(device)
     print(f"Model: {model.__class__.__name__} | params: {sum(p.numel() for p in model.parameters() if p.requires_grad):,}")
 
     optimizer = AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
@@ -240,7 +254,7 @@ def train_with_embeddings(args):
 
     # --- Build static memory bank from all training target embeddings ---
     # Collect all training targets once (they're frozen SigLIP embeds, no grad needed).
-    all_train_targets = torch.cat([t for _, t in train_loader], dim=0).to(device)  # (N_train, D)
+    all_train_targets = torch.cat([batch[1] for batch in train_loader], dim=0).to(device)  # (N_train, D)
 
     best_val_2afc = 0.0
 
@@ -248,12 +262,13 @@ def train_with_embeddings(args):
         # --- train ---
         model.train()
         train_loss = 0.0
-        for neural, siglip in train_loader:
-            neural  = neural.to(device)
-            siglip  = siglip.to(device)
+        for batch in train_loader:
+            neural  = batch[0].to(device)
+            siglip  = batch[1].to(device)
+            cat     = batch[2].to(device) if len(batch) == 3 else None
 
             x    = prepare_input(neural, args.model)
-            pred = model(x)
+            pred = model(x, cat)
 
             if args.target_noise > 0.0:
                 siglip = F.normalize(siglip + torch.randn_like(siglip) * args.target_noise, dim=-1)
@@ -287,11 +302,12 @@ def train_with_embeddings(args):
         val_loss = 0.0
         all_preds, all_targets = [], []
         with torch.no_grad():
-            for neural, siglip in val_loader:
-                neural = neural.to(device)
-                siglip = siglip.to(device)
+            for batch in val_loader:
+                neural = batch[0].to(device)
+                siglip = batch[1].to(device)
+                cat    = batch[2].to(device) if len(batch) == 3 else None
                 x      = prepare_input(neural, args.model)
-                pred   = model(x)
+                pred   = model(x, cat)
                 if args.loss == "cosine":
                     val_loss += cosine_loss(pred, siglip).item()
                 else:
@@ -321,12 +337,13 @@ def train_with_embeddings(args):
     model.eval()
     test_preds, test_targets = [], []
     with torch.no_grad():
-        for neural, siglip in test_loader:
-            neural = neural.to(device)
+        for batch in test_loader:
+            neural = batch[0].to(device)
+            cat    = batch[2].to(device) if len(batch) == 3 else None
             x      = prepare_input(neural, args.model)
-            pred   = model(x)
+            pred   = model(x, cat)
             test_preds.append(pred.cpu())
-            test_targets.append(siglip)
+            test_targets.append(batch[1])
 
     test_preds_t   = torch.cat(test_preds)
     test_targets_t = torch.cat(test_targets)
@@ -365,6 +382,10 @@ def train_with_embeddings(args):
 def parse_args():
     p = argparse.ArgumentParser()
     p.add_argument("--model", choices=["mlp", "lstm", "transformer"], default="mlp")
+    p.add_argument("--dataset", choices=["rust", "hvm"], default="rust",
+                   help="Neural dataset to train on")
+    p.add_argument("--use-category", action="store_true", default=False,
+                   help="Condition on category label (HVM only; adds learned Embedding(10, dim) at bottleneck)")
     p.add_argument("--target", choices=["siglip", "clip"], default="siglip",
                    help="Embedding space to predict: siglip (1152-d) or clip (768-d, detailed captions)")
     p.add_argument("--loss", choices=["infonce", "cosine"], default="cosine",

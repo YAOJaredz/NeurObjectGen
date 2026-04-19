@@ -8,9 +8,8 @@ from HexPred.constants import ALL_MONKEYS
 
 from config_const import (
     SEED,
-    SIGLIP_EMBEDDINGS_PATH,
-    CLIP_EMBEDS_PATH, CLIP_DETAILED_EMBEDS_PATH,
-    HVM_TIME_WINDOW, HVM_N_STIMULI, HVM_N_TRAIN, HVM_N_VAL,
+    HVM_SIGLIP_EMBEDDINGS_PATH, HVM_CLIP_EMBEDS_PATH,
+    HVM_TIME_WINDOW, HVM_N_STIMULI, HVM_N_TRAIN, HVM_N_VAL, HVM_N_VAR,
 )
 
 
@@ -69,6 +68,7 @@ def make_hvm_loader(
     verbose: bool = True,
     use_embeddings: bool = False,
     target: str = 'siglip',
+    use_categories: bool = False,
 ) -> tuple[DataLoader, DataLoader, DataLoader]:
     """Build category-stratified train/val/test DataLoaders for HVM data.
 
@@ -96,8 +96,8 @@ def make_hvm_loader(
 
     if use_embeddings:
         _EMBED_PATHS = {
-            'siglip': (SIGLIP_EMBEDDINGS_PATH,   'python scripts/cache_siglip.py'),
-            'clip':   (CLIP_DETAILED_EMBEDS_PATH, 'python scripts/cache_text_embeds.py --device cuda'),
+            'siglip': (HVM_SIGLIP_EMBEDDINGS_PATH, 'python scripts/cache_siglip.py --dataset hvm'),
+            'clip':   (HVM_CLIP_EMBEDS_PATH,        'python scripts/cache_text_embeds.py --dataset hvm'),
         }
         if target not in _EMBED_PATHS:
             raise ValueError(f"Unknown target '{target}'. Choose from: {list(_EMBED_PATHS)}")
@@ -119,11 +119,15 @@ def make_hvm_loader(
     val_idx   = torch.from_numpy(val_idx_np).long()
     test_idx  = torch.from_numpy(test_idx_np).long()
 
+    # Sequential block layout: indices 0–44 = cat 0, 45–89 = cat 1, …, 405–449 = cat 9
+    cat_indices = torch.arange(HVM_N_STIMULI) // HVM_N_VAR  # (450,) int64
+
     def make(idx, shuffle):
-        return DataLoader(
-            TensorDataset(neural_tensor[idx], target_tensor[idx]),
-            batch_size=batch_size, shuffle=shuffle,
-        )
+        if use_categories:
+            ds = TensorDataset(neural_tensor[idx], target_tensor[idx], cat_indices[idx])
+        else:
+            ds = TensorDataset(neural_tensor[idx], target_tensor[idx])
+        return DataLoader(ds, batch_size=batch_size, shuffle=shuffle)
 
     train_loader = make(train_idx, shuffle=True)
     val_loader   = make(val_idx,   shuffle=False)
