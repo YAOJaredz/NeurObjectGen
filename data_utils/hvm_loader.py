@@ -13,10 +13,14 @@ from config_const import (
 )
 
 
-def _load_hvm_neural(monkey: str = 'West') -> np.ndarray:
-    """Return (450, neurons, time) mean-trial response, dead neurons dropped."""
-    rsp, _ = get_hvm_responses(mode='area', monkey=monkey, area='all',
-                               time_window=HVM_TIME_WINDOW)
+def _load_hvm_neural() -> np.ndarray:
+    """Return (450, neurons, time) mean-trial response across all monkeys, dead neurons dropped."""
+    monkey_responses = []
+    for monkey in ALL_MONKEYS:
+        rsp, _ = get_hvm_responses(mode='area', monkey=monkey, area='all',
+                                   time_window=HVM_TIME_WINDOW)
+        monkey_responses.append(rsp)
+    rsp = np.concatenate(monkey_responses, axis=1)  # (450, all_neurons, time)
     dead = (
         np.all((rsp == 0) | np.isnan(rsp), axis=(0, 2))
         | np.any(np.isnan(rsp), axis=(0, 2))
@@ -64,7 +68,6 @@ def _category_stratified_split(
 def make_hvm_loader(
     batch_size: int = 64,
     seed: int = SEED,
-    monkey: str = 'West',
     verbose: bool = True,
     use_embeddings: bool = False,
     target: str = 'siglip',
@@ -72,7 +75,8 @@ def make_hvm_loader(
 ) -> tuple[DataLoader, DataLoader, DataLoader]:
     """Build category-stratified train/val/test DataLoaders for HVM data.
 
-    HVM has 10 object categories × 45 variations = 450 stimuli. The split is
+    HVM has 10 object categories × 45 variations = 450 stimuli. Neural responses
+    are concatenated across all monkeys (same as make_rust_loader). The split is
     stratified so each partition sees every category: 27 train / 9 val / 9 test
     per category (270 / 90 / 90 total).
 
@@ -83,15 +87,15 @@ def make_hvm_loader(
     Args:
         batch_size:     Samples per batch.
         seed:           RNG seed for within-category permutation.
-        monkey:         Monkey name passed to get_hvm_responses.
         verbose:        Print loader statistics.
         use_embeddings: Yield pre-cached embeddings instead of images.
         target:         Which embedding — 'siglip' or 'clip'.
+        use_categories: If True, batches are 3-tuples (neural, target, cat_idx).
 
     Returns:
         ``(train_loader, val_loader, test_loader)``
     """
-    rsp = _load_hvm_neural(monkey)
+    rsp = _load_hvm_neural()
     neural_tensor = torch.from_numpy(rsp).float()  # (450, neurons, time)
 
     if use_embeddings:
@@ -136,7 +140,7 @@ def make_hvm_loader(
     if verbose:
         target_shape = tuple(target_tensor.shape[1:])
         print(
-            f"HVM loaders created ({monkey}): "
+            f"HVM loaders created (all monkeys): "
             f"train={len(train_idx)}, "
             f"val={len(val_idx)}, "
             f"test={len(test_idx)}, "
