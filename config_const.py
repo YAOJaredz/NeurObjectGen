@@ -23,6 +23,14 @@ RUST_LOSS_MASK_PATH = RUST_STIM_DIR / "loss_mask.pt"
 BLIP2_CAPTIONS_PATH = CACHE_DIR / "blip2_captions.json"
 BLIP2_DETAILED_CAPTIONS_PATH = CACHE_DIR / "blip2_detailed_captions.json"
 
+HVM_BLIP2_CAPTIONS_PATH          = CACHE_DIR / "hvm_blip2_captions.json"
+HVM_BLIP2_DETAILED_CAPTIONS_PATH  = CACHE_DIR / "hvm_blip2_detailed_captions.json"
+HVM_SIGLIP_EMBEDDINGS_PATH        = CACHE_DIR / "hvm_siglip_embeddings.pt"    # (450, 1152)
+HVM_CLIP_EMBEDS_PATH              = CACHE_DIR / "hvm_clip_embeds.pt"           # (450, 768)
+HVM_CLIP_DETAILED_EMBEDS_PATH     = CACHE_DIR / "hvm_clip_detailed_embeds.pt"  # (450, 768)
+HVM_T5_EMBEDS_PATH                = CACHE_DIR / "hvm_t5_embeds.pt"             # (450, 512, 4096)
+HVM_T5_DETAILED_EMBEDS_PATH       = CACHE_DIR / "hvm_t5_detailed_embeds.pt"    # (450, 512, 4096)
+
 SEED = 42
 
 N_STIMULI = 300

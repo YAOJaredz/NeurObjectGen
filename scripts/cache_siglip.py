@@ -19,8 +19,9 @@ from config_const import (
     SIGLIP_STRIPPED_PATH,
     SIGLIP_PATCH8_PATH,
     SIGLIP_PATCH14_PATH,
+    HVM_SIGLIP_EMBEDDINGS_PATH,
 )
-from data_utils.stimuli import load_rust_stimuli
+from data_utils.stimuli import load_rust_stimuli, load_hvm_stimuli
 from encoders.siglip_embed import embed_images, embed_images_patches, embed_images_stripped, load_siglip
 
 
@@ -36,39 +37,52 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--device", default="cuda")
     parser.add_argument("--force", action="store_true")
+    parser.add_argument("--dataset", choices=["rust", "hvm", "both"], default="rust")
     args = parser.parse_args()
 
     SIGLIP_EMBEDDINGS_PATH.parent.mkdir(parents=True, exist_ok=True)
+    datasets = ["rust", "hvm"] if args.dataset == "both" else [args.dataset]
+
     processor, vision_model = load_siglip(args.device)
 
-    # --- tensor-based targets (global raw, patches) ---
-    tensor_targets = [
-        ("global", SIGLIP_EMBEDDINGS_PATH, None),
-        ("patch14", SIGLIP_PATCH14_PATH, 14),
-        ("patch8",  SIGLIP_PATCH8_PATH,   8),
-    ]
-    images = None
-    for name, path, grid in tensor_targets:
-        if path.exists() and not args.force:
-            print(f"{path} exists; skipping {name}")
-            continue
-        if images is None:
-            images = load_rust_stimuli()
-        if grid is None:
-            embeds = embed_images(processor, vision_model, images)
-        else:
-            embeds = embed_images_patches(processor, vision_model, images, grid_size=grid)
-        torch.save(embeds, path)
-        print(f"saved {tuple(embeds.shape)} -> {path}")
+    if "rust" in datasets:
+        # --- tensor-based targets (global raw, patches) ---
+        tensor_targets = [
+            ("global", SIGLIP_EMBEDDINGS_PATH, None),
+            ("patch14", SIGLIP_PATCH14_PATH, 14),
+            ("patch8",  SIGLIP_PATCH8_PATH,   8),
+        ]
+        images = None
+        for name, path, grid in tensor_targets:
+            if path.exists() and not args.force:
+                print(f"{path} exists; skipping {name}")
+                continue
+            if images is None:
+                images = load_rust_stimuli()
+            if grid is None:
+                embeds = embed_images(processor, vision_model, images)
+            else:
+                embeds = embed_images_patches(processor, vision_model, images, grid_size=grid)
+            torch.save(embeds, path)
+            print(f"saved {tuple(embeds.shape)} -> {path}")
 
-    # --- stripped variant (needs raw RGBA PIL images) ---
-    if SIGLIP_STRIPPED_PATH.exists() and not args.force:
-        print(f"{SIGLIP_STRIPPED_PATH} exists; skipping stripped")
-    else:
-        pils = load_rust_pils()
-        embeds = embed_images_stripped(processor, vision_model, pils)
-        torch.save(embeds, SIGLIP_STRIPPED_PATH)
-        print(f"saved {tuple(embeds.shape)} -> {SIGLIP_STRIPPED_PATH}")
+        # --- stripped variant (needs raw RGBA PIL images) ---
+        if SIGLIP_STRIPPED_PATH.exists() and not args.force:
+            print(f"{SIGLIP_STRIPPED_PATH} exists; skipping stripped")
+        else:
+            pils = load_rust_pils()
+            embeds = embed_images_stripped(processor, vision_model, pils)
+            torch.save(embeds, SIGLIP_STRIPPED_PATH)
+            print(f"saved {tuple(embeds.shape)} -> {SIGLIP_STRIPPED_PATH}")
+
+    if "hvm" in datasets:
+        if HVM_SIGLIP_EMBEDDINGS_PATH.exists() and not args.force:
+            print(f"{HVM_SIGLIP_EMBEDDINGS_PATH} exists; skipping HVM SigLIP")
+        else:
+            images = load_hvm_stimuli()
+            embeds = embed_images(processor, vision_model, images)
+            torch.save(embeds, HVM_SIGLIP_EMBEDDINGS_PATH)
+            print(f"saved {tuple(embeds.shape)} -> {HVM_SIGLIP_EMBEDDINGS_PATH}")
 
 
 if __name__ == "__main__":
