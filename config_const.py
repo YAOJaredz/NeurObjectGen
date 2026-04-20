@@ -20,6 +20,7 @@ SIGLIP_PATCH14_PATH    = CACHE_DIR / "siglip_patch14.pt"   # (300, 196, 1152)
 SIGLIP_PATCH8_PATH     = CACHE_DIR / "siglip_patch8.pt"    # (300,  64, 1152)
 SIGLIP_PATCH_TOKENS    = {14: 196, 8: 64}
 RUST_LOSS_MASK_PATH = RUST_STIM_DIR / "loss_mask.pt"
+HVM_LOSS_MASK_PATH  = STIMULI_ROOT / "hvm_cropped" / "loss_mask.pt"
 BLIP2_CAPTIONS_PATH = CACHE_DIR / "blip2_captions.json"
 BLIP2_DETAILED_CAPTIONS_PATH = CACHE_DIR / "blip2_detailed_captions.json"
 

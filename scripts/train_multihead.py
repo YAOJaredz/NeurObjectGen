@@ -24,8 +24,9 @@ from torch.optim.lr_scheduler import LambdaLR
 REPO_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPO_ROOT))
 
-from config_const import SEED, CHECKPOINT_DIR
+from config_const import SEED, CHECKPOINT_DIR, HVM_N_CAT
 from data_utils.rust_loader import make_multihead_loader
+from data_utils.hvm_loader import make_hvm_multihead_loader
 from encoders import MultiHeadTransformer
 from eval.metrics import two_afc_identification, retrieval_accuracy
 from get_device import get_device
@@ -80,7 +81,8 @@ def run_name(args) -> str:
 
 
 def run_dir(args) -> Path:
-    return CHECKPOINT_DIR / "multihead" / run_name(args)
+    tag = args.dataset + ("_cat" if getattr(args, "use_category", False) else "")
+    return CHECKPOINT_DIR / "multihead" / tag / run_name(args)
 
 
 def save_checkpoint(path: Path, model, optimizer, scheduler, epoch: int, metrics: dict, args):
@@ -102,11 +104,18 @@ def train(args):
     torch.manual_seed(SEED)
     device = get_device()
 
-    train_loader, val_loader, test_loader = make_multihead_loader(batch_size=args.batch_size)
+    if args.dataset == "hvm":
+        train_loader, val_loader, test_loader = make_hvm_multihead_loader(batch_size=args.batch_size)
+        clip_key = "clip_short"
+    else:
+        train_loader, val_loader, test_loader = make_multihead_loader(batch_size=args.batch_size)
+        clip_key = "clip"
 
-    sample_neural, _ = next(iter(train_loader))
+    sample_batch = next(iter(train_loader))
+    sample_neural = sample_batch[0]
     _, n_neurons, n_time = sample_neural.shape
 
+    n_cat = HVM_N_CAT if (args.dataset == "hvm" and args.use_category) else 0
     model = MultiHeadTransformer(
         n_neurons=n_neurons,
         d_model=args.d_model,
@@ -114,6 +123,7 @@ def train(args):
         n_layers=args.n_layers,
         shared_dim=args.shared_dim,
         dropout=args.dropout,
+        n_categories=n_cat,
     ).to(device)
 
     n_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
@@ -141,11 +151,14 @@ def train(args):
         model.train()
         train_loss = train_l_sig = train_l_clip = 0.0
 
-        for neural, tgt in train_loader:
+        for batch in train_loader:
+            neural, tgt = batch[0], batch[1]
+            cat = batch[2].to(device) if len(batch) >= 3 else None
+
             x = neural.permute(0, 2, 1).to(device)  # (B, T, N)
 
             sig_tgt  = tgt["siglip"].to(device)
-            clip_tgt = tgt["clip"].to(device)
+            clip_tgt = tgt[clip_key].to(device)
 
             if args.target_noise > 0.0:
                 sig_tgt  = F.normalize(sig_tgt  + torch.randn_like(sig_tgt)  * args.target_noise, dim=-1)
@@ -157,7 +170,7 @@ def train(args):
                 mask = (torch.rand(x.shape[0], 1, x.shape[2], device=device) > args.neuron_dropout).float()
                 x = x * mask
 
-            pred = model(x)
+            pred = model(x, cat)
 
             l_sig  = head_loss(pred["siglip"], sig_tgt,  args.nce_weight, args.nce_temperature)
             l_clip = head_loss(pred["clip"],   clip_tgt, args.nce_weight, args.nce_temperature)
@@ -194,13 +207,15 @@ def train(args):
         preds_sig, preds_clip, gt_sig, gt_clip = [], [], [], []
 
         with torch.no_grad():
-            for neural, tgt in val_loader:
+            for batch in val_loader:
+                neural, tgt = batch[0], batch[1]
+                cat = batch[2].to(device) if len(batch) >= 3 else None
                 x = neural.permute(0, 2, 1).to(device)
-                pred = model(x)
+                pred = model(x, cat)
                 preds_sig.append(pred["siglip"].cpu())
                 preds_clip.append(pred["clip"].cpu())
                 gt_sig.append(tgt["siglip"])
-                gt_clip.append(tgt["clip"])
+                gt_clip.append(tgt[clip_key])
 
         preds_sig_t  = torch.cat(preds_sig)
         preds_clip_t = torch.cat(preds_clip)
@@ -244,13 +259,15 @@ def train(args):
 
     test_sig, test_clip, test_gt_sig, test_gt_clip = [], [], [], []
     with torch.no_grad():
-        for neural, tgt in test_loader:
+        for batch in test_loader:
+            neural, tgt = batch[0], batch[1]
+            cat = batch[2].to(device) if len(batch) >= 3 else None
             x = neural.permute(0, 2, 1).to(device)
-            pred = model(x)
+            pred = model(x, cat)
             test_sig.append(pred["siglip"].cpu())
             test_clip.append(pred["clip"].cpu())
             test_gt_sig.append(tgt["siglip"])
-            test_gt_clip.append(tgt["clip"])
+            test_gt_clip.append(tgt[clip_key])
 
     ts  = torch.cat(test_sig);  tgs = torch.cat(test_gt_sig)
     tc  = torch.cat(test_clip); tgc = torch.cat(test_gt_clip)
@@ -290,6 +307,13 @@ def train(args):
 
 def parse_args():
     p = argparse.ArgumentParser()
+
+    # Dataset + conditioning
+    p.add_argument("--dataset", choices=["rust", "hvm"], default="rust",
+                   help="Neural dataset to train on.")
+    p.add_argument("--use-category", action="store_true", default=False,
+                   help="Condition on category label (HVM only; adds learned "
+                        "Embedding at shared latent).")
 
     # Transformer backbone
     p.add_argument("--d-model",    type=int,   default=128)

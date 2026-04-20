@@ -584,6 +584,7 @@ def generate_img2img(
     rf_noise_blend: float = 0.0,
     seed: int = 0,
     aperture_composite: bool = True,
+    aperture_mask: torch.Tensor | None = None,
     show_progress: bool = True,
 ) -> Image.Image:
     """Img2img generation with per-step aperture compositing.
@@ -687,9 +688,11 @@ def generate_img2img(
         latents = pipe.scheduler.scale_noise(init_latent_packed, t_start, noise)
         image_latents = None
 
-    aperture_mask = None
-    if aperture_composite:
+    if aperture_mask is not None:
+        aperture_mask = aperture_mask.to(device=device, dtype=dtype)
+    elif aperture_composite:
         aperture_mask = load_packed_aperture_mask(image_size=height, device=device, dtype=dtype)
+    if aperture_mask is not None:
         assert aperture_mask.shape[1] == init_latent_packed.shape[1], (
             f"mask seq {aperture_mask.shape[1]} != latent seq {init_latent_packed.shape[1]}"
         )
