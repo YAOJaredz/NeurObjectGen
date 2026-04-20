@@ -5,19 +5,27 @@ Loss: InfoNCE + cosine mixture (head_loss), same as each head in train_multihead
 
 Checkpoint criterion: best val cosine similarity on T5 PCA targets.
 
+Datasets:
+  --dataset rust (default): 300 RUST stimuli, random 200/50/50 split.
+  --dataset hvm:            450 HVM stimuli, category-stratified 270/90/90 split.
+                            Use --use-category to add learned category conditioning.
+
 Modes:
   default (--per-token not set):
-      One datapoint per stimulus (200 train). Target = mean-pooled T5 PCA vector.
+      One datapoint per stimulus. Target = mean-pooled T5 PCA vector.
   --per-token:
-      One datapoint per real T5 token × stimulus (~13,900 train pairs from 200 stimuli).
-      --captions controls which caption set: short (~8 tokens), detailed (~61), or both.
-      Requires cache/t5_xxl_tokens_{short,detailed}.pt — run scripts/cache_t5_xxl_tokens.py first.
+      One datapoint per real T5 token × stimulus.
+      --captions controls which caption set: short, detailed, or both.
+      RUST:  Requires cache/t5_xxl_tokens_{short,detailed}.pt
+      HVM:   Requires cache/hvm_t5_xxl_tokens_{short,detailed}.pt
+             Run scripts/cache_hvm_t5_xxl_tokens.py first.
 
 Usage:
     python scripts/train_t5.py
     python scripts/train_t5.py --n-layers 2 --nce-weight 0.5
     python scripts/train_t5.py --per-token --captions both
-    python scripts/train_t5.py --per-token --captions detailed --epochs 100
+    python scripts/train_t5.py --dataset hvm --captions short
+    python scripts/train_t5.py --dataset hvm --captions short --use-category
 """
 
 import argparse
@@ -33,9 +41,10 @@ from torch.optim.lr_scheduler import LambdaLR
 REPO_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPO_ROOT))
 
-from config_const import SEED, CHECKPOINT_DIR, T5_PCA_K
+from config_const import SEED, CHECKPOINT_DIR, T5_PCA_K, HVM_N_CAT
 from data_utils.rust_loader import make_multihead_loader
 from data_utils.t5_token_loader import make_t5_token_loader
+from data_utils.hvm_t5_token_loader import make_hvm_t5_token_loader
 from encoders import TemporalTransformer
 from eval.metrics import two_afc_identification, retrieval_accuracy
 from get_device import get_device
@@ -76,18 +85,20 @@ def uniformity_loss(z: torch.Tensor, t: float = 2.0) -> torch.Tensor:
 
 def run_name(args) -> str:
     mode = f"_tok{args.captions}" if args.per_token else ""
+    cat  = "_cat" if getattr(args, "use_category", False) else ""
     return (
         f"d{args.d_model}_nh{args.n_heads}_nl{args.n_layers}"
         f"_k{args.t5_pca_k}_do{args.dropout}"
         f"_lr{args.lr}_wd{args.weight_decay}"
         f"_tn{args.target_noise}_in{args.input_noise}_nd{args.neuron_dropout}"
         f"_bs{args.batch_size}_nw{args.nce_weight}_nt{args.nce_temperature}"
-        f"_uw{args.uniformity_weight}{mode}"
+        f"_uw{args.uniformity_weight}{mode}{cat}"
     )
 
 
 def run_dir(args) -> Path:
-    return CHECKPOINT_DIR / "transformer" / "t5" / run_name(args)
+    dataset = getattr(args, "dataset", "rust")
+    return CHECKPOINT_DIR / "transformer" / "t5" / dataset / run_name(args)
 
 
 def save_checkpoint(path: Path, model, optimizer, scheduler, epoch: int, metrics: dict, args):
@@ -112,6 +123,11 @@ def _extract_target(tgt) -> torch.Tensor:
     return tgt
 
 
+def _is_hvm_batch(batch) -> bool:
+    """HVM T5 token batches are 3-tuples (neural, pca_coords, cat_idx)."""
+    return len(batch) == 3
+
+
 def _pool_by_stimulus(preds: torch.Tensor, stim_index: torch.Tensor) -> torch.Tensor:
     """Average per-token predictions to one L2-normalised vector per stimulus."""
     n_stim = int(stim_index.max().item()) + 1
@@ -126,7 +142,14 @@ def train(args):
     torch.manual_seed(SEED)
     device = get_device()
 
-    if args.per_token:
+    dataset = getattr(args, "dataset", "rust")
+    use_category = getattr(args, "use_category", False)
+
+    if dataset == "hvm":
+        train_loader, val_loader, test_loader = make_hvm_t5_token_loader(
+            batch_size=args.batch_size, t5_pca_k=args.t5_pca_k, captions=args.captions,
+        )
+    elif args.per_token:
         train_loader, val_loader, test_loader = make_t5_token_loader(
             batch_size=args.batch_size, t5_pca_k=args.t5_pca_k, captions=args.captions,
         )
@@ -135,8 +158,11 @@ def train(args):
             batch_size=args.batch_size, t5_pca_k=args.t5_pca_k,
         )
 
-    sample_neural, _ = next(iter(train_loader))
+    sample_batch = next(iter(train_loader))
+    sample_neural = sample_batch[0]
     _, n_neurons, n_time = sample_neural.shape
+
+    n_categories = HVM_N_CAT if (dataset == "hvm" and use_category) else 0
 
     model = TemporalTransformer(
         n_neurons=n_neurons,
@@ -145,10 +171,14 @@ def train(args):
         n_layers=args.n_layers,
         out_dim=args.t5_pca_k,
         dropout=args.dropout,
+        n_categories=n_categories,
     ).to(device)
 
     n_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
-    print(f"TemporalTransformer (T5) | params: {n_params:,} | out_dim: {args.t5_pca_k}")
+    print(
+        f"TemporalTransformer (T5) | dataset: {dataset} | params: {n_params:,} | "
+        f"out_dim: {args.t5_pca_k} | n_categories: {n_categories}"
+    )
 
     optimizer = AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
     warmup_epochs = max(1, int(args.epochs * args.warmup_frac)) if args.warmup_frac > 0 else 0
@@ -172,7 +202,10 @@ def train(args):
         model.train()
         train_loss = 0.0
 
-        for neural, tgt in train_loader:
+        for batch in train_loader:
+            neural, tgt = batch[0], batch[1]
+            cat = batch[2].to(device) if (_is_hvm_batch(batch) and use_category) else None
+
             x      = neural.permute(0, 2, 1).to(device)   # (B, T, N)
             t5_tgt = _extract_target(tgt).to(device)
 
@@ -186,7 +219,7 @@ def train(args):
                 mask = (torch.rand(x.shape[0], 1, x.shape[2], device=device) > args.neuron_dropout).float()
                 x = x * mask
 
-            pred = model(x)
+            pred = model(x, cat)
             loss = head_loss(pred, t5_tgt, args.nce_weight, args.nce_temperature)
 
             if args.uniformity_weight > 0.0:
@@ -207,13 +240,15 @@ def train(args):
         model.eval()
         train_preds, train_tgts = [], []
         with torch.no_grad():
-            for neural, tgt in train_loader:
+            for batch in train_loader:
+                neural, tgt = batch[0], batch[1]
+                cat = batch[2].to(device) if (_is_hvm_batch(batch) and use_category) else None
                 x = neural.permute(0, 2, 1).to(device)
-                train_preds.append(model(x).cpu())
+                train_preds.append(model(x, cat).cpu())
                 train_tgts.append(_extract_target(tgt))
         train_preds_t = torch.cat(train_preds)
         train_tgts_t  = torch.cat(train_tgts)
-        if args.per_token:
+        if hasattr(train_loader.dataset, "stim_index"):
             sidx = train_loader.dataset.stim_index
             train_preds_stim = _pool_by_stimulus(train_preds_t, sidx)
             train_tgts_stim  = _pool_by_stimulus(train_tgts_t,  sidx)
@@ -225,15 +260,17 @@ def train(args):
         # --- val ---
         all_preds, all_targets = [], []
         with torch.no_grad():
-            for neural, tgt in val_loader:
-                x      = neural.permute(0, 2, 1).to(device)
-                pred   = model(x)
+            for batch in val_loader:
+                neural, tgt = batch[0], batch[1]
+                cat  = batch[2].to(device) if (_is_hvm_batch(batch) and use_category) else None
+                x    = neural.permute(0, 2, 1).to(device)
+                pred = model(x, cat)
                 all_preds.append(pred.cpu())
                 all_targets.append(_extract_target(tgt))
 
         preds_t   = torch.cat(all_preds)
         targets_t = torch.cat(all_targets)
-        if args.per_token:
+        if hasattr(val_loader.dataset, "stim_index"):
             sidx = val_loader.dataset.stim_index
             preds_stim   = _pool_by_stimulus(preds_t,   sidx)
             targets_stim = _pool_by_stimulus(targets_t, sidx)
@@ -269,16 +306,18 @@ def train(args):
 
     test_preds, test_targets = [], []
     with torch.no_grad():
-        for neural, tgt in test_loader:
+        for batch in test_loader:
+            neural, tgt = batch[0], batch[1]
+            cat  = batch[2].to(device) if (_is_hvm_batch(batch) and use_category) else None
             x    = neural.permute(0, 2, 1).to(device)
-            pred = model(x)
+            pred = model(x, cat)
             test_preds.append(pred.cpu())
             test_targets.append(_extract_target(tgt))
 
     tp = torch.cat(test_preds)
     tt = torch.cat(test_targets)
 
-    if args.per_token:
+    if hasattr(test_loader.dataset, "stim_index"):
         sidx = test_loader.dataset.stim_index
         tp_stim = _pool_by_stimulus(tp, sidx)
         tt_stim = _pool_by_stimulus(tt, sidx)
@@ -317,6 +356,12 @@ def train(args):
 
 def parse_args():
     p = argparse.ArgumentParser()
+
+    # Dataset
+    p.add_argument("--dataset",      choices=["rust", "hvm"], default="rust",
+                   help="Which dataset to train on (default: rust)")
+    p.add_argument("--use-category", action="store_true",
+                   help="Add learned category conditioning (HVM only, requires --dataset hvm)")
 
     # Transformer backbone
     p.add_argument("--d-model",    type=int,   default=128)
