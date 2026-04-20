@@ -6,7 +6,7 @@ from PIL import Image
 from torchvision import transforms
 from tqdm import tqdm
 
-from config_const import N_STIMULI, RUST_STIM_DIR, HVM_N_STIMULI, HVM_CATEGORIES, HVM_STIM_DIR
+from config_const import N_STIMULI, RUST_STIM_DIR, HVM_N_STIMULI, HVM_CATEGORIES, HVM_NOFIXATION_DIR
 
 _transform = transforms.Compose([
     transforms.Resize(224),
@@ -40,7 +40,7 @@ def load_hvm_stimuli() -> torch.Tensor:
     """
     imgs = []
     for cat in tqdm(HVM_CATEGORIES, desc="Loading HVM stimuli"):
-        cat_dir = HVM_STIM_DIR / cat
+        cat_dir = HVM_NOFIXATION_DIR / cat
         for k in range(45):
             path = cat_dir / f"{k:02d}.png"
             with Image.open(path) as im:

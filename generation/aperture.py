@@ -48,13 +48,7 @@ def build_packed_aperture_mask(
     r = image_size * radius_frac
     circle = ((yy - c) ** 2 + (xx - c) ** 2) <= r ** 2
 
-    half = int(round(image_size * center_frac / 2))
-    center_sq = torch.zeros_like(circle, dtype=torch.bool)
-    lo = int(round(c)) - half
-    hi = int(round(c)) + half + 1
-    center_sq[lo:hi, lo:hi] = True
-
-    pixel_mask = (circle & ~center_sq).float().view(1, 1, image_size, image_size)
+    pixel_mask = circle.float().view(1, 1, image_size, image_size)
     packed_grid = image_size // 16
     mask = F.avg_pool2d(pixel_mask, kernel_size=16).view(1, packed_grid * packed_grid, 1)
 
