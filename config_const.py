@@ -48,9 +48,12 @@ HVM_N_VAR      = 45   # variations per category
 HVM_N_VAL      = 90   # 9 per category × 10
 HVM_N_TEST     = 90   # 9 per category × 10
 
-HVM_SRC_DIR  = Path('/mnt/smb/locker/issa-locker/Data/West/Saved_Images/E8')
-HVM_RAW_DIR  = STIMULI_ROOT / 'hvm'
-HVM_STIM_DIR = STIMULI_ROOT / 'hvm_cropped'
+HVM_SRC_DIR        = Path('/mnt/smb/locker/issa-locker/Data/West/Saved_Images/E8')
+HVM_RAW_DIR        = STIMULI_ROOT / 'hvm'
+HVM_STIM_DIR       = STIMULI_ROOT / 'hvm_cropped'
+HVM_NOFIXATION_DIR = STIMULI_ROOT / 'hvm_nofixation'
+
+RUST_NOFIXATION_DIR = STIMULI_ROOT / 'rust_nofixation'
 
 SIGLIP_DIM = 1152  # google/siglip-so400m-patch14-384
 CLIP_DIM = 768     # FLUX CLIP pooled embedding dim
