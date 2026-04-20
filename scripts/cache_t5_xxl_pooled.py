@@ -18,9 +18,7 @@ from tqdm import tqdm
 REPO_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPO_ROOT))
 
-from config_const import BLIP2_DETAILED_CAPTIONS_PATH, N_STIMULI, T5_XXL_POOLED_PATH
-
-MODEL = "google/t5-v1_1-xxl"
+from config_const import BLIP2_DETAILED_CAPTIONS_PATH, N_STIMULI, T5_XXL_POOLED_PATH, T5_XXL_MODEL_ID
 
 
 def main():
@@ -38,10 +36,10 @@ def main():
         caps = json.load(f)
     texts = [caps[str(i)] for i in range(N_STIMULI)]
 
-    print(f"Loading {MODEL} ...")
-    tokenizer = T5Tokenizer.from_pretrained(MODEL)
+    print(f"Loading {T5_XXL_MODEL_ID} ...")
+    tokenizer = T5Tokenizer.from_pretrained(T5_XXL_MODEL_ID)
     encoder   = T5EncoderModel.from_pretrained(
-        MODEL, torch_dtype=torch.bfloat16
+        T5_XXL_MODEL_ID, torch_dtype=torch.bfloat16
     ).to(args.device).eval()
     print(f"  hidden dim: {encoder.config.d_model}")
 

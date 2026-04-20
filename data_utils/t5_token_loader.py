@@ -31,11 +31,9 @@ from config_const import (
     N_STIMULI, N_TRAIN, N_VAL,
     SEED,
     T5_PCA_K,
+    T5_TOKENS_SHORT_PATH, T5_TOKENS_DETAILED_PATH,
 )
 from data_utils.rust_loader import ALL_MONKEYS, RUST_TIME_WINDOW, get_rust_responses
-
-T5_TOKENS_SHORT_PATH    = CACHE_DIR / "t5_xxl_tokens_short.pt"
-T5_TOKENS_DETAILED_PATH = CACHE_DIR / "t5_xxl_tokens_detailed.pt"
 
 
 class T5TokenDataset(Dataset):

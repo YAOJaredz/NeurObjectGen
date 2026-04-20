@@ -9,7 +9,7 @@ from HexPred.constants import ALL_MONKEYS
 from config_const import (
     SEED,
     HVM_SIGLIP_EMBEDDINGS_PATH, HVM_CLIP_EMBEDS_PATH,
-    HVM_TIME_WINDOW, HVM_N_STIMULI, HVM_N_TRAIN, HVM_N_VAL, HVM_N_VAR,
+    HVM_TIME_WINDOW, HVM_N_STIMULI, HVM_N_VAL, HVM_N_VAR,
 )
 
 

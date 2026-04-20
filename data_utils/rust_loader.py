@@ -11,7 +11,7 @@ from config_const import (
     N_STIMULI, N_TRAIN, N_VAL, RUST_TIME_WINDOW, SEED,
     SIGLIP_EMBEDDINGS_PATH,
     CLIP_EMBEDS_PATH, CLIP_DETAILED_EMBEDS_PATH,
-    T5_XXL_POOLED_PATH, T5_PCA_K, CACHE_DIR,
+    T5_PCA_K, CACHE_DIR,
 )
 from data_utils.stimuli import load_rust_stimuli
 

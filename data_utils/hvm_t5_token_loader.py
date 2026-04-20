@@ -28,11 +28,9 @@ from config_const import (
     T5_PCA_K,
     HVM_N_STIMULI,
     HVM_N_VAR,
+    HVM_T5_TOKENS_SHORT_PATH, HVM_T5_TOKENS_DETAILED_PATH,
 )
 from data_utils.hvm_loader import _load_hvm_neural, _category_stratified_split
-
-HVM_T5_TOKENS_SHORT_PATH    = CACHE_DIR / "hvm_t5_xxl_tokens_short.pt"
-HVM_T5_TOKENS_DETAILED_PATH = CACHE_DIR / "hvm_t5_xxl_tokens_detailed.pt"
 
 
 class HVMTokenDataset(Dataset):

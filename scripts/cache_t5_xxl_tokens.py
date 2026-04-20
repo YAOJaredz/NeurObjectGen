@@ -30,18 +30,15 @@ from config_const import (
     BLIP2_DETAILED_CAPTIONS_PATH,
     CACHE_DIR,
     N_STIMULI,
+    T5_XXL_MODEL_ID,
+    T5_TOKENS_SHORT_PATH, T5_TOKENS_DETAILED_PATH,
 )
-
-MODEL = "google/t5-v1_1-xxl"
-
-T5_TOKENS_SHORT_PATH    = CACHE_DIR / "t5_xxl_tokens_short.pt"
-T5_TOKENS_DETAILED_PATH = CACHE_DIR / "t5_xxl_tokens_detailed.pt"
 
 
 def encode_and_save(texts: list[str], out_path: Path, device: str, batch_size: int):
-    print(f"Loading {MODEL} ...")
-    tokenizer = T5Tokenizer.from_pretrained(MODEL)
-    encoder   = T5EncoderModel.from_pretrained(MODEL, torch_dtype=torch.bfloat16).to(device).eval()
+    print(f"Loading {T5_XXL_MODEL_ID} ...")
+    tokenizer = T5Tokenizer.from_pretrained(T5_XXL_MODEL_ID)
+    encoder   = T5EncoderModel.from_pretrained(T5_XXL_MODEL_ID, torch_dtype=torch.bfloat16).to(device).eval()
 
     all_hidden  = []   # list of (seq_i, 4096) float32 tensors (real tokens only)
     all_lengths = []   # list of ints

@@ -28,11 +28,9 @@ from config_const import (
     N_STIMULI, RUST_STIM_DIR, BLIP2_CAPTIONS_PATH, BLIP2_DETAILED_CAPTIONS_PATH,
     HVM_N_STIMULI, HVM_CATEGORIES, HVM_STIM_DIR,
     HVM_BLIP2_CAPTIONS_PATH, HVM_BLIP2_DETAILED_CAPTIONS_PATH,
+    INSTRUCTBLIP_MODEL_ID,
 )
 from get_device import get_device
-
-
-_MODEL_NAME = "Salesforce/instructblip-vicuna-7b"
 
 # Short: one sentence, main subject + scene. Stays well under 77 CLIP tokens.
 _SHORT_PROMPT = (
@@ -117,9 +115,9 @@ def caption_stimuli_from_paths(
 
     n = len(image_paths)
     device = get_device()
-    processor = InstructBlipProcessor.from_pretrained(_MODEL_NAME)
+    processor = InstructBlipProcessor.from_pretrained(INSTRUCTBLIP_MODEL_ID)
     model = InstructBlipForConditionalGeneration.from_pretrained(
-        _MODEL_NAME, torch_dtype=torch.float16,
+        INSTRUCTBLIP_MODEL_ID, torch_dtype=torch.float16,
     )
     model.to(device).eval()
 

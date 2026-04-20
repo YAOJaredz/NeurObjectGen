@@ -8,13 +8,10 @@ import torch.nn.functional as F
 from PIL import Image
 from transformers import AutoModel, SiglipImageProcessor, SiglipProcessor, SiglipVisionModel
 
+from config_const import SIGLIP_MODEL_ID, APERTURE_CENTER_FRAC
 from get_device import get_device
 
-SIGLIP_MODEL_ID = "google/siglip-so400m-patch14-384"
 _BATCH_SIZE = 32
-
-# Fixation square geometry — matches aperture.py DEFAULT_CENTER_FRAC = 0.06
-_FIX_FRAC = 0.06
 
 
 def strip_aperture(pil_image: Image.Image) -> Image.Image:
@@ -41,7 +38,7 @@ def strip_aperture(pil_image: Image.Image) -> Image.Image:
 
     # --- fill fixation square with local surround mean ---
     cx, cy = (w - 1) / 2, (h - 1) / 2
-    half = int(round(min(h, w) * _FIX_FRAC / 2))
+    half = int(round(min(h, w) * APERTURE_CENTER_FRAC / 2))
     lo_y, hi_y = int(round(cy)) - half, int(round(cy)) + half + 1
     lo_x, hi_x = int(round(cx)) - half, int(round(cx)) + half + 1
 

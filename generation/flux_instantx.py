@@ -42,20 +42,12 @@ from PIL import Image
 import torchvision.transforms as T
 from tqdm import tqdm
 
-from config_const import SIGLIP_DIM
+from config_const import (
+    SIGLIP_DIM,
+    INSTANTX_REPO, INSTANTX_WEIGHTS,
+    FLUX_JOINT_DIM, FLUX_HIDDEN_DIM, NUM_IP_TOKENS,
+)
 from generation.aperture import load_packed_aperture_mask
-
-
-# ---------------------------------------------------------------------------
-# Constants — fixed by the InstantX checkpoint.
-# ---------------------------------------------------------------------------
-
-INSTANTX_REPO = "InstantX/FLUX.1-dev-IP-Adapter"
-INSTANTX_WEIGHTS = "ip-adapter.bin"
-
-FLUX_JOINT_DIM = 4096       # cross_attention_dim
-FLUX_HIDDEN_DIM = 3072      # num_attention_heads * attention_head_dim
-NUM_IP_TOKENS = 128         # from image_proj shape: 524288 = 128 * 4096
 
 
 # ---------------------------------------------------------------------------

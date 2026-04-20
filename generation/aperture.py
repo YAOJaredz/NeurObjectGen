@@ -11,15 +11,10 @@ from __future__ import annotations
 import torch
 import torch.nn.functional as F
 
-from config_const import RUST_LOSS_MASK_PATH, HVM_LOSS_MASK_PATH
-
-DEFAULT_CENTER_FRAC = 0.06
-
-# HVM aperture params measured from stimuli/hvm_cropped images (276×276 px):
-#   circle radius = 135.5 px  →  radius_frac = 135.5/276 ≈ 0.4909
-#   fixation square = 10 px   →  center_frac = 10/276     ≈ 0.0362
-HVM_RADIUS_FRAC = 0.4909
-HVM_CENTER_FRAC = 0.0362
+from config_const import (
+    RUST_LOSS_MASK_PATH, HVM_LOSS_MASK_PATH,
+    APERTURE_CENTER_FRAC, HVM_RADIUS_FRAC, HVM_CENTER_FRAC,
+)
 
 
 def build_packed_aperture_mask(
@@ -74,7 +69,7 @@ def load_packed_aperture_mask(
     image_size: int,
     device: torch.device | str,
     dtype: torch.dtype,
-    center_frac: float = DEFAULT_CENTER_FRAC,
+    center_frac: float = APERTURE_CENTER_FRAC,
     radius_frac: float = 0.5,
     binarize: bool = True,
     save_path=None,

@@ -32,12 +32,9 @@ from config_const import (
     HVM_BLIP2_DETAILED_CAPTIONS_PATH,
     CACHE_DIR,
     HVM_N_STIMULI,
+    T5_XXL_MODEL_ID,
+    HVM_T5_TOKENS_SHORT_PATH, HVM_T5_TOKENS_DETAILED_PATH,
 )
-
-MODEL = "google/t5-v1_1-xxl"
-
-HVM_T5_TOKENS_SHORT_PATH    = CACHE_DIR / "hvm_t5_xxl_tokens_short.pt"
-HVM_T5_TOKENS_DETAILED_PATH = CACHE_DIR / "hvm_t5_xxl_tokens_detailed.pt"
 
 
 def encode_and_save(
@@ -109,9 +106,9 @@ def main():
     if not to_encode:
         return
 
-    print(f"Loading {MODEL} ...")
-    tokenizer = T5Tokenizer.from_pretrained(MODEL)
-    encoder   = T5EncoderModel.from_pretrained(MODEL, torch_dtype=torch.bfloat16).to(args.device).eval()
+    print(f"Loading {T5_XXL_MODEL_ID} ...")
+    tokenizer = T5Tokenizer.from_pretrained(T5_XXL_MODEL_ID)
+    encoder   = T5EncoderModel.from_pretrained(T5_XXL_MODEL_ID, torch_dtype=torch.bfloat16).to(args.device).eval()
 
     for cap_path, out_path, label in to_encode:
         with open(cap_path) as f:

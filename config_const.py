@@ -18,7 +18,6 @@ SIGLIP_EMBEDDINGS_PATH = CACHE_DIR / "siglip_embeddings.pt"
 SIGLIP_STRIPPED_PATH   = CACHE_DIR / "siglip_stripped.pt"  # (300, 1152) aperture-stripped
 SIGLIP_PATCH14_PATH    = CACHE_DIR / "siglip_patch14.pt"   # (300, 196, 1152)
 SIGLIP_PATCH8_PATH     = CACHE_DIR / "siglip_patch8.pt"    # (300,  64, 1152)
-SIGLIP_PATCH_TOKENS    = {14: 196, 8: 64}
 RUST_LOSS_MASK_PATH = RUST_STIM_DIR / "loss_mask.pt"
 HVM_LOSS_MASK_PATH  = STIMULI_ROOT / "hvm_cropped" / "loss_mask.pt"
 BLIP2_CAPTIONS_PATH = CACHE_DIR / "blip2_captions.json"
@@ -46,7 +45,6 @@ HVM_N_STIMULI  = 450
 HVM_CATEGORIES = ('apple', 'bear', 'car', 'chair', 'dog', 'elephant', 'head', 'plane', 'table', 'turtle')
 HVM_N_CAT      = 10
 HVM_N_VAR      = 45   # variations per category
-HVM_N_TRAIN    = 270  # 27 per category × 10
 HVM_N_VAL      = 90   # 9 per category × 10
 HVM_N_TEST     = 90   # 9 per category × 10
 
@@ -60,5 +58,27 @@ CHECKPOINT_DIR = REPO_ROOT / "checkpoints"
 
 T5_PCA_K          = 128
 T5_PCA_BASIS_PATH = CACHE_DIR / f"t5_pca_basis_k{T5_PCA_K}.pt"   # (K, 4096)
-T5_PCA_COORDS_PATH= CACHE_DIR / f"t5_pca_coords_k{T5_PCA_K}.pt"  # (300, K)
 T5_PCA_MEAN_PATH  = CACHE_DIR / f"t5_pca_mean_k{T5_PCA_K}.pt"    # (4096,)
+
+# --- Model identifiers ---
+SIGLIP_MODEL_ID       = "google/siglip-so400m-patch14-384"
+T5_XXL_MODEL_ID       = "google/t5-v1_1-xxl"
+INSTRUCTBLIP_MODEL_ID = "Salesforce/instructblip-vicuna-7b"
+INSTANTX_REPO         = "InstantX/FLUX.1-dev-IP-Adapter"
+INSTANTX_WEIGHTS      = "ip-adapter.bin"
+
+# --- FLUX / IP-Adapter architecture (fixed by InstantX checkpoint) ---
+FLUX_JOINT_DIM  = 4096   # cross_attention_dim
+FLUX_HIDDEN_DIM = 3072   # num_attention_heads * attention_head_dim
+NUM_IP_TOKENS   = 128    # from image_proj shape: 524288 = 128 * 4096
+
+# --- Aperture geometry ---
+APERTURE_CENTER_FRAC = 0.06    # fixation square side as fraction of image size
+HVM_RADIUS_FRAC      = 0.4909  # HVM circle radius / image size (measured from 276×276 px)
+HVM_CENTER_FRAC      = 0.0362  # HVM fixation square / image size
+
+# --- T5 token cache paths ---
+T5_TOKENS_SHORT_PATH        = CACHE_DIR / "t5_xxl_tokens_short.pt"
+T5_TOKENS_DETAILED_PATH     = CACHE_DIR / "t5_xxl_tokens_detailed.pt"
+HVM_T5_TOKENS_SHORT_PATH    = CACHE_DIR / "hvm_t5_xxl_tokens_short.pt"
+HVM_T5_TOKENS_DETAILED_PATH = CACHE_DIR / "hvm_t5_xxl_tokens_detailed.pt"
