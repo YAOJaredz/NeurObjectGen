@@ -6,112 +6,115 @@
 
 ## 1. Background
 
-The primate ventral visual stream transforms retinal input into a rich representation in inferotemporal (IT) cortex that supports robust object recognition [Rust and DiCarlo, 2010]. A powerful test of how well we understand this representation is whether we can invert it—reconstructing the perceived image directly from neural activity. This also poses challenges modern generative models, requiring them to produce faithful reconstructions when conditioned on noisy, low-dimensional signals far removed from their training distribution of text and image embeddings.
+The primate ventral visual stream transforms retinal input into a rich representation in inferotemporal (IT) cortex that supports robust object recognition [Rust and DiCarlo, 2010]. A powerful test of how well we understand this representation is whether we can invert it—reconstructing the perceived image directly from neural activity. This also poses challenges for modern generative models, requiring them to produce faithful reconstructions when conditioned on noisy, low-dimensional signals far removed from their training distribution of text and image embeddings.
 
 Recent work has achieved striking reconstructions by aligning brain responses with the latent spaces of pretrained generative models, first from fMRI [Takagi and Nishimoto, 2023, Scotti et al., 2024] and more recently from intracortical electrophysiology [Ciferri et al., 2026]. However, these successes rely on massive datasets (e.g., 22,000 images, 1024 channels) atypical of most primate neurophysiology and sidestep the question of whether reconstruction is possible in the data-limited regime.
 
-We address this using Neuropixels 1.0 recordings (384 channels per session) from primate IT cortex, collected across multiple sessions during viewing of the 300 naturalistic image stimulus set introduced by Rust and DiCarlo [2010]. Pooling across sessions yields a large pseudo-population, enabling high-dimensional decoding despite the modest stimulus count.
+We address this using Neuropixels 1.0 recordings from primate IT cortex during passive viewing of the High-variation (HVM) object dataset [DiCarlo et al., 2012], which comprises 450 naturalistic images spanning 10 object categories. Pooling neural responses across sessions yields a large pseudo-population, enabling high-dimensional decoding despite the modest stimulus count.
 
 ---
 
 ## 2. Problem Formulation
 
-We collect neural responses with Neuropixels 1.0 probes across multiple sessions from primate IT cortex during passive viewing of 300 naturalistic images [Rust and DiCarlo, 2010], and construct a pseudo-population by pooling across sessions. The goal is to reconstruct the perceived image from the population activity vector.
+We collect neural responses with Neuropixels 1.0 probes across multiple sessions from primate IT cortex during passive viewing of the 450-image HVM stimulus set (10 object categories × 45 variations each). Neural responses are pooled across sessions to form a pseudo-population. The goal is to reconstruct the perceived image from population activity.
 
-Formally, we seek a mapping **f : r → z**, where **r ∈ R^(N×T)** is the neural response (N channels from the pooled pseudo-population, with 384 channels per session and T time points after stimulus presentation) and **z** is a latent representation that conditions a pretrained image generation model to produce a reconstruction **x̂** of the original stimulus **x**.
+Formally, we seek a mapping **f : r → (ẑ_sig, ẑ_clip)**, where **r ∈ R^(N×T)** is the neural response (N channels from the pooled pseudo-population, T time points after stimulus presentation), **ẑ_sig ∈ R^1152** is a predicted SigLIP image embedding, and **ẑ_clip ∈ R^768** is a predicted CLIP-short embedding. Both condition a pretrained image generation model to produce a reconstruction **x̂** of the original stimulus **x**.
+
+Stimuli are split by category-stratified sampling into train/validation/test sets (270/90/90), ensuring each category is proportionally represented across splits.
 
 ---
 
 ## 3. Approach
 
-### Stage 1 — Neural Decoders (Semantic + Spatial)
+### Stage 1 — Neural Encoder (MultiHeadTransformer)
 
-Stage 1 splits the neural signal into two complementary decoders that feed the two independent conditioning paths of the InstantX-wrapped FLUX pipeline. This mirrors the "what / where" decomposition that has been effective in prior fMRI reconstruction work [Takagi and Nishimoto, 2023]: a semantic head drives category/object identity, and a spatial head drives coarse layout and low-frequency structure.
+A single **MultiHeadTransformer** maps the neural pseudo-population response to dual embedding targets simultaneously: SigLIP-SO400M (1152-d) and CLIP-short (768-d). The architecture consists of:
 
-**Semantic decoder (→ SigLIP image embedding).** A regularized encoder maps pseudo-population firing-rate vectors to the frozen SigLIP-SO400M image embedding space. Given the ratio of stimuli (300) to channels (potentially thousands), we compare three architectures:
+- **Input projection:** LayerNorm over neurons, then a linear projection to a d_model-dimensional token embedding for each time step
+- **CLS token + positional embeddings** prepended to the time-step sequence
+- **Pre-LN transformer encoder:** configurable depth (n_layers) and width (d_model), with GELU activations and multi-head self-attention
+- **Attention pooling:** a learned scalar attention weight over all tokens (including CLS) produces a single pooled vector
+- **Shared projection:** a linear layer from d_model → shared_dim followed by GELU, producing a shared latent
+- **Category conditioning:** a learned embedding for each of the 10 HVM categories is added to the shared latent at training and inference time
+- **Dual heads:** two linear layers from shared_dim → 1152 (SigLIP) and shared_dim → 768 (CLIP), each L2-normalised
 
-- **Ridge regression** — baseline, no temporal structure
-- **Low-rank bottleneck MLP** — flattens the (N × T) response and projects through a small bottleneck
-- **Temporal LSTM / Transformer** — operates over the T time bins, treating each T-step as a token over N-dimensional neural activity
+**Training objective.** The loss combines a per-head weighted sum of InfoNCE (symmetric contrastive loss, CLIP-style) and cosine regression, plus a uniformity loss on the shared latent:
 
-All semantic encoders are trained with an **InfoNCE contrastive loss** that aligns predicted embeddings with frozen SigLIP embeddings of the presented stimuli, improving data efficiency over direct regression. The best architecture is selected by 2AFC identification accuracy on a held-out validation set. Its output feeds the IP-Adapter image path via `MLPProjModel`.
+```
+L = w_sig * head_loss(ẑ_sig, z_sig) + w_clip * head_loss(ẑ_clip, z_clip) + w_unif * L_unif(shared)
+head_loss = nce_weight * L_InfoNCE + (1 − nce_weight) * L_cos
+```
 
-**Spatial decoder (→ init-latent / structure).** A second ridge regressor maps the same pseudo-population vector to a low-dimensional spatial target that seeds the img2img init latent. We decode into a compressed representation of the FLUX-packed VAE latent of the stimulus — either directly onto PCA components of the packed latent, or onto a downsampled grayscale-luminance image that is then VAE-encoded on the fly. The decoded structure is used as the `init_image` passed into `generate_img2img(...)`, so the generator begins denoising from a neural estimate of where things are rather than from pure noise or the ground-truth stimulus. The spatial head uses plain ridge regression: the target dimensionality is small, the spatial signal in IT is weaker than the semantic signal, and a linear baseline is a more honest reference for what the spatial pathway contributes before investing in deeper models.
-
-The two decoders are trained independently on the same 200-stimulus training split and combined only at inference. This lets us ablate them separately: **semantic-only** (neural SigLIP + noise init), **spatial-only** (neural init + zero ip_scale), and **full** (neural SigLIP + neural init) — directly isolating which pathway is carrying stimulus-specific information.
+Hyperparameters (d_model, n_layers, shared_dim, nce_weight, and others) are swept on the Issa Lab SLURM cluster; the best configuration is selected by mean validation cosine similarity `(cos_siglip + cos_clip) / 2` and saved for inference.
 
 ### Stage 2 — Pretrained IP-Adapter (InstantX/FLUX.1-dev-IP-Adapter)
 
-The predicted SigLIP embedding conditions a pretrained **FLUX.1-dev** model via the **pretrained InstantX/FLUX.1-dev-IP-Adapter**, which already ships a SigLIP-SO400M image encoder matching our cached embeddings. This replaces an earlier plan to train a custom projection module from scratch: with only 200 training stimuli, training a bespoke adapter that has never seen neural-decoded inputs was a poor use of data relative to adopting a community-validated adapter that already implements a real cross-attention path via a learned resampler and per-block IP key/value projections on all 57 FLUX transformer blocks.
+The predicted SigLIP and CLIP-short embeddings condition a pretrained **FLUX.1-dev** model via the **pretrained InstantX/FLUX.1-dev-IP-Adapter**. The adapter ships a SigLIP-SO400M encoder matching our cached embeddings and implements a real cross-attention path via a learned resampler (`MLPProjModel`: SigLIP 1152 → 128 × 4096 image tokens) and per-block IP key/value projections on all 57 FLUX transformer blocks.
 
-Because diffusers 0.37.1's generic `load_ip_adapter` loader does not accept InstantX's checkpoint layout for FLUX, we vendor the minimal adapter bits directly: an `MLPProjModel` (SigLIP 1152 → 128 × 4096 image tokens) and an `IPAFluxAttnProcessor` installed on all 57 attention blocks (19 double-stream + 38 single-stream). Image conditioning is threaded through `pipe(..., joint_attention_kwargs={"image_emb": image_emb, "scale": ip_adapter_scale})` so each block's attention output receives an additive `scale · ip_attn` contribution in parallel with standard joint attention. **No adapter training is performed** — Stage 2 is now a pure inference component, and the only trained module in the pipeline is the Stage 1 neural encoder.
+Because diffusers' generic loader does not accept InstantX's checkpoint layout for FLUX, we vendor the minimal adapter components directly: the `MLPProjModel` and an `IPAFluxAttnProcessor` installed on all 57 attention blocks (19 double-stream + 38 single-stream). Image conditioning is threaded via `pipe(..., joint_attention_kwargs={"image_emb": image_emb, "scale": ip_adapter_scale})`. **No adapter training is performed** — Stage 2 is a pure inference component.
 
-Rust-dataset-specific loop logic is preserved around the pretrained adapter rather than baked into it:
+HVM-specific generation details:
 
-- **Grayscale-luminance VAE encoding** of Rust stimuli, matching the achromatic presentation distribution
-- **Per-step aperture compositing** during img2img denoising: at every scheduler step, latents inside the circular stimulus aperture are updated by the adapter-conditioned transformer while latents outside the aperture (and inside the central fixation square) are pinned to a re-noised copy of the original init latent, using a soft mask downsampled from pixel space to FLUX's packed-latent grid (each position covers a 16×16 pixel block)
-- **Init-latent conditioning** via flow-matching `scale_noise(strength)`, so at inference we can trade off how much the adapter repaints versus how much of the stimulus structure leaks through from the init
+- **Init latent:** the ground-truth stimulus image at 512 × 512 is VAE-encoded and noised to a configurable `strength` (0.55), so the generator begins from a perturbed version of the original stimulus
+- **Per-step aperture compositing:** at every scheduler step, latents inside the circular HVM stimulus aperture are updated by the adapter-conditioned transformer while latents outside are pinned to a re-noised copy of the original init latent, using a soft mask downsampled to FLUX's packed-latent grid (each position covers a 16 × 16 pixel block)
+- **Text conditioning:** instead of per-image captions, T5 and CLIP text embeddings are pre-computed for each of the 10 HVM category names and reused for all stimuli within a category. In practice, the T5 embeddings are zeroed out and only the CLIP pooled embedding varies by condition (see below)
 
-This preserves everything the earlier custom-adapter plan used the aperture mask for (keeping generations anchored to the trained visual region), while moving the conditioning mechanism itself onto pretrained weights.
+### Comparison Conditions
+
+Four conditions are compared on the 90 held-out test stimuli to isolate the contribution of each signal:
+
+| # | Condition | T5 | CLIP pooled | SigLIP (IP-adapter) |
+|---|-----------|-----|-------------|---------------------|
+| 1 | **Control** | null | null | disabled (scale=0) |
+| 2 | **Text (cat CLIP)** | zeroed | category-name CLIP | disabled (scale=0) |
+| 3 | **Neural pred** | zeroed | predicted CLIP-short | predicted SigLIP (scale=1.0) |
+| 4 | **GT emb (↑)** | zeroed | category-name CLIP | GT SigLIP (scale=1.0) |
+
+The **control** condition establishes the img2img baseline with no semantic conditioning. **Text (cat CLIP)** adds category-level semantic information via the CLIP pooled embedding of the category name. **Neural pred** replaces text-derived embeddings with the decoded neural predictions from Stage 1, adding stimulus-specific visual information via the SigLIP IP-adapter. **GT emb** uses the ground-truth SigLIP embedding and serves as the upper bound on reconstruction quality achievable by the generator given perfect visual embeddings.
 
 ### Inference Pipeline
 
-At test time the single trained stage is chained into the pretrained generator:
-
 ```
-                    ┌── semantic ridge ──▶ ẑ_sem ∈ R^1152 ──MLPProj──▶ image_emb (128×4096)
-neural r (N×T) ─────┤                                                        │
-                    └── spatial ridge  ──▶ ẑ_spa ──decode──▶ init latent     │
-                                                                  │          │
-                              optional text prompt ──T5/CLIP──▶ encoder_hidden_states
-                                                                  │          │
-                                                                  ▼          ▼
-                                            FLUX.1-dev + per-block IPAFluxAttnProcessor
-                                                                  │
-                                                                  ▼
-                                                            reconstruction x̂
+                ┌── CLIP head ──▶ ẑ_clip ∈ R^768  ──────────────────▶ CLIP pooled
+neural r (N×T) ─┤                                                            │
+                └── SigLIP head ──▶ ẑ_sig ∈ R^1152 ──MLPProj──▶ image_emb  │
+                                                                      │      │
+                                              zero T5 ──────────────────────▶│
+                                                                      │      │
+                                                                      ▼      ▼
+                                    FLUX.1-dev + per-block IPAFluxAttnProcessor
+                                                                      │
+                                                          aperture compositing
+                                                                      │
+                                                                      ▼
+                                                                reconstruction x̂
 ```
-
-The semantic decoder predicts a SigLIP-aligned embedding that the vendored InstantX `MLPProjModel` expands into 128 image tokens at FLUX's cross-attention dimension; the spatial decoder predicts a low-dimensional structural target that is decoded into a FLUX-packed init latent. Each transformer block mixes the image tokens with standard T5/CLIP text conditioning through parallel IP key/value attention, while the init latent is noised to a configurable `strength` and denoised with per-step aperture compositing so the untrained ring of the canvas stays pinned and the trained aperture is repainted from the neural signal.
-
-### Text-Conditioned Hybrid
-
-Because 300 images may under-constrain a purely neural decoder, we implement a hybrid condition where short text captions (from BLIP-2 auto-captioning) supplement the neural embedding. The InstantX adapter makes this natural: FLUX's standard T5/CLIP text path and the IP image path are additive inside each attention block, so switching conditions amounts to toggling the `prompt` argument and the `ip_adapter_scale` knob without changing code paths. We systematically compare **neural-only** (empty prompt, ip_scale>0), **text-only** (caption, ip_scale=0), and **neural+text** (caption, ip_scale>0) to isolate the contribution of neural signals beyond what text provides.
-
-### Sanity Ceiling
-
-Before evaluating neural-decoded embeddings, we measure an **upper-bound recovery test**: feed the pipeline the ground-truth SigLIP embedding and a noised version of the ground-truth VAE latent, then sweep `strength` and `ip_adapter_scale` and measure luminance MSE inside the trained aperture. This isolates adapter+compositing behavior from neural-decoder quality — if this ceiling is low, any downstream failure lives in Stage 1 rather than the generator.
 
 ---
 
 ## 4. Deliverables & Evaluation
 
 **Deliverables:**
-1. A trained **semantic** neural decoder mapping IT pseudo-population activity to SigLIP space
-2. A trained **spatial** neural decoder mapping the same activity to a FLUX-packed init-latent target
-3. An inference wrapper around the pretrained InstantX/FLUX.1-dev-IP-Adapter with Rust-specific grayscale VAE encoding and per-step aperture compositing
-4. A conditioned image generation pipeline producing reconstructions from held-out neural responses by combining the two decoders
-5. A sanity-ceiling recovery analysis using ground-truth embeddings + init latents to bound adapter-side error
-6. A systematic comparison across decoding conditions (semantic-only, spatial-only, full, ± text) with ablations
+1. A trained **MultiHeadTransformer** mapping IT pseudo-population activity to dual (SigLIP + CLIP-short) embedding spaces
+2. An inference wrapper around the pretrained InstantX/FLUX.1-dev-IP-Adapter with HVM-specific aperture compositing and category-name text conditioning
+3. Per-stimulus reconstruction outputs across all four conditions for the 90 held-out test stimuli (saved as labeled PNG composites)
+4. A systematic comparison of all four conditions on quantitative metrics
 
-**Evaluation:** We will use a fixed 200/50/50 train/val/test split over the 300 image stimulus set. Metrics include:
-- **Semantic similarity** — embedding cosine similarity
-- **Perceptual quality** — SSIM
-- **Identification accuracy** — 2AFC on held-out trials
+**Evaluation:** Fixed category-stratified 270/90/90 train/val/test split. Metrics:
+- **Embedding cosine similarity** — mean cosine similarity between predicted and GT embeddings (SigLIP and CLIP-short separately)
+- **Identification accuracy** — 2-AFC forced-choice identification on the test set for both embedding heads
 
 **Success criteria:**
-- (a) Neural-only reconstructions achieve above-chance 2AFC identification
-- (b) Neural+text significantly outperforms text-only, demonstrating that neural signals carry stimulus-specific information beyond category labels
+- (a) Neural-only reconstructions achieve above-chance 2-AFC identification
+- (b) Neural pred significantly outperforms text (cat CLIP), demonstrating that predicted SigLIP embeddings carry stimulus-specific visual information beyond what the category name provides
 
 ---
 
 ## 5. Compute Plan
 
-**Stage 1 (neural decoders):** Lightweight — ridge regression for the spatial head, and ridge / MLP / LSTM for the semantic head on neural time series. Both run in minutes on a local machine or Colab. Hyperparameter sweeps run via SLURM on the Issa Lab cluster inside an Apptainer container.
+**Stage 1 (MultiHeadTransformer):** Hyperparameter sweep over d_model, n_layers, shared_dim, nce_weight, and regularisation coefficients, run via SLURM on the Issa Lab cluster inside an Apptainer container. Individual training runs are fast (a few minutes each on GPU). The best configuration is exported to `cache/best_hvm_multihead_config.json` and used for inference.
 
-**Stage 2 (IP-Adapter):** Inference only — no gradient updates. Requires GPU memory for the frozen FLUX.1-dev transformer (~24 GB bf16) plus the pretrained InstantX adapter weights (small, negligible). Switching from a custom-trained adapter to pretrained InstantX eliminates a full training loop and its hyperparameter sweeps from the compute budget.
-
-**Inference:** Generating 300 images through the full pipeline takes on the order of a few GPU-hours. Total compute requirements remain modest relative to the available resources.
+**Stage 2 (IP-Adapter):** Inference only — no gradient updates. Requires GPU memory for the frozen FLUX.1-dev transformer (~24 GB bf16) plus the pretrained InstantX adapter weights. Generating 90 test stimuli × 4 conditions takes on the order of a few GPU-hours.
 
 ---
 
@@ -120,5 +123,6 @@ Before evaluating neural-decoded embeddings, we measure an **upper-bound recover
 - Y. Takagi and S. Nishimoto. High-resolution image reconstruction with latent diffusion models from human brain activity. In *CVPR*, 2023.
 - P. Scotti, M. Triparity, C. K. T. Villanueva, et al. MindEye2: Shared-subject models enable fMRI-to-image with 1 hour of data. *arXiv:2403.11207*, 2024.
 - M. Ciferri, M. Ferrante, and N. Toschi. Simple models, rich representations: Visual decoding from primate intracortical neural signals. *arXiv:2601.11108*, 2026.
+- J. J. DiCarlo, D. Zoccolan, and N. C. Rust. How does the brain solve visual object recognition? *Neuron*, 73(3):415–434, 2012.
 - N. C. Rust and J. J. DiCarlo. Selectivity and tolerance ("invariance") both increase as visual information propagates from cortical area V4 to IT. *Journal of Neuroscience*, 30(39):12978–12995, 2010.
 - H. Ye, J. Zhang, S. Liu, X. Han, and W. Yang. IP-Adapter: Text compatible image prompt adapter for text-to-image diffusion models. *arXiv:2308.06721*, 2023.
