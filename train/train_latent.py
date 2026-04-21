@@ -1,12 +1,13 @@
 """Train a neural encoder (MLP, LSTM, or Transformer) to map IT responses -> FLUX VAE latents.
 
-The target is the spatial VAE latent (16, 28, 28) flattened to 12544-d. Loss is MSE.
-Validation reports MSE and cosine similarity on the flat latent vectors.
+Target is the top-K PCA coordinates of the VAE latent, computed from the training
+split only. Loss is MSE on PCA coords. The PCA basis is saved with the checkpoint
+so predictions can be reconstructed to full latents for decoding.
 
 Usage:
-    python train/train_latent.py --model transformer --dataset rust
+    python train/train_latent.py --model transformer --dataset hvm
     python train/train_latent.py --model transformer --dataset hvm --use-category
-    python train/train_latent.py --model mlp --bottleneck 512 --dataset hvm
+    python train/train_latent.py --model mlp --bottleneck 512 --dataset hvm --pca-k 256
 """
 
 import argparse
@@ -27,7 +28,7 @@ sys.path.insert(0, str(REPO_ROOT))
 from config_const import (
     SEED,
     CHECKPOINT_DIR,
-    HVM_N_CAT, HVM_N_STIMULI, HVM_N_VAL, HVM_N_VAR,
+    HVM_N_CAT, HVM_N_STIMULI, HVM_N_VAR,
     N_STIMULI, N_TRAIN, N_VAL,
     RUST_TIME_WINDOW, HVM_TIME_WINDOW,
     RUST_VAE_LATENTS_PATH, HVM_VAE_LATENTS_PATH,
@@ -35,15 +36,38 @@ from config_const import (
 from encoders import BottleneckMLP, TemporalLSTM, TemporalTransformer
 from get_device import get_device
 
-LATENT_SHAPE = (16, 28, 28)
-OUT_DIM = 16 * 28 * 28  # 12544
-
 MLP_TIME_SLICE = slice(5, 20)
 MLP_N_BINS = MLP_TIME_SLICE.stop - MLP_TIME_SLICE.start
 
 
 # ---------------------------------------------------------------------------
-# Neural data loading (inlined to avoid modifying existing loaders)
+# PCA (fit on train split only)
+# ---------------------------------------------------------------------------
+
+def fit_pca(latents_flat: torch.Tensor, train_idx: torch.Tensor, k: int):
+    """Fit PCA on the training split. Returns (coords, mean, basis).
+
+    Args:
+        latents_flat: (N, D) all latents flattened.
+        train_idx:    indices of training samples.
+        k:            number of principal components to keep.
+
+    Returns:
+        coords: (N, k)  PCA coordinates for all N stimuli (projected using train basis).
+        mean:   (D,)    per-dimension mean of training latents.
+        basis:  (k, D)  top-k right singular vectors (row = PC).
+    """
+    X_train = latents_flat[train_idx].float()
+    mean = X_train.mean(0)
+    Xc = X_train - mean
+    _, _, Vh = torch.linalg.svd(Xc, full_matrices=False)
+    basis = Vh[:k]                              # (k, D)
+    coords = (latents_flat.float() - mean) @ basis.T  # (N, k)
+    return coords, mean, basis
+
+
+# ---------------------------------------------------------------------------
+# Neural data loading
 # ---------------------------------------------------------------------------
 
 def _load_rust_neural() -> np.ndarray:
@@ -102,16 +126,18 @@ def _hvm_stratified_split(seed: int):
     return (np.concatenate(train_idx), np.concatenate(val_idx), np.concatenate(test_idx))
 
 
-def make_loaders(args) -> tuple[DataLoader, DataLoader, DataLoader, int, int]:
-    """Return (train, val, test, n_neurons, n_time)."""
+def make_loaders(args):
+    """Return (train, val, test, n_neurons, n_time, lat_shape, pca_mean, pca_basis)."""
     if args.dataset == "rust":
         if not RUST_VAE_LATENTS_PATH.exists():
             raise FileNotFoundError(
-                f"RUST VAE latent cache not found. Run: python scripts/cache_vae_latents.py --dataset rust"
+                "RUST VAE latent cache not found. Run: python scripts/cache_vae_latents.py --dataset rust"
             )
         rsp = _load_rust_neural()
         neural = torch.from_numpy(rsp).float()
-        latents = torch.load(RUST_VAE_LATENTS_PATH, weights_only=True).flatten(1)  # (300, 12544)
+        all_latents = torch.load(RUST_VAE_LATENTS_PATH, weights_only=True)
+        lat_shape = tuple(all_latents.shape[1:])
+        latents_flat = all_latents.flatten(1).float()
 
         rng = np.random.default_rng(args.seed)
         perm = rng.permutation(N_STIMULI)
@@ -119,32 +145,38 @@ def make_loaders(args) -> tuple[DataLoader, DataLoader, DataLoader, int, int]:
         val_idx   = torch.from_numpy(perm[N_TRAIN:N_TRAIN + N_VAL]).long()
         test_idx  = torch.from_numpy(perm[N_TRAIN + N_VAL:]).long()
 
+        coords, pca_mean, pca_basis = fit_pca(latents_flat, train_idx, args.pca_k)
+
         def make(idx, shuffle):
             return DataLoader(
-                TensorDataset(neural[idx], latents[idx]),
+                TensorDataset(neural[idx], coords[idx]),
                 batch_size=args.batch_size, shuffle=shuffle,
             )
 
     else:  # hvm
         if not HVM_VAE_LATENTS_PATH.exists():
             raise FileNotFoundError(
-                f"HVM VAE latent cache not found. Run: python scripts/cache_vae_latents.py --dataset hvm"
+                "HVM VAE latent cache not found. Run: python scripts/cache_vae_latents.py --dataset hvm"
             )
         rsp = _load_hvm_neural()
         neural = torch.from_numpy(rsp).float()
-        latents = torch.load(HVM_VAE_LATENTS_PATH, weights_only=True).flatten(1)  # (450, 12544)
-        cat_indices = torch.arange(HVM_N_STIMULI) // HVM_N_VAR  # (450,) int64
+        all_latents = torch.load(HVM_VAE_LATENTS_PATH, weights_only=True)
+        lat_shape = tuple(all_latents.shape[1:])
+        latents_flat = all_latents.flatten(1).float()
+        cat_indices = torch.arange(HVM_N_STIMULI) // HVM_N_VAR
 
         train_idx_np, val_idx_np, test_idx_np = _hvm_stratified_split(args.seed)
         train_idx = torch.from_numpy(train_idx_np).long()
         val_idx   = torch.from_numpy(val_idx_np).long()
         test_idx  = torch.from_numpy(test_idx_np).long()
 
+        coords, pca_mean, pca_basis = fit_pca(latents_flat, train_idx, args.pca_k)
+
         def make(idx, shuffle):
             if args.use_category:
-                ds = TensorDataset(neural[idx], latents[idx], cat_indices[idx])
+                ds = TensorDataset(neural[idx], coords[idx], cat_indices[idx])
             else:
-                ds = TensorDataset(neural[idx], latents[idx])
+                ds = TensorDataset(neural[idx], coords[idx])
             return DataLoader(ds, batch_size=args.batch_size, shuffle=shuffle)
 
     train_loader = make(train_idx, shuffle=True)
@@ -156,27 +188,27 @@ def make_loaders(args) -> tuple[DataLoader, DataLoader, DataLoader, int, int]:
     print(
         f"{args.dataset.upper()} loaders: "
         f"train={len(train_idx)}, val={len(val_idx)}, test={len(test_idx)}, "
-        f"neurons={n_neurons}, time={n_time}, target=vae_latent{LATENT_SHAPE}"
+        f"neurons={n_neurons}, time={n_time}, target=pca_coords({args.pca_k})"
     )
-    return train_loader, val_loader, test_loader, n_neurons, n_time
+    return train_loader, val_loader, test_loader, n_neurons, n_time, lat_shape, pca_mean, pca_basis
 
 
 # ---------------------------------------------------------------------------
 # Model
 # ---------------------------------------------------------------------------
 
-def build_model(args, n_neurons: int, n_time: int, n_categories: int = 0):
+def build_model(args, n_neurons: int, n_time: int, out_dim: int, n_categories: int = 0):
     if args.model == "mlp":
         in_dim = n_neurons * MLP_N_BINS
-        return BottleneckMLP(in_dim=in_dim, bottleneck=args.bottleneck, out_dim=OUT_DIM,
+        return BottleneckMLP(in_dim=in_dim, bottleneck=args.bottleneck, out_dim=out_dim,
                              dropout=args.dropout, n_categories=n_categories)
     elif args.model == "lstm":
-        return TemporalLSTM(n_neurons=n_neurons, hidden=args.hidden, out_dim=OUT_DIM,
+        return TemporalLSTM(n_neurons=n_neurons, hidden=args.hidden, out_dim=out_dim,
                             n_layers=args.n_layers, dropout=args.dropout, n_categories=n_categories)
     else:
         return TemporalTransformer(
             n_neurons=n_neurons, d_model=args.d_model, n_heads=args.n_heads,
-            n_layers=args.n_layers, out_dim=OUT_DIM, dropout=args.dropout,
+            n_layers=args.n_layers, out_dim=out_dim, dropout=args.dropout,
             n_categories=n_categories,
         )
 
@@ -193,7 +225,7 @@ def prepare_input(neural: torch.Tensor, model_name: str) -> torch.Tensor:
 
 def run_name(args) -> str:
     cat_tag = "_cat" if getattr(args, "use_category", False) else ""
-    shared = f"do{args.dropout}_lr{args.lr}_wd{args.weight_decay}_bs{args.batch_size}_uw{args.uniformity_weight}"
+    shared = f"pca{args.pca_k}_do{args.dropout}_lr{args.lr}_wd{args.weight_decay}_bs{args.batch_size}"
     if args.model == "mlp":
         return f"bn{args.bottleneck}_{shared}{cat_tag}"
     elif args.model == "lstm":
@@ -203,10 +235,11 @@ def run_name(args) -> str:
 
 
 def run_dir(args) -> Path:
-    return CHECKPOINT_DIR / args.dataset / args.model / "vae_latent" / run_name(args)
+    return CHECKPOINT_DIR / args.dataset / args.model / "vae_latent_pca" / run_name(args)
 
 
-def save_checkpoint(path, model, optimizer, scheduler, epoch, metrics, args):
+def save_checkpoint(path, model, optimizer, scheduler, epoch, metrics, args,
+                    pca_mean=None, pca_basis=None, lat_shape=None):
     torch.save({
         "epoch": epoch,
         "model_state": model.state_dict(),
@@ -214,6 +247,9 @@ def save_checkpoint(path, model, optimizer, scheduler, epoch, metrics, args):
         "scheduler_state": scheduler.state_dict(),
         "metrics": metrics,
         "args": vars(args),
+        "pca_mean": pca_mean,
+        "pca_basis": pca_basis,
+        "lat_shape": lat_shape,
     }, path)
 
 
@@ -224,15 +260,6 @@ def load_checkpoint(path, model):
 
 
 # ---------------------------------------------------------------------------
-# Loss
-# ---------------------------------------------------------------------------
-
-def uniformity_loss(z: torch.Tensor, t: float = 2.0) -> torch.Tensor:
-    sq_pdist = torch.pdist(z, p=2).pow(2)
-    return sq_pdist.mul(-t).exp().mean().log()
-
-
-# ---------------------------------------------------------------------------
 # Training loop
 # ---------------------------------------------------------------------------
 
@@ -240,10 +267,10 @@ def train(args):
     torch.manual_seed(SEED)
     device = get_device()
 
-    train_loader, val_loader, test_loader, n_neurons, n_time = make_loaders(args)
+    train_loader, val_loader, test_loader, n_neurons, n_time, lat_shape, pca_mean, pca_basis = make_loaders(args)
 
     n_cat = HVM_N_CAT if (args.dataset == "hvm" and args.use_category) else 0
-    model = build_model(args, n_neurons, n_time, n_categories=n_cat).to(device)
+    model = build_model(args, n_neurons, n_time, out_dim=args.pca_k, n_categories=n_cat).to(device)
     print(f"Model: {model.__class__.__name__} | params: {sum(p.numel() for p in model.parameters() if p.requires_grad):,}")
 
     optimizer = AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
@@ -261,24 +288,20 @@ def train(args):
     ckpt_dir.mkdir(parents=True, exist_ok=True)
     print(f"Checkpoints -> {ckpt_dir}")
 
+    ckpt_kwargs = dict(pca_mean=pca_mean, pca_basis=pca_basis, lat_shape=lat_shape)
     best_val_mse = float("inf")
 
     for epoch in range(1, args.epochs + 1):
         model.train()
         train_loss = 0.0
         for batch in train_loader:
-            neural  = batch[0].to(device)
-            target  = batch[1].to(device)
-            cat     = batch[2].to(device) if len(batch) == 3 else None
+            neural = batch[0].to(device)
+            target = batch[1].to(device)
+            cat    = batch[2].to(device) if len(batch) == 3 else None
 
             x    = prepare_input(neural, args.model)
             pred = model(x, cat)
-
             loss = F.mse_loss(pred, target)
-
-            if args.uniformity_weight > 0.0:
-                pred_norm = F.normalize(pred, dim=-1)
-                loss = loss + args.uniformity_weight * uniformity_loss(pred_norm)
 
             optimizer.zero_grad()
             loss.backward()
@@ -310,10 +333,10 @@ def train(args):
         print(f"epoch {epoch:3d}/{args.epochs}  train_mse={train_loss:.6f}  val_mse={val_mse:.6f}  cos={cos_sim:.4f}")
 
         metrics = {"epoch": epoch, "train_mse": train_loss, "val_mse": val_mse, "val_cos_sim": cos_sim}
-        save_checkpoint(ckpt_dir / "last.pt", model, optimizer, scheduler, epoch, metrics, args)
+        save_checkpoint(ckpt_dir / "last.pt", model, optimizer, scheduler, epoch, metrics, args, **ckpt_kwargs)
         if val_mse < best_val_mse:
             best_val_mse = val_mse
-            save_checkpoint(ckpt_dir / "best.pt", model, optimizer, scheduler, epoch, metrics, args)
+            save_checkpoint(ckpt_dir / "best.pt", model, optimizer, scheduler, epoch, metrics, args, **ckpt_kwargs)
 
     load_checkpoint(ckpt_dir / "best.pt", model)
 
@@ -348,9 +371,11 @@ def train(args):
 def parse_args():
     p = argparse.ArgumentParser()
     p.add_argument("--model", choices=["mlp", "lstm", "transformer"], default="transformer")
-    p.add_argument("--dataset", choices=["rust", "hvm"], default="rust")
+    p.add_argument("--dataset", choices=["rust", "hvm"], default="hvm")
     p.add_argument("--use-category", action="store_true", default=False,
                    help="Condition on category label (HVM only)")
+    p.add_argument("--pca-k", type=int, default=512,
+                   help="Number of PCA components to predict (default: 512)")
     p.add_argument("--seed", type=int, default=SEED)
 
     # MLP
@@ -368,9 +393,6 @@ def parse_args():
     p.add_argument("--lr", type=float, default=1e-3)
     p.add_argument("--weight-decay", type=float, default=1e-2)
     p.add_argument("--warmup-frac", type=float, default=0.1)
-    p.add_argument("--uniformity-weight", type=float, default=0.0,
-                   help="Weight of uniformity loss on predicted embeddings (applied after L2-norm). "
-                        "Set >0 to spread predictions across the latent space.")
 
     return p.parse_args()
 

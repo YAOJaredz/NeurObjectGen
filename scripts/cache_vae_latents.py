@@ -76,7 +76,7 @@ def cache_hvm(vae: AutoencoderKL, device: str, force: bool) -> None:
         print(f"{HVM_VAE_LATENTS_PATH} exists; skipping HVM")
         return
 
-    img_paths = sorted(HVM_NOFIXATION_DIR.glob("*.png"))
+    img_paths = sorted(HVM_NOFIXATION_DIR.rglob("*.png"))
     assert len(img_paths) == HVM_N_STIMULI, (
         f"Expected {HVM_N_STIMULI} HVM images, found {len(img_paths)}"
     )

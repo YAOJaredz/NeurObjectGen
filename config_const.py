@@ -65,6 +65,7 @@ T5_PCA_K          = 128
 T5_PCA_BASIS_PATH = CACHE_DIR / f"t5_pca_basis_k{T5_PCA_K}.pt"   # (K, 4096)
 T5_PCA_MEAN_PATH  = CACHE_DIR / f"t5_pca_mean_k{T5_PCA_K}.pt"    # (4096,)
 
+
 # --- Model identifiers ---
 SIGLIP_MODEL_ID       = "google/siglip-so400m-patch14-384"
 T5_XXL_MODEL_ID       = "google/t5-v1_1-xxl"

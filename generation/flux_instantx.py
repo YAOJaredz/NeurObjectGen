@@ -577,6 +577,7 @@ def generate_img2img(
     seed: int = 0,
     aperture_composite: bool = True,
     aperture_mask: torch.Tensor | None = None,
+    init_latent: torch.Tensor | None = None,
     show_progress: bool = True,
 ) -> Image.Image:
     """Img2img generation with per-step aperture compositing.
@@ -632,8 +633,11 @@ def generate_img2img(
             max_sequence_length=512,
         )
 
-    init_resized = init_image.resize((width, height), Image.LANCZOS)
-    init_latent = encode_image(pipe, init_resized).to(device=device, dtype=dtype)
+    if init_latent is not None:
+        init_latent = init_latent.to(device=device, dtype=dtype)
+    else:
+        init_resized = init_image.resize((width, height), Image.LANCZOS)
+        init_latent = encode_image(pipe, init_resized).to(device=device, dtype=dtype)
 
     h = 2 * (height // (pipe.vae_scale_factor * 2))
     w = 2 * (width // (pipe.vae_scale_factor * 2))
