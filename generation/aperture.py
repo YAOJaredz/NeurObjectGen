@@ -117,7 +117,7 @@ def load_hvm_packed_aperture_mask(
 ) -> torch.Tensor:
     """Load (or build) the HVM aperture mask.
 
-    HVM aperture params measured from stimuli/hvm_cropped (276×276 px):
+    HVM aperture params measured from stimuli/hvm_nofixation (276×276 px):
       radius_frac=0.4909, center_frac=0.0362
     """
     return load_packed_aperture_mask(

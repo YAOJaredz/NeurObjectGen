@@ -61,6 +61,7 @@ def fit_pca(latents_flat: torch.Tensor, train_idx: torch.Tensor, k: int):
     mean = X_train.mean(0)
     Xc = X_train - mean
     _, _, Vh = torch.linalg.svd(Xc, full_matrices=False)
+    k = min(k, Vh.shape[0])  # can't exceed min(n_train, D)
     basis = Vh[:k]                              # (k, D)
     coords = (latents_flat.float() - mean) @ basis.T  # (N, k)
     return coords, mean, basis
@@ -268,6 +269,12 @@ def train(args):
     device = get_device()
 
     train_loader, val_loader, test_loader, n_neurons, n_time, lat_shape, pca_mean, pca_basis = make_loaders(args)
+
+    # pca_basis may be smaller than requested if n_train < pca_k
+    actual_pca_k = pca_basis.shape[0]
+    if actual_pca_k != args.pca_k:
+        print(f"Warning: requested pca_k={args.pca_k} but n_train={actual_pca_k}; using {actual_pca_k}")
+        args.pca_k = actual_pca_k
 
     n_cat = HVM_N_CAT if (args.dataset == "hvm" and args.use_category) else 0
     model = build_model(args, n_neurons, n_time, out_dim=args.pca_k, n_categories=n_cat).to(device)

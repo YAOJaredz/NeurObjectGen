@@ -21,7 +21,7 @@ SIGLIP_STRIPPED_PATH   = CACHE_DIR / "siglip_stripped.pt"  # (300, 1152) apertur
 SIGLIP_PATCH14_PATH    = CACHE_DIR / "siglip_patch14.pt"   # (300, 196, 1152)
 SIGLIP_PATCH8_PATH     = CACHE_DIR / "siglip_patch8.pt"    # (300,  64, 1152)
 RUST_LOSS_MASK_PATH = RUST_STIM_DIR / "loss_mask.pt"
-HVM_LOSS_MASK_PATH  = STIMULI_ROOT / "hvm_cropped" / "loss_mask.pt"
+HVM_LOSS_MASK_PATH  = STIMULI_ROOT / "hvm_nofixation" / "loss_mask.pt"
 BLIP2_CAPTIONS_PATH = CACHE_DIR / "blip2_captions.json"
 BLIP2_DETAILED_CAPTIONS_PATH = CACHE_DIR / "blip2_detailed_captions.json"
 
@@ -52,7 +52,8 @@ HVM_N_TEST     = 90   # 9 per category × 10
 
 HVM_SRC_DIR        = Path('/mnt/smb/locker/issa-locker/Data/West/Saved_Images/E8')
 HVM_RAW_DIR        = STIMULI_ROOT / 'hvm'
-HVM_STIM_DIR       = STIMULI_ROOT / 'hvm_cropped'
+HVM_STIM_DIR       = STIMULI_ROOT / 'hvm_nofixation'
+HVM_CROPPED_DIR    = STIMULI_ROOT / 'hvm_cropped'
 HVM_NOFIXATION_DIR = STIMULI_ROOT / 'hvm_nofixation'
 
 RUST_NOFIXATION_DIR = STIMULI_ROOT / 'rust_nofixation'

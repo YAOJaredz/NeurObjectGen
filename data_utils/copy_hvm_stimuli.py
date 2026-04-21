@@ -19,7 +19,7 @@ from pathlib import Path
 
 from PIL import Image
 
-from config_const import HVM_SRC_DIR, HVM_RAW_DIR, HVM_STIM_DIR, HVM_CATEGORIES
+from config_const import HVM_SRC_DIR, HVM_RAW_DIR, HVM_CROPPED_DIR, HVM_CATEGORIES
 from data_utils.stim_preprocess import compute_bbox
 
 _INDEX_RE = re.compile(r'_index(\d+)\.png$')
@@ -35,7 +35,7 @@ def copy_hvm_stimuli(overwrite: bool = False) -> None:
         src_dir = src_dirs[0]
 
         raw_dir    = HVM_RAW_DIR  / cat
-        cropped_dir = HVM_STIM_DIR / cat
+        cropped_dir = HVM_CROPPED_DIR / cat
         raw_dir.mkdir(parents=True, exist_ok=True)
         cropped_dir.mkdir(parents=True, exist_ok=True)
 

@@ -25,7 +25,7 @@ from PIL import Image
 from config_const import (
     SEED,
     # HVM
-    HVM_CATEGORIES, HVM_N_VAR, HVM_STIM_DIR, HVM_NOFIXATION_DIR,
+    HVM_CATEGORIES, HVM_N_VAR, HVM_CROPPED_DIR, HVM_NOFIXATION_DIR,
     HVM_SIGLIP_EMBEDDINGS_PATH, HVM_CLIP_EMBEDS_PATH, HVM_CENTER_FRAC,
     # Rust
     N_STIMULI, RUST_STIM_DIR, RUST_NOFIXATION_DIR,
@@ -44,7 +44,7 @@ FIXATION_PROMPT = "a seamless, coherent image with no artifacts"
 
 _DATASETS = {
     "hvm": dict(
-        stim_dir=HVM_STIM_DIR,
+        stim_dir=HVM_CROPPED_DIR,
         out_dir=HVM_NOFIXATION_DIR,
         siglip_path=HVM_SIGLIP_EMBEDDINGS_PATH,
         clip_path=HVM_CLIP_EMBEDS_PATH,
