@@ -65,7 +65,7 @@ echo "Task ${SLURM_ARRAY_TASK_ID}: bottleneck=${BOTTLENECK} dropout=${DROPOUT} l
 CAT_FLAG=""
 [ "$USE_CAT" -eq 1 ] && CAT_FLAG="--use-category"
 
-$PYTHON scripts/train_encoder.py \
+$PYTHON train/train_encoder.py \
     --dataset       hvm \
     --model         mlp \
     --target        siglip \

@@ -58,7 +58,7 @@ echo "Task ${SLURM_ARRAY_TASK_ID}: bottleneck=${BOTTLENECK} dropout=${DROPOUT} l
 # ---------------------------------------------------------------------------
 # Train
 # ---------------------------------------------------------------------------
-$PYTHON scripts/train_encoder.py \
+$PYTHON train/train_encoder.py \
     --model mlp \
     --target       siglip \
     --bottleneck   "${BOTTLENECK}" \

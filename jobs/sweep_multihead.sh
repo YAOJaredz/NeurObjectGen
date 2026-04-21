@@ -75,7 +75,7 @@ echo "Task ${SLURM_ARRAY_TASK_ID}: nce_weight=${NCE_WEIGHT} d_model=${D_MODEL} n
 # ---------------------------------------------------------------------------
 # Train
 # ---------------------------------------------------------------------------
-$PYTHON scripts/train_multihead.py \
+$PYTHON train/train_multihead.py \
     --d-model          "${D_MODEL}"          \
     --n-heads          "${N_HEADS}"          \
     --n-layers         "${N_LAYER}"          \

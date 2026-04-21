@@ -65,7 +65,7 @@ echo "Task ${SLURM_ARRAY_TASK_ID}: d_model=${D_MODEL} n_layers=${N_LAYER} lr=${L
 # ---------------------------------------------------------------------------
 # Train
 # ---------------------------------------------------------------------------
-$PYTHON scripts/train_encoder.py \
+$PYTHON train/train_encoder.py \
     --model transformer \
     --target       clip \
     --d-model      "${D_MODEL}" \

@@ -72,7 +72,7 @@ echo "Task ${SLURM_ARRAY_TASK_ID}: d_model=${D_MODEL} n_layers=${N_LAYER} dropou
 CAT_FLAG=""
 [ "$USE_CAT" -eq 1 ] && CAT_FLAG="--use-category"
 
-$PYTHON scripts/train_encoder.py \
+$PYTHON train/train_encoder.py \
     --dataset       hvm \
     --model         transformer \
     --target        siglip \

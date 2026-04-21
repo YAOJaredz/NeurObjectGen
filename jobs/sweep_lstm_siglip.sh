@@ -62,7 +62,7 @@ echo "Task ${SLURM_ARRAY_TASK_ID}: hidden=${HIDDEN} n_layers=${N_LAYER} lr=${LR}
 # ---------------------------------------------------------------------------
 # Train
 # ---------------------------------------------------------------------------
-$PYTHON scripts/train_encoder.py \
+$PYTHON train/train_encoder.py \
     --model lstm \
     --target       siglip \
     --hidden       "${HIDDEN}" \

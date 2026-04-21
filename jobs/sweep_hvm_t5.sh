@@ -71,7 +71,7 @@ echo "Task ${SLURM_ARRAY_TASK_ID}: n_layers=${N_LAYER} d_model=${D_MODEL} nce_we
 # ---------------------------------------------------------------------------
 # Train
 # ---------------------------------------------------------------------------
-$PYTHON scripts/train_t5.py \
+$PYTHON train/train_t5.py \
     --dataset           hvm              \
     --use-category                       \
     --d-model           ${D_MODEL}       \
