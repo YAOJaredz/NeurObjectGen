@@ -1,13 +1,11 @@
 """Train a neural encoder (MLP, LSTM, or Transformer) to map IT responses -> FLUX VAE latents.
 
-Target is the top-K PCA coordinates of the VAE latent, computed from the training
-split only. Loss is MSE on PCA coords. The PCA basis is saved with the checkpoint
-so predictions can be reconstructed to full latents for decoding.
+Target: flat VAE latent (C*H*W), normalized per-channel using training split stats.
+Loss: MSE on normalized latent. Checkpoint saves channel mean/std for decoding.
 
 Usage:
-    python train/train_latent.py --model transformer --dataset hvm
     python train/train_latent.py --model transformer --dataset hvm --use-category
-    python train/train_latent.py --model mlp --bottleneck 512 --dataset hvm --pca-k 256
+    python train/train_latent.py --model transformer --dataset rust
 """
 
 import argparse
@@ -38,33 +36,6 @@ from get_device import get_device
 
 MLP_TIME_SLICE = slice(5, 20)
 MLP_N_BINS = MLP_TIME_SLICE.stop - MLP_TIME_SLICE.start
-
-
-# ---------------------------------------------------------------------------
-# PCA (fit on train split only)
-# ---------------------------------------------------------------------------
-
-def fit_pca(latents_flat: torch.Tensor, train_idx: torch.Tensor, k: int):
-    """Fit PCA on the training split. Returns (coords, mean, basis).
-
-    Args:
-        latents_flat: (N, D) all latents flattened.
-        train_idx:    indices of training samples.
-        k:            number of principal components to keep.
-
-    Returns:
-        coords: (N, k)  PCA coordinates for all N stimuli (projected using train basis).
-        mean:   (D,)    per-dimension mean of training latents.
-        basis:  (k, D)  top-k right singular vectors (row = PC).
-    """
-    X_train = latents_flat[train_idx].float()
-    mean = X_train.mean(0)
-    Xc = X_train - mean
-    _, _, Vh = torch.linalg.svd(Xc, full_matrices=False)
-    k = min(k, Vh.shape[0])  # can't exceed min(n_train, D)
-    basis = Vh[:k]                              # (k, D)
-    coords = (latents_flat.float() - mean) @ basis.T  # (N, k)
-    return coords, mean, basis
 
 
 # ---------------------------------------------------------------------------
@@ -127,8 +98,12 @@ def _hvm_stratified_split(seed: int):
     return (np.concatenate(train_idx), np.concatenate(val_idx), np.concatenate(test_idx))
 
 
+def pool_latents(latents: torch.Tensor, target_hw: int = 8) -> torch.Tensor:
+    """Spatially pool (N, C, H, W) to (N, C, target_hw, target_hw)."""
+    return F.adaptive_avg_pool2d(latents.float(), (target_hw, target_hw))
+
+
 def make_loaders(args):
-    """Return (train, val, test, n_neurons, n_time, lat_shape, pca_mean, pca_basis)."""
     if args.dataset == "rust":
         if not RUST_VAE_LATENTS_PATH.exists():
             raise FileNotFoundError(
@@ -136,9 +111,9 @@ def make_loaders(args):
             )
         rsp = _load_rust_neural()
         neural = torch.from_numpy(rsp).float()
-        all_latents = torch.load(RUST_VAE_LATENTS_PATH, weights_only=True)
+        raw_latents = torch.load(RUST_VAE_LATENTS_PATH, weights_only=True)  # (N, C, H, W)
+        all_latents = pool_latents(raw_latents, args.pool_hw)
         lat_shape = tuple(all_latents.shape[1:])
-        latents_flat = all_latents.flatten(1).float()
 
         rng = np.random.default_rng(args.seed)
         perm = rng.permutation(N_STIMULI)
@@ -146,11 +121,9 @@ def make_loaders(args):
         val_idx   = torch.from_numpy(perm[N_TRAIN:N_TRAIN + N_VAL]).long()
         test_idx  = torch.from_numpy(perm[N_TRAIN + N_VAL:]).long()
 
-        coords, pca_mean, pca_basis = fit_pca(latents_flat, train_idx, args.pca_k)
-
         def make(idx, shuffle):
             return DataLoader(
-                TensorDataset(neural[idx], coords[idx]),
+                TensorDataset(neural[idx], all_latents[idx]),
                 batch_size=args.batch_size, shuffle=shuffle,
             )
 
@@ -161,9 +134,9 @@ def make_loaders(args):
             )
         rsp = _load_hvm_neural()
         neural = torch.from_numpy(rsp).float()
-        all_latents = torch.load(HVM_VAE_LATENTS_PATH, weights_only=True)
+        raw_latents = torch.load(HVM_VAE_LATENTS_PATH, weights_only=True)  # (N, C, H, W)
+        all_latents = pool_latents(raw_latents, args.pool_hw)
         lat_shape = tuple(all_latents.shape[1:])
-        latents_flat = all_latents.flatten(1).float()
         cat_indices = torch.arange(HVM_N_STIMULI) // HVM_N_VAR
 
         train_idx_np, val_idx_np, test_idx_np = _hvm_stratified_split(args.seed)
@@ -171,13 +144,11 @@ def make_loaders(args):
         val_idx   = torch.from_numpy(val_idx_np).long()
         test_idx  = torch.from_numpy(test_idx_np).long()
 
-        coords, pca_mean, pca_basis = fit_pca(latents_flat, train_idx, args.pca_k)
-
         def make(idx, shuffle):
             if args.use_category:
-                ds = TensorDataset(neural[idx], coords[idx], cat_indices[idx])
+                ds = TensorDataset(neural[idx], all_latents[idx], cat_indices[idx])
             else:
-                ds = TensorDataset(neural[idx], coords[idx])
+                ds = TensorDataset(neural[idx], all_latents[idx])
             return DataLoader(ds, batch_size=args.batch_size, shuffle=shuffle)
 
     train_loader = make(train_idx, shuffle=True)
@@ -186,12 +157,30 @@ def make_loaders(args):
 
     n_neurons = rsp.shape[1]
     n_time    = rsp.shape[2]
+
+    # z-score neural inputs on training split
+    neural_train = neural[train_idx]  # (n_train, N, T)
+    neural_mean = neural_train.mean(dim=(0, 2), keepdim=True)   # (1, N, 1)
+    neural_std  = neural_train.std(dim=(0, 2), keepdim=True).clamp(min=1e-6)
+
+    # normalize latent targets per channel on training split
+    # all_latents[train_idx]: (n_train, C, H, W)
+    lat_train = all_latents[train_idx].float()
+    C = lat_shape[0]
+    lat_mean = lat_train.mean(dim=(0, 2, 3))   # (C,)
+    lat_std  = lat_train.std(dim=(0, 2, 3)).clamp(min=1e-6)   # (C,)
+
+    out_dim = int(np.prod(lat_shape))
     print(
         f"{args.dataset.upper()} loaders: "
         f"train={len(train_idx)}, val={len(val_idx)}, test={len(test_idx)}, "
-        f"neurons={n_neurons}, time={n_time}, target=pca_coords({args.pca_k})"
+        f"neurons={n_neurons}, time={n_time}, "
+        f"lat_shape={lat_shape}, out_dim={out_dim}"
     )
-    return train_loader, val_loader, test_loader, n_neurons, n_time, lat_shape, pca_mean, pca_basis
+    return (train_loader, val_loader, test_loader,
+            n_neurons, n_time, lat_shape, out_dim,
+            neural_mean, neural_std,
+            lat_mean, lat_std)
 
 
 # ---------------------------------------------------------------------------
@@ -210,7 +199,7 @@ def build_model(args, n_neurons: int, n_time: int, out_dim: int, n_categories: i
         return TemporalTransformer(
             n_neurons=n_neurons, d_model=args.d_model, n_heads=args.n_heads,
             n_layers=args.n_layers, out_dim=out_dim, dropout=args.dropout,
-            n_categories=n_categories,
+            n_categories=n_categories, normalize_output=False,
         )
 
 
@@ -220,13 +209,18 @@ def prepare_input(neural: torch.Tensor, model_name: str) -> torch.Tensor:
     return neural.permute(0, 2, 1)  # (B, T, N)
 
 
+def normalize_latent(latent: torch.Tensor, lat_mean, lat_std) -> torch.Tensor:
+    """Normalize (B, C, H, W) latent per channel."""
+    return (latent - lat_mean[None, :, None, None]) / lat_std[None, :, None, None]
+
+
 # ---------------------------------------------------------------------------
 # Checkpointing
 # ---------------------------------------------------------------------------
 
 def run_name(args) -> str:
     cat_tag = "_cat" if getattr(args, "use_category", False) else ""
-    shared = f"pca{args.pca_k}_do{args.dropout}_lr{args.lr}_wd{args.weight_decay}_bs{args.batch_size}"
+    shared = f"hw{args.pool_hw}_do{args.dropout}_lr{args.lr}_wd{args.weight_decay}_bs{args.batch_size}"
     if args.model == "mlp":
         return f"bn{args.bottleneck}_{shared}{cat_tag}"
     elif args.model == "lstm":
@@ -236,11 +230,12 @@ def run_name(args) -> str:
 
 
 def run_dir(args) -> Path:
-    return CHECKPOINT_DIR / args.dataset / args.model / "vae_latent_pca" / run_name(args)
+    return CHECKPOINT_DIR / args.dataset / args.model / "vae_latent_flat" / run_name(args)
 
 
 def save_checkpoint(path, model, optimizer, scheduler, epoch, metrics, args,
-                    pca_mean=None, pca_basis=None, lat_shape=None):
+                    lat_shape=None, neural_mean=None, neural_std=None,
+                    lat_mean=None, lat_std=None):
     torch.save({
         "epoch": epoch,
         "model_state": model.state_dict(),
@@ -248,9 +243,11 @@ def save_checkpoint(path, model, optimizer, scheduler, epoch, metrics, args,
         "scheduler_state": scheduler.state_dict(),
         "metrics": metrics,
         "args": vars(args),
-        "pca_mean": pca_mean,
-        "pca_basis": pca_basis,
         "lat_shape": lat_shape,
+        "neural_mean": neural_mean,
+        "neural_std": neural_std,
+        "lat_mean": lat_mean,
+        "lat_std": lat_std,
     }, path)
 
 
@@ -268,16 +265,18 @@ def train(args):
     torch.manual_seed(SEED)
     device = get_device()
 
-    train_loader, val_loader, test_loader, n_neurons, n_time, lat_shape, pca_mean, pca_basis = make_loaders(args)
+    (train_loader, val_loader, test_loader,
+     n_neurons, n_time, lat_shape, out_dim,
+     neural_mean, neural_std,
+     lat_mean, lat_std) = make_loaders(args)
 
-    # pca_basis may be smaller than requested if n_train < pca_k
-    actual_pca_k = pca_basis.shape[0]
-    if actual_pca_k != args.pca_k:
-        print(f"Warning: requested pca_k={args.pca_k} but n_train={actual_pca_k}; using {actual_pca_k}")
-        args.pca_k = actual_pca_k
+    neural_mean = neural_mean.to(device)
+    neural_std  = neural_std.to(device)
+    lat_mean    = lat_mean.to(device)
+    lat_std     = lat_std.to(device)
 
     n_cat = HVM_N_CAT if (args.dataset == "hvm" and args.use_category) else 0
-    model = build_model(args, n_neurons, n_time, out_dim=args.pca_k, n_categories=n_cat).to(device)
+    model = build_model(args, n_neurons, n_time, out_dim=out_dim, n_categories=n_cat).to(device)
     print(f"Model: {model.__class__.__name__} | params: {sum(p.numel() for p in model.parameters() if p.requires_grad):,}")
 
     optimizer = AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
@@ -295,7 +294,11 @@ def train(args):
     ckpt_dir.mkdir(parents=True, exist_ok=True)
     print(f"Checkpoints -> {ckpt_dir}")
 
-    ckpt_kwargs = dict(pca_mean=pca_mean, pca_basis=pca_basis, lat_shape=lat_shape)
+    ckpt_kwargs = dict(
+        lat_shape=lat_shape,
+        neural_mean=neural_mean.cpu(), neural_std=neural_std.cpu(),
+        lat_mean=lat_mean.cpu(), lat_std=lat_std.cpu(),
+    )
     best_val_mse = float("inf")
 
     for epoch in range(1, args.epochs + 1):
@@ -303,9 +306,11 @@ def train(args):
         train_loss = 0.0
         for batch in train_loader:
             neural = batch[0].to(device)
-            target = batch[1].to(device)
+            latent = batch[1].to(device).float()
             cat    = batch[2].to(device) if len(batch) == 3 else None
 
+            neural = (neural - neural_mean) / neural_std
+            target = normalize_latent(latent, lat_mean, lat_std).flatten(1)  # (B, C*H*W)
             x    = prepare_input(neural, args.model)
             pred = model(x, cat)
             loss = F.mse_loss(pred, target)
@@ -324,8 +329,10 @@ def train(args):
         with torch.no_grad():
             for batch in val_loader:
                 neural = batch[0].to(device)
-                target = batch[1].to(device)
+                latent = batch[1].to(device).float()
                 cat    = batch[2].to(device) if len(batch) == 3 else None
+                neural = (neural - neural_mean) / neural_std
+                target = normalize_latent(latent, lat_mean, lat_std).flatten(1)
                 x      = prepare_input(neural, args.model)
                 pred   = model(x, cat)
                 val_mse += F.mse_loss(pred, target).item()
@@ -352,11 +359,14 @@ def train(args):
     with torch.no_grad():
         for batch in test_loader:
             neural = batch[0].to(device)
+            latent = batch[1].to(device).float()
             cat    = batch[2].to(device) if len(batch) == 3 else None
+            neural = (neural - neural_mean) / neural_std
+            target = normalize_latent(latent, lat_mean, lat_std).flatten(1)
             x      = prepare_input(neural, args.model)
             pred   = model(x, cat)
             test_preds.append(pred.cpu())
-            test_targets.append(batch[1])
+            test_targets.append(target.cpu())
 
     test_preds_t   = torch.cat(test_preds)
     test_targets_t = torch.cat(test_targets)
@@ -381,8 +391,8 @@ def parse_args():
     p.add_argument("--dataset", choices=["rust", "hvm"], default="hvm")
     p.add_argument("--use-category", action="store_true", default=False,
                    help="Condition on category label (HVM only)")
-    p.add_argument("--pca-k", type=int, default=512,
-                   help="Number of PCA components to predict (default: 512)")
+    p.add_argument("--pool-hw", type=int, default=8,
+                   help="Spatial size to pool latent to before predicting (default: 8 → 16×8×8=1024)")
     p.add_argument("--seed", type=int, default=SEED)
 
     # MLP

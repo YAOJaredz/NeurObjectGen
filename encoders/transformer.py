@@ -34,6 +34,7 @@ class TemporalTransformer(nn.Module):
         dropout: float = 0.1,
         max_time: int = 32,
         n_categories: int = 0,
+        normalize_output: bool = True,
     ):
         super().__init__()
         # Normalise the 6802-d neural vector at each time step before projection.
@@ -61,6 +62,7 @@ class TemporalTransformer(nn.Module):
         # Temporal attention pooling over time-step tokens (excludes CLS)
         self.attn = nn.Linear(d_model, 1, bias=False)
         self.proj = nn.Linear(d_model, out_dim)
+        self.normalize_output = normalize_output
         self.use_cat = n_categories > 0
         if self.use_cat:
             self.cat_emb = nn.Embedding(n_categories, d_model)
@@ -94,4 +96,4 @@ class TemporalTransformer(nn.Module):
         if self.use_cat and cat is not None:
             pooled = pooled + self.cat_emb(cat)
         out = self.proj(pooled)                         # (B, out_dim)
-        return F.normalize(out, dim=-1)
+        return F.normalize(out, dim=-1) if self.normalize_output else out

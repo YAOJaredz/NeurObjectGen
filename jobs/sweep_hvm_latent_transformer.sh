@@ -1,5 +1,5 @@
 #!/bin/bash
-# Sweep Transformer encoder on HVM — VAE latent PCA target, category-conditioned.
+# Sweep Transformer encoder on HVM — VAE latent flat target (16x34x34), category-conditioned.
 # Grid: 2 d_models x 3 n_layers x 2 lrs x 2 wds = 24 jobs.
 
 #SBATCH --job-name=hvm_latent_transformer
@@ -63,7 +63,7 @@ echo "Task ${SLURM_ARRAY_TASK_ID}: d_model=${D_MODEL} n_layers=${N_LAYER} lr=${L
 $PYTHON train/train_latent.py \
     --dataset       hvm \
     --model         transformer \
-    --pca-k         512 \
+    --pool-hw       8 \
     --d-model       "${D_MODEL}" \
     --n-heads       "${N_HEADS}" \
     --n-layers      "${N_LAYER}" \
