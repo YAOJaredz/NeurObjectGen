@@ -10,6 +10,7 @@
 #SBATCH --ntasks=1
 #SBATCH --cpus-per-task=4
 #SBATCH --mem=48gb
+#SBATCH --gres=gpu:1
 #SBATCH --time=0-08:00:00
 #SBATCH --partition=issa
 #SBATCH --nodelist=ax11
