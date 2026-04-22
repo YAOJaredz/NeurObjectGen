@@ -578,6 +578,8 @@ def generate_img2img(
     aperture_composite: bool = True,
     aperture_mask: torch.Tensor | None = None,
     init_latent: torch.Tensor | None = None,
+    guidance_latent: torch.Tensor | None = None,
+    guidance_eta: float = 0.15,
     show_progress: bool = True,
 ) -> Image.Image:
     """Img2img generation with per-step aperture compositing.
@@ -609,6 +611,15 @@ def generate_img2img(
             original), 1.0 = pure noise (RF structure discarded). Intermediate
             values keep the structural skeleton while giving the IP-adapter
             room to repaint content instead of fighting a deterministic ODE.
+        guidance_latent: Optional packed or unpacked latent to use as a
+            per-step RF correction target (``y_0``). When provided, every
+            denoising step is steered toward this latent with strength
+            ``guidance_eta``, independently of ``use_rf_inversion``. Pass the
+            neural-predicted latent here to guide generation without using it
+            as the noise init. Must match the spatial resolution implied by
+            ``height``/``width`` (i.e. shape ``(1, 16, H/8, W/8)``).
+        guidance_eta: Strength of the per-step RF correction toward
+            ``guidance_latent``. 0.0 = no guidance, 1.0 = full correction.
     """
     device = pipe.device
     dtype = torch.bfloat16
@@ -644,6 +655,10 @@ def generate_img2img(
     latent_channels = init_latent.shape[1]
     init_latent_packed = pipe._pack_latents(init_latent, 1, latent_channels, h, w)
     latent_image_ids = pipe._prepare_latent_image_ids(1, h // 2, w // 2, device, dtype)
+
+    if guidance_latent is not None:
+        guidance_latent = guidance_latent.to(device=device, dtype=dtype)
+        guidance_latent_packed = pipe._pack_latents(guidance_latent, 1, guidance_latent.shape[1], h, w)
 
     image_seq_len = init_latent_packed.shape[1]
     mu = calculate_shift(
@@ -726,16 +741,25 @@ def generate_img2img(
             return_dict=False,
         )[0]
 
-        if use_rf_inversion:
-            # RF-Inversion reverse step: eta-weighted blend of denoising direction
-            # and image-faithful correction toward y_0. Paper: v_t_cond = (y_0 - latents)/(1 - t_i)
-            # with t_i = 1 - t/1000, so (1 - t_i) = t/1000 = sigma_curr in FLUX convention.
-            sigma_curr = t.to(dtype) / 1000.0
-            sigma_next = (timesteps[step_idx + 1].to(dtype) / 1000.0
-                          if step_idx + 1 < len(timesteps) else torch.zeros(1, device=device, dtype=dtype))
+        sigma_curr = t.to(dtype) / 1000.0
+        sigma_next = (timesteps[step_idx + 1].to(dtype) / 1000.0
+                      if step_idx + 1 < len(timesteps) else torch.zeros(1, device=device, dtype=dtype))
+
+        if use_rf_inversion or guidance_latent is not None:
+            # RF-style Euler step. The correction target is:
+            #   - guidance_latent (neural prediction) when provided — steers toward it
+            #   - image_latents (GT init) when only use_rf_inversion is set — reconstructs original
+            # When both are set, RF-inversion seeds the structured noise init and guidance_latent
+            # provides the per-step correction target, combining structured init with neural steering.
             v_t = -noise_pred
-            v_t_cond = (image_latents - latents) / (sigma_curr + 1e-3)
-            v_hat = v_t + rf_eta * (v_t_cond - v_t)
+            if guidance_latent is not None:
+                correction_target = guidance_latent_packed
+                eta = guidance_eta
+            else:
+                correction_target = image_latents
+                eta = rf_eta
+            v_t_cond = (correction_target - latents) / (sigma_curr + 1e-3)
+            v_hat = v_t + eta * (v_t_cond - v_t)
             latents = latents + v_hat * (sigma_curr - sigma_next)
         else:
             latents = pipe.scheduler.step(noise_pred, t, latents, return_dict=False)[0]
