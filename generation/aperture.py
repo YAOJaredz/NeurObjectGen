@@ -109,6 +109,55 @@ def load_packed_aperture_mask(
     return mask.to(device)
 
 
+def build_object_region_mask(
+    image_size: int,
+    cx_px: float,
+    cy_px: float,
+    r_px: float,
+    device: torch.device | str,
+    dtype: torch.dtype,
+    binarize: bool = True,
+    bbox_frac: float | None = None,
+) -> torch.Tensor:
+    """Build a packed-latent-resolution mask for a per-stimulus object region.
+
+    Args:
+        image_size: Square canvas side length in pixels.
+        cx_px:      Object center x in pixels (left = 0).
+        cy_px:      Object center y in pixels (top = 0).
+        r_px:       Object radius in pixels (used when bbox_frac is None).
+        device:     Target device.
+        dtype:      Target dtype.
+        binarize:   If True, threshold soft pool at 0.5.
+        bbox_frac:  If set, use a square bbox with half-width = image_size * bbox_frac / 2
+                    instead of the circular mask.
+
+    Returns:
+        (1, packed_seq_len, 1) tensor — 1 inside object region, 0 outside.
+    """
+    yy, xx = torch.meshgrid(
+        torch.arange(image_size, dtype=torch.float32),
+        torch.arange(image_size, dtype=torch.float32),
+        indexing="ij",
+    )
+    if bbox_frac is not None:
+        half = image_size * bbox_frac / 2
+        region = (
+            (yy >= cy_px - half) & (yy <= cy_px + half) &
+            (xx >= cx_px - half) & (xx <= cx_px + half)
+        )
+    else:
+        region = ((yy - cy_px) ** 2 + (xx - cx_px) ** 2) <= r_px ** 2
+    pixel_mask = region.float().view(1, 1, image_size, image_size)
+    packed_grid = image_size // 16
+    mask = F.avg_pool2d(pixel_mask, kernel_size=16).view(1, packed_grid * packed_grid, 1)
+    if binarize:
+        mask = (mask > 0.5).to(dtype=dtype)
+    else:
+        mask = mask.to(dtype=dtype)
+    return mask.to(device)
+
+
 def load_hvm_packed_aperture_mask(
     image_size: int,
     device: torch.device | str,

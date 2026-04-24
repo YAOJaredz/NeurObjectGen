@@ -580,6 +580,7 @@ def generate_img2img(
     init_latent: torch.Tensor | None = None,
     guidance_latent: torch.Tensor | None = None,
     guidance_eta: float = 0.15,
+    guidance_mask: torch.Tensor | None = None,
     show_progress: bool = True,
 ) -> Image.Image:
     """Img2img generation with per-step aperture compositing.
@@ -620,6 +621,12 @@ def generate_img2img(
             ``height``/``width`` (i.e. shape ``(1, 16, H/8, W/8)``).
         guidance_eta: Strength of the per-step RF correction toward
             ``guidance_latent``. 0.0 = no guidance, 1.0 = full correction.
+        guidance_mask: Optional packed-latent-resolution mask ``(1, seq_len, 1)``
+            that spatially gates the RF correction. When provided, the correction
+            is applied only at positions where the mask is non-zero (i.e. inside
+            the projected object region). Outside positions receive zero correction
+            and evolve freely. Shape must match the packed latent sequence length.
+            Build with ``generation.aperture.build_object_region_mask``.
     """
     device = pipe.device
     dtype = torch.bfloat16
@@ -759,7 +766,11 @@ def generate_img2img(
                 correction_target = image_latents
                 eta = rf_eta
             v_t_cond = (correction_target - latents) / (sigma_curr + 1e-3)
-            v_hat = v_t + eta * (v_t_cond - v_t)
+            correction = eta * (v_t_cond - v_t)
+            if guidance_mask is not None:
+                gm = guidance_mask.to(device=latents.device, dtype=latents.dtype)
+                correction = gm * correction
+            v_hat = v_t + correction
             latents = latents + v_hat * (sigma_curr - sigma_next)
         else:
             latents = pipe.scheduler.step(noise_pred, t, latents, return_dict=False)[0]
