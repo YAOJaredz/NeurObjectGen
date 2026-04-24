@@ -22,7 +22,7 @@ import torch
 from PIL import Image
 from transformers import AutoModelForZeroShotObjectDetection, AutoProcessor
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+sys.path.append('.')
 from config_const import CACHE_DIR, HVM_CATEGORIES, HVM_N_VAR, HVM_NOFIXATION_DIR
 from generation.project_hvm import hvm_object_pixel_coords, load_hvm_metadata
 
