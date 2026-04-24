@@ -92,7 +92,89 @@ neural r (N×T) ─┤                                                          
 
 ---
 
-## 4. Deliverables & Evaluation
+## 4. Object-Specific Reconstruction Directions
+
+The main pipeline (Section 3) conditions generation on global image embeddings and applies a soft aperture mask to suppress background leakage. Three additional directions target the object region more precisely by exploiting GDINO bounding boxes to constrain reconstruction to the object itself.
+
+---
+
+### Direction A — Canonical Object Latent Prediction
+
+**Idea.** Crop the FLUX VAE latent at the GDINO bounding box and bilinearly resize to a fixed spatial resolution (16 × 16 patches), producing a *canonical object latent* of shape (16, 16, 16). A TemporalTransformer is trained to predict this canonical latent directly from neural activity. At inference the predicted patch is resized back to the bbox footprint in latent space and pasted into the full init latent before generation.
+
+**Residual formulation.** Because the category-mean latent (average over 45 training variants) explains ~57% of latent variance, the model predicts the *residual* `δ = latent − category_mean` instead of the full latent. This reduces the effective output variance by more than half and gives the model a strong prior for free. At inference: `predicted_latent = category_mean[category] + predicted_δ`.
+
+**Training details.**
+- Target: (16, 16, 16) canonical latent, per-channel whitened on training split
+- Loss: MSE + InfoNCE (weight 0.1) in whitened space
+- Augmentation: Gaussian input noise (σ = 0.05), neuron dropout (10%)
+- Hyperparameter sweep: d\_model ∈ {64, 128}, n\_layers ∈ {1, 2}, lr ∈ {1e-3, 3e-4}, residual ∈ {on, off}
+
+**Integration.** The predicted canonical patch is resized to the bbox extent in FLUX's packed-latent grid and pasted into the init latent. The existing `guidance_mask` mechanism (Section 3) restricts RF correction to the bbox region during generation, so the neural prediction shapes object content while the adapter handles global coherence.
+
+**Limitation.** With 270 training stimuli and a 4096-dimensional target, the regression is underdetermined. Val cosine similarity plateaus at ~0.34 even with regularisation, suggesting this direction benefits from additional structure (see Directions B and C).
+
+---
+
+### Direction B — Category-Mean Conditioned Latent Prediction
+
+**Idea.** Decouple representation learning from latent decoding using a two-module architecture trained jointly:
+
+1. **NeuralEmbedder** — TemporalTransformer producing a compact embedding `e ∈ R^{embed_dim}` from neural activity.
+2. **LatentRefiner** — a 3-layer GELU MLP that receives `[e; proj(cat_mean_flat)]` and outputs the predicted canonical latent.
+
+The category-mean latent is projected to `embed_dim` and concatenated with the neural embedding before the MLP head. This gives the model an explicit latent-space prior: rather than subtracting the mean as a constant (Direction A), the MLP can learn nonlinear interactions between the object prior and the stimulus-specific neural signal.
+
+```
+Neural (N×T)  →  TemporalTransformer  →  embed (embed_dim)
+                                                ↓
+cat_mean (16,16,16)  →  Linear(D→embed_dim)  →  cat_feat
+                                                ↓
+                         concat([embed; cat_feat])
+                                                ↓
+                          MLP (3 layers, GELU)
+                                                ↓
+                         predicted latent (16,16,16)
+```
+
+**Training details.**
+- Same loss, augmentation, and inference-time splicing as Direction A
+- Additional sweep axis: refiner\_hidden ∈ {256, 512}
+- Category conditioning applied in the NeuralEmbedder (learned category embedding added to pooled token)
+
+**Advantage over Direction A.** The category-mean latent is an active input rather than a subtracted constant, allowing the refiner to selectively preserve, amplify, or override spatial regions of the prior based on the neural signal. This is particularly useful for within-category variation (pose, lighting, scale) where the category mean provides accurate coarse structure but incorrect fine detail.
+
+---
+
+### Direction C — SigLIP-Guided Object Bbox Generation
+
+**Idea.** Bypass canonical latent prediction entirely. Instead, use the SigLIP embedding predicted by the MultiHeadTransformer (Stage 1) to guide FLUX generation specifically within the GDINO bounding box, leveraging the already-installed IP-Adapter.
+
+```
+Neural (N×T)
+    ↓
+MultiHeadTransformer (Stage 1, frozen)
+    ↓
+Predicted SigLIP ∈ R^1152
+    ↓  MLPProjModel
+IP-Adapter image tokens
+    ↓  spatially masked to bbox region
+FLUX.1-dev (img2img from category-mean stimulus)
+    ↓
+Reconstruction with object region guided by neural prediction
+```
+
+**Spatial masking.** The IP-Adapter cross-attention contribution is gated by a packed-latent-resolution mask derived from the GDINO bbox (matching the existing `guidance_mask` interface). Attention outside the object region is attenuated (scale → 0), so the predicted SigLIP embedding steers only the object content while the background evolves freely from the init.
+
+**Init image.** The generation starts from the category-mean stimulus (average of 45 training variants for the known category), VAE-encoded and noised to `strength ≈ 0.55`. This provides correct object location and rough shape; the IP-Adapter refines the object's specific appearance based on the neural prediction.
+
+**Advantage over Directions A and B.** No latent regression is required. The hard step of predicting a 4096-dimensional latent from 270 training examples is replaced by leveraging the already-trained SigLIP predictor (~0.5 cosine similarity) and FLUX's native image conditioning pathway. SigLIP embeddings capture within-category variation (different viewpoints of the same object have distinct embeddings), giving a richer per-stimulus prior than the category-mean latent alone.
+
+**Implementation.** The existing `generate_img2img` function already accepts `siglip_embedding` and `guidance_mask` arguments. The only addition needed is a bbox-derived mask passed as `guidance_mask` and spatially restricting `ip_adapter_scale` to the object region.
+
+---
+
+## 5. Deliverables & Evaluation
 
 **Deliverables:**
 1. A trained **MultiHeadTransformer** mapping IT pseudo-population activity to dual (SigLIP + CLIP-short) embedding spaces
@@ -110,7 +192,7 @@ neural r (N×T) ─┤                                                          
 
 ---
 
-## 5. Compute Plan
+## 6. Compute Plan
 
 **Stage 1 (MultiHeadTransformer):** Hyperparameter sweep over d_model, n_layers, shared_dim, nce_weight, and regularisation coefficients, run via SLURM on the Issa Lab cluster inside an Apptainer container. Individual training runs are fast (a few minutes each on GPU). The best configuration is exported to `cache/best_hvm_multihead_config.json` and used for inference.
 
