@@ -13,7 +13,7 @@ At inference:
 Usage:
     python train/train_canonical_latent.py
     python train/train_canonical_latent.py --d-model 256 --n-layers 4 --use-category
-    python train/train_canonical_latent.py --canonical-lat 32
+    python train/train_canonical_latent.py --pca-dim 64 --input-noise 0.05 --neuron-dropout 0.1
 """
 
 import argparse
@@ -42,6 +42,19 @@ from train.train_latent import _load_hvm_neural, _hvm_stratified_split, prepare_
 
 
 # ---------------------------------------------------------------------------
+# Losses
+# ---------------------------------------------------------------------------
+
+def info_nce_loss(pred: torch.Tensor, target: torch.Tensor, temperature: float = 0.07) -> torch.Tensor:
+    """Symmetric InfoNCE (CLIP-style)."""
+    pred_n = F.normalize(pred, dim=-1)
+    tgt_n  = F.normalize(target, dim=-1)
+    logits = (pred_n @ tgt_n.T) / temperature
+    labels = torch.arange(logits.size(0), device=logits.device)
+    return 0.5 * (F.cross_entropy(logits, labels) + F.cross_entropy(logits.T, labels))
+
+
+# ---------------------------------------------------------------------------
 # Data
 # ---------------------------------------------------------------------------
 
@@ -64,6 +77,31 @@ def load_canonical_latents(canonical_lat: int, image_size: int) -> torch.Tensor:
     return latents.float()
 
 
+def fit_pca(lat_train_flat: torch.Tensor, pca_dim: int):
+    """Fit PCA on (N, D) training latents. Returns (components, mean) on CPU."""
+    mean = lat_train_flat.mean(dim=0)          # (D,)
+    X    = lat_train_flat - mean               # centered
+    _, _, Vh = torch.linalg.svd(X, full_matrices=False)
+    components = Vh[:pca_dim]                  # (K, D)
+    var_explained = (torch.linalg.svd(X, full_matrices=False)[1][:pca_dim] ** 2).sum() / \
+                    (torch.linalg.svd(X, full_matrices=False)[1] ** 2).sum()
+    print(f"PCA: keeping {pca_dim} components, "
+          f"variance explained = {var_explained.item():.4f}")
+    return components.cpu(), mean.cpu()
+
+
+def compute_cat_means(latents: torch.Tensor, train_idx: torch.Tensor,
+                      cat_indices: torch.Tensor) -> torch.Tensor:
+    """Category-mean latents (10, C, S, S) computed from training split only."""
+    n_cat = cat_indices.max().item() + 1
+    cat_means = torch.zeros(n_cat, *latents.shape[1:])
+    cat_train = cat_indices[train_idx]
+    for c in range(n_cat):
+        mask = cat_train == c
+        cat_means[c] = latents[train_idx][mask].mean(0)
+    return cat_means
+
+
 def make_loaders(args):
     rsp = _load_hvm_neural()
     neural = torch.from_numpy(rsp).float()                    # (450, N, T)
@@ -78,15 +116,34 @@ def make_loaders(args):
     val_idx   = torch.from_numpy(val_idx_np).long()
     test_idx  = torch.from_numpy(test_idx_np).long()
 
+    # category-mean residual: subtract per-category mean (train-computed) from all latents
+    cat_means = None
+    if args.use_residual:
+        cat_means = compute_cat_means(latents, train_idx, cat_indices)  # (10, 16, S, S)
+        baseline  = cat_means[cat_indices]                               # (450, 16, S, S)
+        latents   = latents - baseline
+        resid_var = latents.var().item()
+        print(f"Residual mode: var={resid_var:.4f} "
+              f"({resid_var / (resid_var + cat_means.var().item() * 10) * 100:.1f}% of original)")
+
     # z-score neural on training split
     neural_train = neural[train_idx]
     neural_mean = neural_train.mean(dim=(0, 2), keepdim=True)
     neural_std  = neural_train.std(dim=(0, 2), keepdim=True).clamp(min=1e-6)
 
-    # per-channel normalization on training split
+    # per-channel normalization on training split (on residuals if use_residual)
     lat_train = latents[train_idx]
     lat_mean  = lat_train.mean(dim=(0, 2, 3))                   # (16,)
     lat_std   = lat_train.std(dim=(0, 2, 3)).clamp(min=1e-6)    # (16,)
+
+    # PCA on whitened training latents (on residuals if use_residual)
+    pca_components = pca_mean = None
+    if args.pca_dim > 0:
+        lat_train_norm = ((lat_train - lat_mean[None,:,None,None])
+                          / lat_std[None,:,None,None]).flatten(1)   # (270, D)
+        pca_components, pca_mean = fit_pca(lat_train_norm, args.pca_dim)
+        out_dim = args.pca_dim
+        print(f"Training in PCA space: out_dim={out_dim} (was {int(np.prod(lat_shape))})")
 
     def make(idx, shuffle):
         if args.use_category:
@@ -108,7 +165,8 @@ def make_loaders(args):
     )
     return (train_loader, val_loader, test_loader,
             n_neurons, n_time, lat_shape, out_dim,
-            neural_mean, neural_std, lat_mean, lat_std)
+            neural_mean, neural_std, lat_mean, lat_std,
+            pca_components, pca_mean, cat_means, cat_indices)
 
 
 # ---------------------------------------------------------------------------
@@ -132,15 +190,31 @@ def normalize_lat(lat, lat_mean, lat_std):
     return (lat - lat_mean[None, :, None, None]) / lat_std[None, :, None, None]
 
 
+def to_pca(flat_norm: torch.Tensor, components: torch.Tensor, pca_mean: torch.Tensor) -> torch.Tensor:
+    """Project whitened flat latent (B, D) → PCA space (B, K)."""
+    return (flat_norm - pca_mean) @ components.T
+
+
+def from_pca(pca_codes: torch.Tensor, components: torch.Tensor, pca_mean: torch.Tensor) -> torch.Tensor:
+    """Invert PCA codes (B, K) → whitened flat latent (B, D)."""
+    return pca_codes @ components + pca_mean
+
+
 # ---------------------------------------------------------------------------
 # Checkpointing
 # ---------------------------------------------------------------------------
 
 def run_name(args):
     cat_tag = "_cat" if args.use_category else ""
+    res_tag = "_res" if args.use_residual else ""
+    pca_tag = f"_pca{args.pca_dim}" if args.pca_dim > 0 else ""
+    in_tag  = f"_in{args.input_noise}" if args.input_noise > 0 else ""
+    nd_tag  = f"_nd{args.neuron_dropout}" if args.neuron_dropout > 0 else ""
+    nce_tag = f"_nw{args.nce_weight}" if args.nce_weight > 0 else ""
     return (f"d{args.d_model}_nh{args.n_heads}_nl{args.n_layers}"
             f"_c{args.canonical_lat}_do{args.dropout}"
-            f"_lr{args.lr}_wd{args.weight_decay}_bs{args.batch_size}{cat_tag}")
+            f"_lr{args.lr}_wd{args.weight_decay}_bs{args.batch_size}"
+            f"{cat_tag}{res_tag}{pca_tag}{in_tag}{nd_tag}{nce_tag}")
 
 
 def run_dir(args):
@@ -149,19 +223,23 @@ def run_dir(args):
 
 def save_checkpoint(path, model, optimizer, scheduler, epoch, metrics, args,
                     lat_shape=None, neural_mean=None, neural_std=None,
-                    lat_mean=None, lat_std=None):
+                    lat_mean=None, lat_std=None, pca_components=None, pca_mean=None,
+                    cat_means=None):
     torch.save({
-        "epoch": epoch,
-        "model_state": model.state_dict(),
+        "epoch":           epoch,
+        "model_state":     model.state_dict(),
         "optimizer_state": optimizer.state_dict(),
         "scheduler_state": scheduler.state_dict(),
-        "metrics": metrics,
-        "args": vars(args),
-        "lat_shape": lat_shape,
-        "neural_mean": neural_mean,
-        "neural_std":  neural_std,
-        "lat_mean":    lat_mean,
-        "lat_std":     lat_std,
+        "metrics":         metrics,
+        "args":            vars(args),
+        "lat_shape":       lat_shape,
+        "neural_mean":     neural_mean,
+        "neural_std":      neural_std,
+        "lat_mean":        lat_mean,
+        "lat_std":         lat_std,
+        "pca_components":  pca_components,
+        "pca_mean":        pca_mean,
+        "cat_means":       cat_means,
     }, path)
 
 
@@ -175,12 +253,20 @@ def train(args):
 
     (train_loader, val_loader, test_loader,
      n_neurons, n_time, lat_shape, out_dim,
-     neural_mean, neural_std, lat_mean, lat_std) = make_loaders(args)
+     neural_mean, neural_std, lat_mean, lat_std,
+     pca_components, pca_mean, cat_means, cat_indices) = make_loaders(args)
 
     neural_mean = neural_mean.to(device)
     neural_std  = neural_std.to(device)
     lat_mean    = lat_mean.to(device)
     lat_std     = lat_std.to(device)
+    use_pca     = pca_components is not None
+    use_res     = cat_means is not None
+    if use_pca:
+        pca_comp_d = pca_components.to(device)
+        pca_mean_d = pca_mean.to(device)
+    if use_res:
+        cat_means_d = cat_means.to(device)   # (10, 16, S, S)
 
     model = build_model(args, n_neurons, n_time, out_dim).to(device)
     print(f"Model params: {sum(p.numel() for p in model.parameters() if p.requires_grad):,}")
@@ -204,6 +290,8 @@ def train(args):
         lat_shape=lat_shape,
         neural_mean=neural_mean.cpu(), neural_std=neural_std.cpu(),
         lat_mean=lat_mean.cpu(),       lat_std=lat_std.cpu(),
+        pca_components=pca_components, pca_mean=pca_mean,
+        cat_means=cat_means,
     )
     best_val_cos = -float("inf")
 
@@ -216,11 +304,26 @@ def train(args):
             cat    = batch[2].to(device) if len(batch) == 3 else None
 
             neural = (neural - neural_mean) / neural_std
-            target = normalize_lat(lat, lat_mean, lat_std).flatten(1)
-            x      = prepare_input(neural, 'transformer')
-            pred   = model(x, cat)
+
+            # input noise + neuron dropout
+            if args.input_noise > 0.0:
+                neural = neural + torch.randn_like(neural) * args.input_noise
+            if args.neuron_dropout > 0.0:
+                mask = (torch.rand(neural.shape[0], 1, neural.shape[2], device=device)
+                        > args.neuron_dropout).float()
+                neural = neural * mask
+
+            flat_norm = normalize_lat(lat, lat_mean, lat_std).flatten(1)
+            target = to_pca(flat_norm, pca_comp_d, pca_mean_d) if use_pca else flat_norm
+
+            x    = prepare_input(neural, 'transformer')
+            pred = model(x, cat)
 
             loss = F.mse_loss(pred, target)
+            if args.nce_weight > 0.0 and pred.size(0) > 1:
+                loss = (1.0 - args.nce_weight) * loss + \
+                       args.nce_weight * info_nce_loss(pred, target, args.nce_temperature)
+
             optimizer.zero_grad()
             loss.backward()
             optimizer.step()
@@ -230,7 +333,7 @@ def train(args):
         scheduler.step()
 
         model.eval()
-        val_mse = 0.0
+        val_loss = 0.0
         all_preds, all_targets = [], []
         with torch.no_grad():
             for batch in val_loader:
@@ -238,23 +341,32 @@ def train(args):
                 lat    = batch[1].to(device).float()
                 cat    = batch[2].to(device) if len(batch) == 3 else None
                 neural = (neural - neural_mean) / neural_std
-                target = normalize_lat(lat, lat_mean, lat_std).flatten(1)
-                x      = prepare_input(neural, 'transformer')
-                pred   = model(x, cat)
-                val_mse += F.mse_loss(pred, target).item()
+                flat_norm = normalize_lat(lat, lat_mean, lat_std).flatten(1)
+                target = to_pca(flat_norm, pca_comp_d, pca_mean_d) if use_pca else flat_norm
+                x    = prepare_input(neural, 'transformer')
+                pred = model(x, cat)
+                val_loss += F.mse_loss(pred, target).item()
                 all_preds.append(pred.cpu())
                 all_targets.append(target.cpu())
 
-        val_mse /= len(val_loader)
+        val_loss /= len(val_loader)
         preds_t   = torch.cat(all_preds)
         targets_t = torch.cat(all_targets)
         val_cos = F.cosine_similarity(preds_t, targets_t, dim=-1).mean().item()
 
+        # report MSE in original whitened space (invert PCA and/or add back category baseline)
+        if use_pca:
+            preds_full   = from_pca(preds_t,   pca_components, pca_mean)
+            targets_full = from_pca(targets_t, pca_components, pca_mean)
+        else:
+            preds_full, targets_full = preds_t, targets_t
+        val_mse_full = F.mse_loss(preds_full, targets_full).item()
         print(f"epoch {epoch:3d}/{args.epochs}  "
-              f"train_mse={train_loss:.6f}  val_mse={val_mse:.6f}  val_cos={val_cos:.4f}")
+              f"train_loss={train_loss:.6f}  val_loss={val_loss:.6f}  "
+              f"val_mse={val_mse_full:.6f}  val_cos={val_cos:.4f}")
 
-        metrics = {"epoch": epoch, "train_mse": train_loss,
-                   "val_mse": val_mse, "val_cos_sim": val_cos}
+        metrics = {"epoch": epoch, "train_loss": train_loss,
+                   "val_loss": val_loss, "val_mse": val_mse_full, "val_cos_sim": val_cos}
         save_checkpoint(ckpt_dir / "last.pt", model, optimizer, scheduler,
                         epoch, metrics, args, **ckpt_kwargs)
         if val_cos > best_val_cos:
@@ -273,16 +385,22 @@ def train(args):
             lat    = batch[1].to(device).float()
             cat    = batch[2].to(device) if len(batch) == 3 else None
             neural = (neural - neural_mean) / neural_std
-            target = normalize_lat(lat, lat_mean, lat_std).flatten(1)
-            x      = prepare_input(neural, 'transformer')
-            pred   = model(x, cat)
+            flat_norm = normalize_lat(lat, lat_mean, lat_std).flatten(1)
+            target = to_pca(flat_norm, pca_comp_d, pca_mean_d) if use_pca else flat_norm
+            x    = prepare_input(neural, 'transformer')
+            pred = model(x, cat)
             test_preds.append(pred.cpu())
             test_targets.append(target.cpu())
 
     tp = torch.cat(test_preds)
     tt = torch.cat(test_targets)
-    test_mse = F.mse_loss(tp, tt).item()
     test_cos = F.cosine_similarity(tp, tt, dim=-1).mean().item()
+    if use_pca:
+        tp_full = from_pca(tp, pca_components, pca_mean)
+        tt_full = from_pca(tt, pca_components, pca_mean)
+    else:
+        tp_full, tt_full = tp, tt
+    test_mse = F.mse_loss(tp_full, tt_full).item()
     print(f"\nTest (N={len(tp)}):  mse={test_mse:.6f}  cos={test_cos:.4f}")
 
     ckpt["test_metrics"] = {"test_mse": test_mse, "test_cos_sim": test_cos}
@@ -295,19 +413,30 @@ def train(args):
 
 def parse_args():
     p = argparse.ArgumentParser()
-    p.add_argument("--use-category",  action="store_true", default=False)
-    p.add_argument("--canonical-lat", type=int,   default=16)
-    p.add_argument("--image-size",    type=int,   default=512)
-    p.add_argument("--d-model",       type=int,   default=128)
-    p.add_argument("--n-heads",       type=int,   default=4)
-    p.add_argument("--n-layers",      type=int,   default=2)
-    p.add_argument("--dropout",       type=float, default=0.1)
-    p.add_argument("--epochs",        type=int,   default=200)
-    p.add_argument("--batch-size",    type=int,   default=32)
-    p.add_argument("--lr",            type=float, default=1e-3)
-    p.add_argument("--weight-decay",  type=float, default=1e-2)
-    p.add_argument("--warmup-frac",   type=float, default=0.1)
-    p.add_argument("--seed",          type=int,   default=SEED)
+    p.add_argument("--use-category",    action="store_true", default=False)
+    p.add_argument("--canonical-lat",   type=int,   default=16)
+    p.add_argument("--image-size",      type=int,   default=512)
+    p.add_argument("--d-model",         type=int,   default=128)
+    p.add_argument("--n-heads",         type=int,   default=4)
+    p.add_argument("--n-layers",        type=int,   default=2)
+    p.add_argument("--dropout",         type=float, default=0.1)
+    p.add_argument("--epochs",          type=int,   default=200)
+    p.add_argument("--batch-size",      type=int,   default=32)
+    p.add_argument("--lr",              type=float, default=1e-3)
+    p.add_argument("--weight-decay",    type=float, default=1e-2)
+    p.add_argument("--warmup-frac",     type=float, default=0.1)
+    p.add_argument("--seed",            type=int,   default=SEED)
+    p.add_argument("--use-residual",    action="store_true", default=False,
+                   help="Predict residual from category-mean latent instead of full latent.")
+    p.add_argument("--pca-dim",         type=int,   default=0,
+                   help="Project targets to top-K PCA components. 0 = disabled.")
+    p.add_argument("--input-noise",     type=float, default=0.0,
+                   help="Gaussian noise std added to neural inputs during training.")
+    p.add_argument("--neuron-dropout",  type=float, default=0.0,
+                   help="Fraction of neurons zeroed per batch during training.")
+    p.add_argument("--nce-weight",      type=float, default=0.0,
+                   help="Weight of InfoNCE loss mixed with MSE. 0 = MSE only.")
+    p.add_argument("--nce-temperature", type=float, default=0.07)
     return p.parse_args()
 
 
