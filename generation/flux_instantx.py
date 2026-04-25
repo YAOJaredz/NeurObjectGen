@@ -124,6 +124,9 @@ class IPAFluxAttnProcessor(nn.Module):
         attention_mask: torch.Tensor | None = None,
         image_rotary_emb: torch.Tensor | None = None,
         image_emb: torch.Tensor | None = None,
+        object_image_emb: torch.Tensor | None = None,
+        object_mask: torch.Tensor | None = None,
+        object_scale: float = 1.0,
     ):
         batch_size = (
             encoder_hidden_states.shape[0] if encoder_hidden_states is not None else hidden_states.shape[0]
@@ -161,6 +164,30 @@ class IPAFluxAttnProcessor(nn.Module):
             )
             ip_hidden_states = ip_hidden_states.to(query.dtype)
 
+        ip_hidden_states_obj = None
+        if object_image_emb is not None and object_mask is not None:
+            obj_k = self.to_k_ip(object_image_emb)
+            obj_v = self.to_v_ip(object_image_emb)
+            obj_k = obj_k.view(batch_size, -1, attn.heads, head_dim).transpose(1, 2)
+            obj_v = obj_v.view(batch_size, -1, attn.heads, head_dim).transpose(1, 2)
+            obj_k = self.norm_added_k(obj_k)
+            # In double-stream blocks encoder_hidden_states is not yet concatenated, so query is
+            # image-only (img_seq_len tokens).  In single-stream blocks the full txt+img sequence
+            # is already in query; we must address only the image tail.
+            img_seq_len = object_mask.shape[1]
+            bbox_idx = object_mask[0, :, 0].bool()          # (img_seq_len,)
+            q_img = query[:, :, -img_seq_len:, :]            # (B, heads, img_seq_len, head_dim)
+            q_bbox = q_img[:, :, bbox_idx, :]                # (B, heads, n_bbox, head_dim)
+            obj_out = F.scaled_dot_product_attention(
+                q_bbox, obj_k, obj_v, dropout_p=0.0, is_causal=False
+            )  # (B, heads, n_bbox, head_dim)
+            # scatter into image-sized zero tensor → reshape to (B, img_seq_len, hidden)
+            obj_full = torch.zeros_like(q_img)               # (B, heads, img_seq_len, head_dim)
+            obj_full[:, :, bbox_idx, :] = obj_out
+            ip_hidden_states_obj = obj_full.transpose(1, 2).reshape(
+                batch_size, -1, attn.heads * head_dim
+            ).to(query.dtype)
+
         if encoder_hidden_states is not None:
             ctx_q = attn.add_q_proj(encoder_hidden_states)
             ctx_k = attn.add_k_proj(encoder_hidden_states)
@@ -194,6 +221,8 @@ class IPAFluxAttnProcessor(nn.Module):
             encoder_out, hidden_states = hidden_states[:, :enc_len], hidden_states[:, enc_len:]
             if ip_hidden_states is not None:
                 hidden_states = hidden_states + self.scale * ip_hidden_states
+            if ip_hidden_states_obj is not None:
+                hidden_states = hidden_states + object_scale * ip_hidden_states_obj
             hidden_states = attn.to_out[0](hidden_states)
             hidden_states = attn.to_out[1](hidden_states)
             encoder_out = attn.to_add_out(encoder_out)
@@ -201,6 +230,12 @@ class IPAFluxAttnProcessor(nn.Module):
 
         if ip_hidden_states is not None:
             hidden_states = hidden_states + self.scale * ip_hidden_states
+        if ip_hidden_states_obj is not None:
+            # single-stream: hidden_states is txt+img; ip_hidden_states_obj covers img tokens only
+            img_len = ip_hidden_states_obj.shape[1]
+            hidden_states[:, -img_len:] = (
+                hidden_states[:, -img_len:] + object_scale * ip_hidden_states_obj
+            )
         return hidden_states
 
 
@@ -569,6 +604,10 @@ def generate_img2img(
     guidance_scale: float = 3.5,
     ip_adapter_scale: float = 1.0,
     ip_adapter_schedule: dict[str, float] | None = None,
+    object_siglip_embedding: torch.Tensor | None = None,
+    object_ip_scale: float = 1.0,
+    object_ip_schedule: dict[str, float] | None = None,
+    object_mask: torch.Tensor | None = None,
     use_rf_inversion: bool = False,
     rf_gamma: float = 0.0,
     rf_eta: float = 0.15,
@@ -636,6 +675,10 @@ def generate_img2img(
         set_ip_adapter_scale(pipe, ip_adapter_scale)
 
     image_emb = _siglip_to_image_emb(image_proj, siglip_embedding, device, dtype)
+
+    object_image_emb = None
+    if object_siglip_embedding is not None:
+        object_image_emb = _siglip_to_image_emb(image_proj, object_siglip_embedding, device, dtype)
 
     if prompt_embeds is not None:
         # Pre-computed path: move to device/dtype, derive text_ids from seq length.
@@ -715,12 +758,16 @@ def generate_img2img(
             f"mask seq {aperture_mask.shape[1]} != latent seq {init_latent_packed.shape[1]}"
         )
 
+    if object_mask is not None:
+        object_mask = object_mask.to(device=device, dtype=dtype)
+
     # Aperture compositing re-noises the init latent at each step; RF path needs
     # a fresh noise tensor since scale_noise is not called during init.
     if use_rf_inversion:
         noise = torch.randn(init_latent_packed.shape, dtype=dtype, device=device, generator=generator)
 
     guidance = torch.full([1], guidance_scale, device=device, dtype=dtype)
+    effective_object_scale = object_ip_scale
 
     iterator = tqdm(enumerate(timesteps), total=len(timesteps)) if show_progress else enumerate(timesteps)
     for step_idx, t in iterator:
@@ -735,6 +782,15 @@ def generate_img2img(
                 scale = ip_adapter_schedule.get("low", ip_adapter_scale)
             set_ip_adapter_scale(pipe, scale)
 
+        if object_ip_schedule is not None:
+            t_frac = t.item() / 1000.0
+            if t_frac > 0.7:
+                effective_object_scale = object_ip_schedule.get("high", object_ip_scale)
+            elif t_frac > 0.4:
+                effective_object_scale = object_ip_schedule.get("mid", object_ip_scale)
+            else:
+                effective_object_scale = object_ip_schedule.get("low", object_ip_scale)
+
         t_input = torch.as_tensor(t, device=device).expand(latents.shape[0]).to(latents.dtype)
         noise_pred = pipe.transformer(
             hidden_states=latents,
@@ -744,7 +800,12 @@ def generate_img2img(
             pooled_projections=pooled_embeds,
             txt_ids=text_ids,
             img_ids=latent_image_ids,
-            joint_attention_kwargs={"image_emb": image_emb},
+            joint_attention_kwargs={
+                "image_emb": image_emb,
+                "object_image_emb": object_image_emb,
+                "object_mask": object_mask,
+                "object_scale": effective_object_scale,
+            },
             return_dict=False,
         )[0]
 
