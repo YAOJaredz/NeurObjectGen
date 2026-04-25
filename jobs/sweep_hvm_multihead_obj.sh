@@ -7,7 +7,7 @@
 #SBATCH --chdir=/home/yy3658/NeurObjectGen
 #SBATCH --ntasks=1
 #SBATCH --cpus-per-task=4
-#SBATCH --mem=32gb
+#SBATCH --mem=48gb
 #SBATCH --gres=gpu:1
 #SBATCH --time=0-02:00:00
 #SBATCH --partition=issa
@@ -68,9 +68,11 @@ $PYTHON train/train_multihead_obj.py \
     --epochs        200 \
     --batch-size    64 \
     --warmup-frac   0.1 \
-    --nce-weight    0.8 \
+    --nce-weight    0.1 \
     --nce-temperature 0.07 \
     --target-noise  0.02 \
     --input-noise   0.05 \
     --neuron-dropout 0.1 \
-    --uniformity-weight 0.1
+    --uniformity-weight 0.1 \
+    --loss-weight-siglip 5.0 \
+    --loss-weight-clip   1.0
