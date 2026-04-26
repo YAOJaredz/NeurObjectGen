@@ -199,13 +199,13 @@ def main(stim_limit):
             ip_adapter_scale=0.0, pooled_prompt_embeds=clip_cat, **full_base)
         f_neural = generate_img2img(
             pipe, image_proj, orig, neural_pred_sig[stim_idx],
-            ip_adapter_scale=0.25,
+            ip_adapter_scale=0.5,
             object_siglip_embedding=neural_pred_sig_obj[stim_idx],
             object_ip_scale=OBJ_SCALE, object_mask=obj_mask,
             pooled_prompt_embeds=neural_pred_clip[stim_idx].unsqueeze(0), **full_base)
         f_gt = generate_img2img(
             pipe, image_proj, orig, siglip_gt[stim_idx],
-            ip_adapter_scale=0.25,
+            ip_adapter_scale=0.5,
             object_siglip_embedding=siglip_obj_gt[stim_idx],
             object_ip_scale=OBJ_SCALE, object_mask=obj_mask,
             pooled_prompt_embeds=clip_cat, **full_base)
