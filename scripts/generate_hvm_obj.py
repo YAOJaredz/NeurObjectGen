@@ -28,7 +28,7 @@ from config_const import (
 from data_utils.hvm_loader import _category_stratified_split, _load_hvm_neural
 from encoders import MultiHeadTransformer
 from generation.flux_instantx import load_pipeline, generate_img2img, encode_text_embeds
-from generation.aperture import build_object_region_mask
+from generation.aperture import build_object_region_mask, load_hvm_packed_aperture_mask
 from generation.project_hvm import load_hvm_bboxes
 from get_device import get_device
 
@@ -152,9 +152,10 @@ def main(stim_limit):
 
     # ── FLUX pipeline ─────────────────────────────────────────────────────────
     pipe, image_proj = load_pipeline(device=device, default_scale=1.0)
+    hvm_aperture = load_hvm_packed_aperture_mask(image_size=IMAGE_SIZE, device='cpu', dtype=torch.bfloat16)
 
     cat_clip_embeds, cat_t5_embeds = encode_text_embeds(pipe, list(HVM_CATEGORIES))
-    null_clip, null_t5 = encode_text_embeds(pipe, [''])
+    _, null_t5 = encode_text_embeds(pipe, [''])
     zero_siglip = torch.zeros(SIGLIP_DIM)
     zero_t5     = null_t5
 
@@ -181,49 +182,54 @@ def main(stim_limit):
 
         full_base = dict(
             height=IMAGE_SIZE, width=IMAGE_SIZE, num_inference_steps=NUM_STEPS,
-            guidance_scale=7.5, strength=STRENGTH, seed=42,
-            aperture_composite=True, show_progress=False, prompt_embeds=zero_t5,
+            guidance_scale=3.5, strength=STRENGTH, seed=i,
+            aperture_mask=hvm_aperture, show_progress=False,
         )
         crop_base = dict(
             height=IMAGE_SIZE, width=IMAGE_SIZE, num_inference_steps=NUM_STEPS,
-            guidance_scale=7.5, strength=OBJ_STRENGTH, seed=42,
-            aperture_composite=False, show_progress=False, prompt_embeds=zero_t5,
+            guidance_scale=3.5, strength=OBJ_STRENGTH, seed=i,
+            aperture_composite=False, show_progress=False,
         )
 
         # full-image conditions
         f_control = generate_img2img(
             pipe, image_proj, orig, zero_siglip,
-            ip_adapter_scale=0.0, pooled_prompt_embeds=null_clip, **full_base)
+            ip_adapter_scale=0.0, prompt='', **full_base)
         f_text = generate_img2img(
             pipe, image_proj, orig, zero_siglip,
-            ip_adapter_scale=0.0, pooled_prompt_embeds=clip_cat, **full_base)
+            ip_adapter_scale=0.0,
+            prompt_embeds=zero_t5, pooled_prompt_embeds=clip_cat, **full_base)
         f_neural = generate_img2img(
             pipe, image_proj, orig, neural_pred_sig[stim_idx],
-            ip_adapter_scale=0.5,
+            ip_adapter_scale=0.25,
             object_siglip_embedding=neural_pred_sig_obj[stim_idx],
             object_ip_scale=OBJ_SCALE, object_mask=obj_mask,
+            prompt_embeds=zero_t5,
             pooled_prompt_embeds=neural_pred_clip[stim_idx].unsqueeze(0), **full_base)
         f_gt = generate_img2img(
             pipe, image_proj, orig, siglip_gt[stim_idx],
-            ip_adapter_scale=0.5,
+            ip_adapter_scale=0.25,
             object_siglip_embedding=siglip_obj_gt[stim_idx],
             object_ip_scale=OBJ_SCALE, object_mask=obj_mask,
-            pooled_prompt_embeds=clip_cat, **full_base)
+            prompt_embeds=zero_t5, pooled_prompt_embeds=clip_cat, **full_base)
 
         # obj-crop conditions
         c_control = generate_img2img(
             pipe, image_proj, crop_pil, zero_siglip,
-            ip_adapter_scale=0.0, pooled_prompt_embeds=null_clip, **crop_base)
+            ip_adapter_scale=0.0, prompt='', **crop_base)
         c_text = generate_img2img(
             pipe, image_proj, crop_pil, zero_siglip,
-            ip_adapter_scale=0.0, pooled_prompt_embeds=clip_cat, **crop_base)
+            ip_adapter_scale=0.0,
+            prompt_embeds=zero_t5, pooled_prompt_embeds=clip_cat, **crop_base)
         c_neural = generate_img2img(
             pipe, image_proj, crop_pil, neural_pred_sig_obj[stim_idx],
             ip_adapter_scale=IP_SCALE,
+            prompt_embeds=zero_t5,
             pooled_prompt_embeds=neural_pred_clip[stim_idx].unsqueeze(0), **crop_base)
         c_gt = generate_img2img(
             pipe, image_proj, crop_pil, siglip_obj_gt[stim_idx],
             ip_adapter_scale=IP_SCALE,
+            prompt_embeds=zero_t5,
             pooled_prompt_embeds=clip_gt[stim_idx].unsqueeze(0), **crop_base)
 
         add_labels([orig, f_control, f_text, f_neural, f_gt], full_labels).save(
