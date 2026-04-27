@@ -18,7 +18,7 @@ We address this using Neuropixels 1.0 recordings from primate IT cortex during p
 
 We collect neural responses with Neuropixels 1.0 probes across multiple sessions from primate IT cortex during passive viewing of the 450-image HVM stimulus set (10 object categories × 45 variations each). Neural responses are pooled across sessions to form a pseudo-population. The goal is to reconstruct the perceived image from population activity.
 
-Formally, we seek a mapping **f : r → (ẑ_sig, ẑ_clip)**, where **r ∈ R^(N×T)** is the neural response (N channels from the pooled pseudo-population, T time points after stimulus presentation), **ẑ_sig ∈ R^1152** is a predicted SigLIP image embedding, and **ẑ_clip ∈ R^768** is a predicted CLIP-short embedding. Both condition a pretrained image generation model to produce a reconstruction **x̂** of the original stimulus **x**.
+Formally, we train two decoders **f_global** and **f_obj**, each mapping the same neural response **r ∈ R^(N×T)** to dual embedding targets. **f_global** targets full-image embeddings: **ẑ_sig_global ∈ R^1152** (SigLIP-SO400M of the full stimulus) and **ẑ_clip ∈ R^768** (CLIP-short). **f_obj** targets object-crop embeddings: **ẑ_sig_obj ∈ R^1152** (SigLIP-SO400M of the GDINO-cropped object region). Both SigLIP predictions condition a pretrained image generation model — the global embedding shapes overall scene coherence and the object embedding steers the object region specifically — to produce a reconstruction **x̂** of the original stimulus **x**.
 
 Stimuli are split by category-stratified sampling into train/validation/test sets (270/90/90), ensuring each category is proportionally represented across splits.
 
@@ -26,9 +26,9 @@ Stimuli are split by category-stratified sampling into train/validation/test set
 
 ## 3. Approach
 
-### Stage 1 — Neural Encoder (MultiHeadTransformer)
+### Stage 1 — Neural Encoders (MultiHeadTransformer × 2)
 
-A single **MultiHeadTransformer** maps the neural pseudo-population response to dual embedding targets simultaneously: SigLIP-SO400M (1152-d) and CLIP-short (768-d). The architecture consists of:
+Two **MultiHeadTransformer** models are trained independently on the same neural data but with different SigLIP targets. The **global model** targets full-image SigLIP and CLIP-short embeddings; the **object model** targets SigLIP embeddings extracted from the GDINO-cropped object region (512 × 512 PIL crop, SigLIP-SO400M encoded). Both share the same architecture:
 
 - **Input projection:** LayerNorm over neurons, then a linear projection to a d_model-dimensional token embedding for each time step
 - **CLS token + positional embeddings** prepended to the time-step sequence
@@ -45,7 +45,7 @@ L = w_sig * head_loss(ẑ_sig, z_sig) + w_clip * head_loss(ẑ_clip, z_clip) + w
 head_loss = nce_weight * L_InfoNCE + (1 − nce_weight) * L_cos
 ```
 
-Hyperparameters (d_model, n_layers, shared_dim, nce_weight, and others) are swept on the Issa Lab SLURM cluster; the best configuration is selected by mean validation cosine similarity `(cos_siglip + cos_clip) / 2` and saved for inference.
+Hyperparameters (d_model, n_layers, shared_dim, nce_weight, and others) are swept on the Issa Lab SLURM cluster; the best configuration for each model is selected by mean validation cosine similarity `(cos_siglip + cos_clip) / 2` and saved for inference. Because object-crop SigLIP embeddings are more view- and scale-sensitive than full-image embeddings, the object model is encouraged to capture stimulus-specific pose and appearance rather than global scene statistics.
 
 ### Stage 2 — Pretrained IP-Adapter (InstantX/FLUX.1-dev-IP-Adapter)
 
@@ -57,44 +57,48 @@ HVM-specific generation details:
 
 - **Init latent:** the ground-truth stimulus image at 512 × 512 is VAE-encoded and noised to a configurable `strength` (0.55), so the generator begins from a perturbed version of the original stimulus
 - **Per-step aperture compositing:** at every scheduler step, latents inside the circular HVM stimulus aperture are updated by the adapter-conditioned transformer while latents outside are pinned to a re-noised copy of the original init latent, using a soft mask downsampled to FLUX's packed-latent grid (each position covers a 16 × 16 pixel block)
-- **Text conditioning:** instead of per-image captions, T5 and CLIP text embeddings are pre-computed for each of the 10 HVM category names and reused for all stimuli within a category. In practice, the T5 embeddings are zeroed out and only the CLIP pooled embedding varies by condition (see below)
+- **Dual IP-Adapter slots:** two SigLIP embeddings condition the adapter simultaneously. The **global slot** (`ip_adapter_scale=0.5`) injects ẑ_sig_global uniformly over all packed-latent positions. The **object slot** (`ip_adapter_scale=0.75`) injects ẑ_sig_obj only within the bbox-derived packed-latent mask, so the higher scale steers only the object footprint while the background evolves from the global signal alone
+- **Object-crop generation:** a separate img2img pass operates directly on the GDINO bbox crop resized to 512 × 512, with `aperture_composite=False` and `strength=0.75`. The generator refines object appearance conditioned on ẑ_sig_obj at full scale (`ip_adapter_scale=1.0`), providing an independent, background-free view of the reconstructed object
+- **Text conditioning:** T5 embeddings are zeroed out. The CLIP pooled embedding is predicted by the object model (ẑ_clip), providing stimulus-specific global context beyond the category name
 
 ### Comparison Conditions
 
 Four conditions are compared on the 90 held-out test stimuli to isolate the contribution of each signal:
 
-| # | Condition | T5 | CLIP pooled | SigLIP (IP-adapter) |
-|---|-----------|-----|-------------|---------------------|
-| 1 | **Control** | null | null | disabled (scale=0) |
-| 2 | **Text (cat CLIP)** | zeroed | category-name CLIP | disabled (scale=0) |
-| 3 | **Neural pred** | zeroed | predicted CLIP-short | predicted SigLIP (scale=1.0) |
-| 4 | **GT emb (↑)** | zeroed | category-name CLIP | GT SigLIP (scale=1.0) |
+| # | Condition | T5 | CLIP pooled | Global SigLIP (scale=0.5) | Object SigLIP (scale=0.75, bbox) |
+|---|-----------|-----|-------------|---------------------------|----------------------------------|
+| 1 | **Control** | null | null | disabled | disabled |
+| 2 | **Text (cat CLIP)** | zeroed | category-name CLIP | disabled | disabled |
+| 3 | **Neural pred (global+obj)** | zeroed | ẑ_clip (obj model) | ẑ_sig_global | ẑ_sig_obj |
+| 4 | **GT emb (↑)** | zeroed | category-name CLIP | GT SigLIP (full) | GT SigLIP (crop) |
 
-The **control** condition establishes the img2img baseline with no semantic conditioning. **Text (cat CLIP)** adds category-level semantic information via the CLIP pooled embedding of the category name. **Neural pred** replaces text-derived embeddings with the decoded neural predictions from Stage 1, adding stimulus-specific visual information via the SigLIP IP-adapter. **GT emb** uses the ground-truth SigLIP embedding and serves as the upper bound on reconstruction quality achievable by the generator given perfect visual embeddings.
+The **control** condition establishes the img2img baseline with no semantic conditioning. **Text (cat CLIP)** adds category-level semantic information via the CLIP pooled embedding of the category name. **Neural pred** uses both decoders: the global model contributes ẑ_sig_global at full-image scale and the object model contributes ẑ_sig_obj gated to the bbox region, with ẑ_clip providing stimulus-specific CLIP conditioning. **GT emb** uses ground-truth embeddings from both full-image and cropped SigLIP and serves as the upper bound on reconstruction quality.
 
 ### Inference Pipeline
 
 ```
-                ┌── CLIP head ──▶ ẑ_clip ∈ R^768  ──────────────────▶ CLIP pooled
-neural r (N×T) ─┤                                                            │
-                └── SigLIP head ──▶ ẑ_sig ∈ R^1152 ──MLPProj──▶ image_emb  │
-                                                                      │      │
-                                              zero T5 ──────────────────────▶│
-                                                                      │      │
-                                                                      ▼      ▼
-                                    FLUX.1-dev + per-block IPAFluxAttnProcessor
-                                                                      │
-                                                          aperture compositing
-                                                                      │
-                                                                      ▼
-                                                                reconstruction x̂
+                ┌─ global model ─┬── SigLIP head ──▶ ẑ_sig_global ──MLPProj──▶ global slot (scale=0.5, full)
+neural r (N×T) ─┤                └── CLIP head ─────▶ (unused)                        │
+                │                                                                      │
+                └─ object model ─┬── SigLIP head ──▶ ẑ_sig_obj ───MLPProj──▶ object slot (scale=0.75, bbox mask)
+                                 └── CLIP head ─────▶ ẑ_clip ──────────────▶ CLIP pooled
+                                                                                       │
+                                                              zero T5 ─────────────────┤
+                                                                                       ▼
+                                               FLUX.1-dev + per-block IPAFluxAttnProcessor
+                                                                                       │
+                                                                     aperture compositing
+                                                                                       │
+                                                                    ┌──────────────────┴──────────────────┐
+                                                                    ▼                                     ▼
+                                                        full reconstruction x̂              obj-crop reconstruction x̂_obj
 ```
 
 ---
 
 ## 4. Object-Specific Reconstruction Directions
 
-The main pipeline (Section 3) conditions generation on global image embeddings and applies a soft aperture mask to suppress background leakage. Three additional directions target the object region more precisely by exploiting GDINO bounding boxes to constrain reconstruction to the object itself.
+The main pipeline (Section 3) already incorporates object-specific SigLIP conditioning via the object model and bbox-masked IP-Adapter slot. Two additional directions target the object region via direct latent prediction, exploiting GDINO bounding boxes to constrain reconstruction to the object itself.
 
 ---
 
@@ -112,7 +116,7 @@ The main pipeline (Section 3) conditions generation on global image embeddings a
 
 **Integration.** The predicted canonical patch is resized to the bbox extent in FLUX's packed-latent grid and pasted into the init latent. The existing `guidance_mask` mechanism (Section 3) restricts RF correction to the bbox region during generation, so the neural prediction shapes object content while the adapter handles global coherence.
 
-**Limitation.** With 270 training stimuli and a 4096-dimensional target, the regression is underdetermined. Val cosine similarity plateaus at ~0.34 even with regularisation, suggesting this direction benefits from additional structure (see Directions B and C).
+**Limitation.** With 270 training stimuli and a 4096-dimensional target, the regression is underdetermined. Val cosine similarity plateaus at ~0.34 even with regularisation, suggesting this direction benefits from additional structure (see Direction B).
 
 ---
 
@@ -146,40 +150,12 @@ cat_mean (16,16,16)  →  Linear(D→embed_dim)  →  cat_feat
 
 ---
 
-### Direction C — SigLIP-Guided Object Bbox Generation
-
-**Idea.** Bypass canonical latent prediction entirely. Instead, use the SigLIP embedding predicted by the MultiHeadTransformer (Stage 1) to guide FLUX generation specifically within the GDINO bounding box, leveraging the already-installed IP-Adapter.
-
-```
-Neural (N×T)
-    ↓
-MultiHeadTransformer (Stage 1, frozen)
-    ↓
-Predicted SigLIP ∈ R^1152
-    ↓  MLPProjModel
-IP-Adapter image tokens
-    ↓  spatially masked to bbox region
-FLUX.1-dev (img2img from category-mean stimulus)
-    ↓
-Reconstruction with object region guided by neural prediction
-```
-
-**Spatial masking.** The IP-Adapter cross-attention contribution is gated by a packed-latent-resolution mask derived from the GDINO bbox (matching the existing `guidance_mask` interface). Attention outside the object region is attenuated (scale → 0), so the predicted SigLIP embedding steers only the object content while the background evolves freely from the init.
-
-**Init image.** The generation starts from the category-mean stimulus (average of 45 training variants for the known category), VAE-encoded and noised to `strength ≈ 0.55`. This provides correct object location and rough shape; the IP-Adapter refines the object's specific appearance based on the neural prediction.
-
-**Advantage over Directions A and B.** No latent regression is required. The hard step of predicting a 4096-dimensional latent from 270 training examples is replaced by leveraging the already-trained SigLIP predictor (~0.5 cosine similarity) and FLUX's native image conditioning pathway. SigLIP embeddings capture within-category variation (different viewpoints of the same object have distinct embeddings), giving a richer per-stimulus prior than the category-mean latent alone.
-
-**Implementation.** The existing `generate_img2img` function already accepts `siglip_embedding` and `guidance_mask` arguments. The only addition needed is a bbox-derived mask passed as `guidance_mask` and spatially restricting `ip_adapter_scale` to the object region.
-
----
-
 ## 5. Deliverables & Evaluation
 
 **Deliverables:**
-1. A trained **MultiHeadTransformer** mapping IT pseudo-population activity to dual (SigLIP + CLIP-short) embedding spaces
-2. An inference wrapper around the pretrained InstantX/FLUX.1-dev-IP-Adapter with HVM-specific aperture compositing and category-name text conditioning
-3. Per-stimulus reconstruction outputs across all four conditions for the 90 held-out test stimuli (saved as labeled PNG composites)
+1. Two trained **MultiHeadTransformer** models: a global model targeting full-image SigLIP + CLIP-short, and an object model targeting bbox-crop SigLIP + CLIP-short
+2. An inference wrapper around the pretrained InstantX/FLUX.1-dev-IP-Adapter with HVM-specific aperture compositing, dual-slot SigLIP conditioning, and object-crop generation
+3. Per-stimulus reconstruction outputs across all four conditions for the 90 held-out test stimuli — both full-image and object-crop views saved as labeled PNG composites
 4. A systematic comparison of all four conditions on quantitative metrics
 
 **Evaluation:** Fixed category-stratified 270/90/90 train/val/test split. Metrics:
@@ -194,7 +170,7 @@ Reconstruction with object region guided by neural prediction
 
 ## 6. Compute Plan
 
-**Stage 1 (MultiHeadTransformer):** Hyperparameter sweep over d_model, n_layers, shared_dim, nce_weight, and regularisation coefficients, run via SLURM on the Issa Lab cluster inside an Apptainer container. Individual training runs are fast (a few minutes each on GPU). The best configuration is exported to `cache/best_hvm_multihead_config.json` and used for inference.
+**Stage 1 (MultiHeadTransformer × 2):** Hyperparameter sweep over d_model, n_layers, shared_dim, nce_weight, and regularisation coefficients, run via SLURM on the Issa Lab cluster inside an Apptainer container. Individual training runs are fast (a few minutes each on GPU). The global model is exported to `cache/best_hvm_multihead_config.json` and the object model to `cache/best_hvm_multihead_obj_config.json`.
 
 **Stage 2 (IP-Adapter):** Inference only — no gradient updates. Requires GPU memory for the frozen FLUX.1-dev transformer (~24 GB bf16) plus the pretrained InstantX adapter weights. Generating 90 test stimuli × 4 conditions takes on the order of a few GPU-hours.
 
