@@ -181,12 +181,12 @@ def main(stim_limit):
 
         full_base = dict(
             height=IMAGE_SIZE, width=IMAGE_SIZE, num_inference_steps=NUM_STEPS,
-            guidance_scale=3.5, strength=STRENGTH, seed=42,
+            guidance_scale=7.5, strength=STRENGTH, seed=42,
             aperture_composite=True, show_progress=False, prompt_embeds=zero_t5,
         )
         crop_base = dict(
             height=IMAGE_SIZE, width=IMAGE_SIZE, num_inference_steps=NUM_STEPS,
-            guidance_scale=3.5, strength=OBJ_STRENGTH, seed=42,
+            guidance_scale=7.5, strength=OBJ_STRENGTH, seed=42,
             aperture_composite=False, show_progress=False, prompt_embeds=zero_t5,
         )
 
