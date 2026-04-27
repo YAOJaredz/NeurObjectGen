@@ -78,7 +78,7 @@ The **control** condition establishes the img2img baseline with no semantic cond
 
 ```
                 ┌─ global model ─┬── SigLIP head ──▶ ẑ_sig_global ──MLPProj──▶ global slot (scale=0.5, full)
-neural r (N×T) ─┤                └── CLIP head ─────▶ (unused)                        │
+neural r (N×T) ─┤                └── CLIP head ─────▶ (unused)                         │
                 │                                                                      │
                 └─ object model ─┬── SigLIP head ──▶ ẑ_sig_obj ───MLPProj──▶ object slot (scale=0.75, bbox mask)
                                  └── CLIP head ─────▶ ẑ_clip ──────────────▶ CLIP pooled
