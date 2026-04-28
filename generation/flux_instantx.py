@@ -846,3 +846,103 @@ def generate_img2img(
 
     latents = pipe._unpack_latents(latents, height, width, pipe.vae_scale_factor)
     return decode_latent(pipe, latents)
+
+
+def generate_obj_sequential(
+    pipe: FluxPipeline,
+    image_proj: MLPProjModel,
+    orig: Image.Image,
+    bbox: dict,
+    obj_siglip: torch.Tensor,
+    global_siglip: torch.Tensor,
+    *,
+    obj_ip_scale: float = 1.0,
+    global_ip_scale: float = 1.0,
+    bbox_preserve: float = 0.7,
+    strength: float = 0.6,
+    num_inference_steps: int = 20,
+    guidance_scale: float = 3.5,
+    prompt_embeds: torch.Tensor | None = None,
+    pooled_prompt_embeds: torch.Tensor | None = None,
+    aperture_mask: torch.Tensor | None = None,
+    image_size: int = 512,
+    bbox_src: int = 276,
+    seed: int = 0,
+    show_progress: bool = False,
+) -> Image.Image:
+    """Two-stage object-then-global sequential reconstruction.
+
+    Pass 1: Crop the bbox region from ``orig``, run img2img with ``obj_siglip``
+    (no aperture compositing), then pixel-paste the result back onto ``orig``.
+
+    Pass 2: Run img2img on the pasted image with ``global_siglip`` and the
+    provided aperture mask.  After decoding, blend the pass-1 bbox back in at
+    ``bbox_preserve`` weight (inside bbox ∩ aperture), then hard-enforce the
+    aperture boundary so pixels outside the circle are always the original.
+
+    Args:
+        bbox: dict with keys ``cx``, ``cy``, ``half`` in ``bbox_src`` pixel coords.
+        bbox_preserve: fraction [0, 1] of pass-1 bbox kept in the final output.
+            0 = pass-2 fully overrides the bbox; 1 = pass-1 bbox frozen.
+        aperture_mask: packed-latent mask ``(1, seq_len, 1)`` for pass-2
+            compositing.  If None, pass-2 runs with default aperture compositing.
+    """
+    import numpy as np
+    from config_const import HVM_RADIUS_FRAC, HVM_CENTER_FRAC
+
+    pad = 5
+    scale = image_size / bbox_src
+    x0 = max(0, int((bbox['cx'] - bbox['half']) * scale - pad))
+    y0 = max(0, int((bbox['cy'] - bbox['half']) * scale - pad))
+    x1 = min(image_size, int((bbox['cx'] + bbox['half']) * scale + pad))
+    y1 = min(image_size, int((bbox['cy'] + bbox['half']) * scale + pad))
+
+    shared = dict(
+        height=image_size, width=image_size,
+        num_inference_steps=num_inference_steps,
+        guidance_scale=guidance_scale,
+        strength=strength, seed=seed,
+        prompt_embeds=prompt_embeds,
+        pooled_prompt_embeds=pooled_prompt_embeds,
+        show_progress=show_progress,
+    )
+
+    # Pass 1: generate bbox crop only
+    crop = orig.crop((x0, y0, x1, y1)).resize((image_size, image_size), Image.LANCZOS)
+    gen_crop = generate_img2img(
+        pipe, image_proj, crop, obj_siglip,
+        ip_adapter_scale=obj_ip_scale,
+        aperture_composite=False,
+        **shared)
+
+    # Paste generated crop back onto original at bbox coordinates
+    inter = orig.copy()
+    inter.paste(gen_crop.resize((x1 - x0, y1 - y0), Image.LANCZOS), (x0, y0))
+
+    # Pass 2: global generation from pasted image
+    gen_global = generate_img2img(
+        pipe, image_proj, inter, global_siglip,
+        ip_adapter_scale=global_ip_scale,
+        aperture_composite=(aperture_mask is None),
+        aperture_mask=aperture_mask,
+        **shared)
+
+    # Pixel-resolution aperture mask for hard boundary enforcement
+    cy = cx = image_size / 2 + HVM_CENTER_FRAC * image_size
+    r  = HVM_RADIUS_FRAC * image_size
+    yy, xx = np.mgrid[:image_size, :image_size].astype(np.float32)
+    apt_px = ((yy - cy) ** 2 + (xx - cx) ** 2 <= r ** 2).astype(np.float32)[:, :, None]
+
+    arr_g = np.array(gen_global, dtype=np.float32)
+    arr_i = np.array(inter,      dtype=np.float32)
+    arr_o = np.array(orig,       dtype=np.float32)
+
+    # Blend pass-1 bbox into pass-2 inside bbox ∩ aperture
+    weight = np.zeros((image_size, image_size, 1), dtype=np.float32)
+    weight[y0:y1, x0:x1] = bbox_preserve
+    weight *= apt_px  # aperture takes priority — no blend outside circle
+
+    blended = weight * arr_i + (1 - weight) * arr_g
+    # hard-enforce aperture: outside circle always uses original pixels
+    result = apt_px * blended + (1 - apt_px) * arr_o
+    return Image.fromarray(result.clip(0, 255).astype(np.uint8))

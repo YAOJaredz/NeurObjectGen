@@ -27,18 +27,18 @@ from config_const import (
 )
 from data_utils.hvm_loader import _category_stratified_split, _load_hvm_neural
 from encoders import MultiHeadTransformer
-from generation.flux_instantx import load_pipeline, generate_img2img, encode_text_embeds
+from generation.flux_instantx import load_pipeline, generate_img2img, generate_obj_sequential, encode_text_embeds
 from generation.aperture import build_object_region_mask, load_hvm_packed_aperture_mask
 from generation.project_hvm import load_hvm_bboxes
 from get_device import get_device
 
-STRENGTH     = 0.55
-OBJ_STRENGTH = 0.75
-IP_SCALE     = 1.0
-OBJ_SCALE    = 0.75
-NUM_STEPS    = 20
-IMAGE_SIZE   = 512
-BBOX_SRC     = 276
+STRENGTH      = 0.6
+OBJ_STRENGTH  = 0.75
+IP_SCALE      = 1.0
+BBOX_PRESERVE = 0.3   # pass-1 bbox retention in sequential condition (0=free, 1=frozen)
+NUM_STEPS     = 20
+IMAGE_SIZE    = 512
+BBOX_SRC      = 276
 
 LABEL_H = 36
 
@@ -169,15 +169,22 @@ def main(stim_limit):
     full_dir.mkdir(parents=True, exist_ok=True)
     crop_dir.mkdir(parents=True, exist_ok=True)
 
-    full_labels = ['Original', 'Control\n(null)', 'Text\n(cat CLIP)', 'Neural pred\n(global+obj)', 'GT emb\n(global+obj ↑)']
+    full_labels = ['Original', 'Control\n(null)', 'Text\n(cat CLIP)', 'Neural pred\n(sequential)', 'GT emb\n(sequential ↑)']
     crop_labels = ['Crop',     'Control\n(null)', 'Text\n(cat CLIP)', 'Neural pred\n(obj)',         'GT emb\n(obj ↑)']
+
+    seq_shared = dict(
+        strength=STRENGTH, num_inference_steps=NUM_STEPS, guidance_scale=3.5,
+        bbox_preserve=BBOX_PRESERVE, image_size=IMAGE_SIZE, bbox_src=BBOX_SRC,
+        aperture_mask=hvm_aperture, show_progress=False,
+        prompt_embeds=zero_t5,
+    )
 
     for i, stim_idx in enumerate(tqdm(
         (int(s) for s in test_idx), desc='Saving', total=len(test_idx)
     )):
         orig     = load_stimulus(stim_idx)
-        obj_mask = get_object_mask(stim_idx, bboxes)
         crop_pil = get_crop(stim_idx, orig, bboxes)
+        bbox     = bboxes[stim_idx]
         _, clip_cat = cat_text_embeds(stim_idx)
 
         full_base = dict(
@@ -199,19 +206,20 @@ def main(stim_limit):
             pipe, image_proj, orig, zero_siglip,
             ip_adapter_scale=0.0,
             prompt_embeds=zero_t5, pooled_prompt_embeds=clip_cat, **full_base)
-        f_neural = generate_img2img(
-            pipe, image_proj, orig, neural_pred_sig[stim_idx],
-            ip_adapter_scale=0.25,
-            object_siglip_embedding=neural_pred_sig_obj[stim_idx],
-            object_ip_scale=OBJ_SCALE, object_mask=obj_mask,
-            prompt_embeds=zero_t5,
-            pooled_prompt_embeds=neural_pred_clip[stim_idx].unsqueeze(0), **full_base)
-        f_gt = generate_img2img(
-            pipe, image_proj, orig, siglip_gt[stim_idx],
-            ip_adapter_scale=0.25,
-            object_siglip_embedding=siglip_obj_gt[stim_idx],
-            object_ip_scale=OBJ_SCALE, object_mask=obj_mask,
-            prompt_embeds=zero_t5, pooled_prompt_embeds=clip_cat, **full_base)
+        f_neural = generate_obj_sequential(
+            pipe, image_proj, orig, bbox,
+            obj_siglip=neural_pred_sig_obj[stim_idx],
+            global_siglip=neural_pred_sig[stim_idx],
+            obj_ip_scale=IP_SCALE, global_ip_scale=IP_SCALE,
+            pooled_prompt_embeds=neural_pred_clip[stim_idx].unsqueeze(0),
+            seed=i, **seq_shared)
+        f_gt = generate_obj_sequential(
+            pipe, image_proj, orig, bbox,
+            obj_siglip=siglip_obj_gt[stim_idx],
+            global_siglip=siglip_gt[stim_idx],
+            obj_ip_scale=IP_SCALE, global_ip_scale=IP_SCALE,
+            pooled_prompt_embeds=clip_cat,
+            seed=i, **seq_shared)
 
         # obj-crop conditions
         c_control = generate_img2img(
