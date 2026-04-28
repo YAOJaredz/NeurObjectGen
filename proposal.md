@@ -55,50 +55,60 @@ Because diffusers' generic loader does not accept InstantX's checkpoint layout f
 
 HVM-specific generation details:
 
-- **Init latent:** the ground-truth stimulus image at 512 × 512 is VAE-encoded and noised to a configurable `strength` (0.55), so the generator begins from a perturbed version of the original stimulus
+- **Init latent:** the ground-truth stimulus image at 512 × 512 is VAE-encoded and noised to `strength=0.65`, so the generator begins from a perturbed version of the original stimulus
 - **Per-step aperture compositing:** at every scheduler step, latents inside the circular HVM stimulus aperture are updated by the adapter-conditioned transformer while latents outside are pinned to a re-noised copy of the original init latent, using a soft mask downsampled to FLUX's packed-latent grid (each position covers a 16 × 16 pixel block)
-- **Dual IP-Adapter slots:** two SigLIP embeddings condition the adapter simultaneously. The **global slot** (`ip_adapter_scale=0.5`) injects ẑ_sig_global uniformly over all packed-latent positions. The **object slot** (`ip_adapter_scale=0.75`) injects ẑ_sig_obj only within the bbox-derived packed-latent mask, so the higher scale steers only the object footprint while the background evolves from the global signal alone
-- **Object-crop generation:** a separate img2img pass operates directly on the GDINO bbox crop resized to 512 × 512, with `aperture_composite=False` and `strength=0.75`. The generator refines object appearance conditioned on ẑ_sig_obj at full scale (`ip_adapter_scale=1.0`), providing an independent, background-free view of the reconstructed object
+- **Sequential two-pass generation** (`generate_obj_sequential`): reconstruction proceeds in two img2img passes. **Pass 1** crops the GDINO bbox region, upscales it to 512 × 512, and runs img2img conditioned on ẑ_sig_obj (`ip_adapter_scale=1.0`, no aperture compositing), producing an object-specific reconstruction. The generated crop is pasted back onto the original at pixel level and VAE-encoded into a *spliced latent*. **Pass 2** starts from the original init latent (not the spliced one) conditioned on ẑ_sig_global, while the spliced latent serves as a per-step bbox guidance reference: at each denoising step, bbox tokens are blended toward the re-noised spliced latent with a weight that decays linearly from `bbox_preserve_start=1.0` at t=1 to 0 at t=0. This anchors object structure early in diffusion and releases it late, allowing global coherence to emerge without leaving a hard boundary at the bbox edge.
+- **Object-crop generation:** a separate img2img pass operates directly on the GDINO bbox crop resized to 512 × 512, with `aperture_composite=False` and `strength=0.65`. The generator refines object appearance conditioned on ẑ_sig_obj at full scale (`ip_adapter_scale=1.0`), providing an independent, background-free view of the reconstructed object
 - **Text conditioning:** T5 embeddings are zeroed out. The CLIP pooled embedding is predicted by the object model (ẑ_clip), providing stimulus-specific global context beyond the category name
 
 ### Comparison Conditions
 
 Four conditions are compared on the 90 held-out test stimuli to isolate the contribution of each signal:
 
-| # | Condition | T5 | CLIP pooled | Global SigLIP (scale=0.5) | Object SigLIP (scale=0.75, bbox) |
-|---|-----------|-----|-------------|---------------------------|----------------------------------|
+| # | Condition | T5 | CLIP pooled | Pass 1 — obj SigLIP | Pass 2 — global SigLIP |
+|---|-----------|-----|-------------|---------------------|------------------------|
 | 1 | **Control** | null | null | disabled | disabled |
 | 2 | **Text (cat CLIP)** | zeroed | category-name CLIP | disabled | disabled |
-| 3 | **Neural pred (global+obj)** | zeroed | ẑ_clip (obj model) | ẑ_sig_global | ẑ_sig_obj |
-| 4 | **GT emb (↑)** | zeroed | category-name CLIP | GT SigLIP (full) | GT SigLIP (crop) |
+| 3 | **Neural pred (sequential)** | zeroed | ẑ_clip (obj model) | ẑ_sig_obj (obj model) | ẑ_sig_global (global model) |
+| 4 | **GT emb (sequential ↑)** | zeroed | category-name CLIP | GT SigLIP (crop) | GT SigLIP (full) |
 
-The **control** condition establishes the img2img baseline with no semantic conditioning. **Text (cat CLIP)** adds category-level semantic information via the CLIP pooled embedding of the category name. **Neural pred** uses both decoders: the global model contributes ẑ_sig_global at full-image scale and the object model contributes ẑ_sig_obj gated to the bbox region, with ẑ_clip providing stimulus-specific CLIP conditioning. **GT emb** uses ground-truth embeddings from both full-image and cropped SigLIP and serves as the upper bound on reconstruction quality.
+The **control** condition establishes the img2img baseline with no semantic conditioning. **Text (cat CLIP)** adds category-level semantic information via the CLIP pooled embedding of the category name. **Neural pred** uses the sequential two-pass approach: the object model's ẑ_sig_obj drives pass 1 (object recovery), ẑ_sig_global from the global model drives pass 2 (global coherence), and ẑ_clip provides stimulus-specific CLIP conditioning. **GT emb** substitutes ground-truth embeddings in both passes and serves as the upper bound on reconstruction quality.
 
 ### Inference Pipeline
 
 ```
-                ┌─ global model ─┬── SigLIP head ──▶ ẑ_sig_global ──MLPProj──▶ global slot (scale=0.5, full)
-neural r (N×T) ─┤                └── CLIP head ─────▶ (unused)                         │
-                │                                                                      │
-                └─ object model ─┬── SigLIP head ──▶ ẑ_sig_obj ───MLPProj──▶ object slot (scale=0.75, bbox mask)
-                                 └── CLIP head ─────▶ ẑ_clip ──────────────▶ CLIP pooled
-                                                                                       │
-                                                              zero T5 ─────────────────┤
-                                                                                       ▼
-                                               FLUX.1-dev + per-block IPAFluxAttnProcessor
-                                                                                       │
-                                                                     aperture compositing
-                                                                                       │
-                                                                    ┌──────────────────┴──────────────────┐
-                                                                    ▼                                     ▼
-                                                        full reconstruction x̂              obj-crop reconstruction x̂_obj
+                ┌─ global model ─┬── SigLIP head ──▶ ẑ_sig_global ─────────────────────────────────────────┐
+neural r (N×T) ─┤                └── CLIP head ─────▶ (unused)                                             │
+                │                                                                                          │
+                └─ object model ─┬── SigLIP head ──▶ ẑ_sig_obj                                             │
+                                 └── CLIP head ─────▶ ẑ_clip ──────────────────────────────▶ CLIP pooled   │
+                                                          │                                               │
+                                                          ▼                                               │
+                                              ┌─── Pass 1 (obj recovery) ───┐                            │
+                                              │  init: bbox crop of orig    │                            │
+                                              │  SigLIP: ẑ_sig_obj          │                            │
+                                              │  scale: 1.0, no aperture    │                            │
+                                              └──────────┬──────────────────┘                            │
+                                                         │ VAE-encode composite → spliced latent          │
+                                                         ▼                                               ▼
+                                              ┌─── Pass 2 (global recovery) ────────────────────────────┐
+                                              │  init: original latent (not spliced)                    │
+                                              │  SigLIP: ẑ_sig_global, scale: 1.0                       │
+                                              │  bbox guidance: spliced latent, preserve 1.0→0 over t   │
+                                              │  aperture compositing: HVM circular mask                 │
+                                              └──────────┬──────────────────────────────────────────────┘
+                                                         │
+                                          ┌──────────────┴──────────────┐
+                                          ▼                             ▼
+                              full reconstruction x̂        obj-crop reconstruction x̂_obj
+                                                           (separate pass, ẑ_sig_obj, no aperture)
 ```
 
 ---
 
 ## 4. Object-Specific Reconstruction Directions
 
-The main pipeline (Section 3) already incorporates object-specific SigLIP conditioning via the object model and bbox-masked IP-Adapter slot. Two additional directions target the object region via direct latent prediction, exploiting GDINO bounding boxes to constrain reconstruction to the object itself.
+The main pipeline (Section 3) already incorporates object-specific SigLIP conditioning via the sequential two-pass approach: pass 1 recovers the object region conditioned on ẑ_sig_obj, and pass 2 restores global coherence guided by ẑ_sig_global with a time-decayed bbox preserve weight. Two additional directions target the object region via direct latent prediction, exploiting GDINO bounding boxes to constrain reconstruction to the object itself.
 
 ---
 
@@ -154,7 +164,7 @@ cat_mean (16,16,16)  →  Linear(D→embed_dim)  →  cat_feat
 
 **Deliverables:**
 1. Two trained **MultiHeadTransformer** models: a global model targeting full-image SigLIP + CLIP-short, and an object model targeting bbox-crop SigLIP + CLIP-short
-2. An inference wrapper around the pretrained InstantX/FLUX.1-dev-IP-Adapter with HVM-specific aperture compositing, dual-slot SigLIP conditioning, and object-crop generation
+2. An inference wrapper around the pretrained InstantX/FLUX.1-dev-IP-Adapter with HVM-specific aperture compositing, sequential two-pass SigLIP conditioning, and object-crop generation
 3. Per-stimulus reconstruction outputs across all four conditions for the 90 held-out test stimuli — both full-image and object-crop views saved as labeled PNG composites
 4. A systematic comparison of all four conditions on quantitative metrics
 
