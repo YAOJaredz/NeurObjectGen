@@ -28,14 +28,13 @@ from config_const import (
 from data_utils.hvm_loader import _category_stratified_split, _load_hvm_neural
 from encoders import MultiHeadTransformer
 from generation.flux_instantx import load_pipeline, generate_img2img, generate_obj_sequential, encode_text_embeds
-from generation.aperture import build_object_region_mask, load_hvm_packed_aperture_mask
+from generation.aperture import load_hvm_packed_aperture_mask
 from generation.project_hvm import load_hvm_bboxes
 from get_device import get_device
 
-STRENGTH      = 0.6
-OBJ_STRENGTH  = 0.75
+STRENGTH      = 0.65
 IP_SCALE      = 1.0
-BBOX_PRESERVE = 0.3   # pass-1 bbox retention in sequential condition (0=free, 1=frozen)
+BBOX_PRESERVE = 1.0   # bbox preserve weight at t=1 (high noise); decays linearly to 0 at t=0
 NUM_STEPS     = 20
 IMAGE_SIZE    = 512
 BBOX_SRC      = 276
@@ -71,17 +70,6 @@ def load_stimulus(global_idx: int, size: int = IMAGE_SIZE) -> Image.Image:
         (size, size), Image.LANCZOS
     )
 
-
-def get_object_mask(stim_idx: int, bboxes, image_size: int = IMAGE_SIZE) -> torch.Tensor:
-    b = bboxes[stim_idx]
-    scale = image_size / BBOX_SRC
-    half_px = b['half'] * scale + 5
-    return build_object_region_mask(
-        image_size=image_size,
-        cx_px=b['cx'] * scale, cy_px=b['cy'] * scale,
-        r_px=0, device='cpu', dtype=torch.bfloat16,
-        bbox_frac=half_px * 2 / image_size,
-    )
 
 
 def get_crop(stim_idx: int, orig: Image.Image, bboxes, image_size: int = IMAGE_SIZE) -> Image.Image:
@@ -174,7 +162,7 @@ def main(stim_limit):
 
     seq_shared = dict(
         strength=STRENGTH, num_inference_steps=NUM_STEPS, guidance_scale=3.5,
-        bbox_preserve=BBOX_PRESERVE, image_size=IMAGE_SIZE, bbox_src=BBOX_SRC,
+        bbox_preserve_start=BBOX_PRESERVE, image_size=IMAGE_SIZE, bbox_src=BBOX_SRC,
         aperture_mask=hvm_aperture, show_progress=False,
         prompt_embeds=zero_t5,
     )
@@ -194,7 +182,7 @@ def main(stim_limit):
         )
         crop_base = dict(
             height=IMAGE_SIZE, width=IMAGE_SIZE, num_inference_steps=NUM_STEPS,
-            guidance_scale=3.5, strength=OBJ_STRENGTH, seed=i,
+            guidance_scale=3.5, strength=STRENGTH, seed=i,
             aperture_composite=False, show_progress=False,
         )
 

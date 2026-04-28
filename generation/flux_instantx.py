@@ -620,6 +620,9 @@ def generate_img2img(
     guidance_latent: torch.Tensor | None = None,
     guidance_eta: float = 0.15,
     guidance_mask: torch.Tensor | None = None,
+    bbox_latent: torch.Tensor | None = None,
+    bbox_mask: torch.Tensor | None = None,
+    bbox_preserve: float = 1.0,
     show_progress: bool = True,
 ) -> Image.Image:
     """Img2img generation with per-step aperture compositing.
@@ -761,6 +764,14 @@ def generate_img2img(
     if object_mask is not None:
         object_mask = object_mask.to(device=device, dtype=dtype)
 
+    if bbox_latent is not None and bbox_mask is not None:
+        bbox_latent_packed = pipe._pack_latents(
+            bbox_latent.to(device=device, dtype=dtype), 1, bbox_latent.shape[1], h, w)
+        bbox_mask_d = bbox_mask.to(device=device, dtype=dtype)
+    else:
+        bbox_latent_packed = None
+        bbox_mask_d = None
+
     # Aperture compositing re-noises the init latent at each step; RF path needs
     # a fresh noise tensor since scale_noise is not called during init.
     if use_rf_inversion:
@@ -844,6 +855,18 @@ def generate_img2img(
                 init_noisy = init_latent_packed
             latents = aperture_mask * latents + (1.0 - aperture_mask) * init_noisy
 
+        if bbox_latent_packed is not None:
+            if step_idx + 1 < len(timesteps):
+                t_next = timesteps[step_idx + 1 : step_idx + 2].to(dtype)
+                bbox_noisy = pipe.scheduler.scale_noise(bbox_latent_packed, t_next, noise)
+            else:
+                bbox_noisy = bbox_latent_packed
+            # soft pin: linearly decay preserve weight from bbox_preserve at t=1 to 0.1 at t=0
+            t_frac = t.item() / 1000.0
+            effective_preserve = bbox_preserve * t_frac
+            latents = bbox_mask_d * (effective_preserve * bbox_noisy + (1.0 - effective_preserve) * latents) \
+                    + (1.0 - bbox_mask_d) * latents
+
     latents = pipe._unpack_latents(latents, height, width, pipe.vae_scale_factor)
     return decode_latent(pipe, latents)
 
@@ -858,7 +881,7 @@ def generate_obj_sequential(
     *,
     obj_ip_scale: float = 1.0,
     global_ip_scale: float = 1.0,
-    bbox_preserve: float = 0.7,
+    bbox_preserve_start: float = 1.0,
     strength: float = 0.6,
     num_inference_steps: int = 20,
     guidance_scale: float = 3.5,
@@ -872,25 +895,25 @@ def generate_obj_sequential(
 ) -> Image.Image:
     """Two-stage object-then-global sequential reconstruction.
 
-    Pass 1: Crop the bbox region from ``orig``, run img2img with ``obj_siglip``
-    (no aperture compositing), then pixel-paste the result back onto ``orig``.
+    Pass 1: Crop the bbox region, run img2img with ``obj_siglip`` (no aperture
+    compositing), encode the result to a latent.
 
-    Pass 2: Run img2img on the pasted image with ``global_siglip`` and the
-    provided aperture mask.  After decoding, blend the pass-1 bbox back in at
-    ``bbox_preserve`` weight (inside bbox ∩ aperture), then hard-enforce the
-    aperture boundary so pixels outside the circle are always the original.
+    Pass 2: Start from the original init latent so global SigLIP denoises
+    the full image naturally.  The pass-1 bbox latent is used as a per-step
+    guidance reference: bbox tokens are blended toward the re-noised pass-1
+    content with a weight that decays linearly from ``bbox_preserve_start``
+    at t=1 down to 0.1 at t=0, so structure is anchored early and blending
+    is allowed late.
 
     Args:
         bbox: dict with keys ``cx``, ``cy``, ``half`` in ``bbox_src`` pixel coords.
-        bbox_preserve: fraction [0, 1] of pass-1 bbox kept in the final output.
-            0 = pass-2 fully overrides the bbox; 1 = pass-1 bbox frozen.
-        aperture_mask: packed-latent mask ``(1, seq_len, 1)`` for pass-2
-            compositing.  If None, pass-2 runs with default aperture compositing.
+        bbox_preserve_start: preserve weight at t=1 (high noise); decays linearly to 0 at t=0.
+        aperture_mask: packed-latent mask for pass-2 aperture compositing.
     """
-    import numpy as np
-    from config_const import HVM_RADIUS_FRAC, HVM_CENTER_FRAC
+    device = pipe.device
+    dtype  = torch.bfloat16
 
-    pad = 5
+    pad   = 5
     scale = image_size / bbox_src
     x0 = max(0, int((bbox['cx'] - bbox['half']) * scale - pad))
     y0 = max(0, int((bbox['cy'] - bbox['half']) * scale - pad))
@@ -907,7 +930,7 @@ def generate_obj_sequential(
         show_progress=show_progress,
     )
 
-    # Pass 1: generate bbox crop only
+    # Pass 1: generate bbox crop with obj SigLIP
     crop = orig.crop((x0, y0, x1, y1)).resize((image_size, image_size), Image.LANCZOS)
     gen_crop = generate_img2img(
         pipe, image_proj, crop, obj_siglip,
@@ -915,34 +938,37 @@ def generate_obj_sequential(
         aperture_composite=False,
         **shared)
 
-    # Paste generated crop back onto original at bbox coordinates
-    inter = orig.copy()
-    inter.paste(gen_crop.resize((x1 - x0, y1 - y0), Image.LANCZOS), (x0, y0))
+    # Paste pass-1 crop back onto orig at pixel level before encoding.
+    # This lets the VAE encode the full composite at native resolution — no
+    # latent-space resize that would smear the object into a blurry block.
+    orig_resized = orig.resize((image_size, image_size), Image.LANCZOS)
+    composite    = orig_resized.copy()
+    gen_crop_bbox = gen_crop.resize((x1 - x0, y1 - y0), Image.LANCZOS)
+    composite.paste(gen_crop_bbox, (x0, y0))
 
-    # Pass 2: global generation from pasted image
-    gen_global = generate_img2img(
-        pipe, image_proj, inter, global_siglip,
+    spliced_latent = encode_image(pipe, composite).to(device=device, dtype=dtype)
+
+    grid = image_size // 16
+
+    # Build packed bbox_mask: 1 at token positions inside bbox, 0 elsewhere
+    bbox_mask_pixel = torch.zeros(1, 1, image_size, image_size)
+    bbox_mask_pixel[:, :, y0:y1, x0:x1] = 1.0
+    bbox_mask_packed = F.avg_pool2d(bbox_mask_pixel, kernel_size=16).view(
+        1, grid * grid, 1).to(device=device, dtype=dtype)
+    bbox_mask_packed = (bbox_mask_packed > 0.5).to(dtype=dtype)
+
+    # Pass 2: start from the original init latent so global SigLIP denoises
+    # the full image naturally.  The pass-1 bbox latent is used only as the
+    # per-step bbox guidance reference — at each step, bbox tokens are pulled
+    # toward the re-noised pass-1 content rather than the global diffusion path.
+    result = generate_img2img(
+        pipe, image_proj, orig_resized, global_siglip,
         ip_adapter_scale=global_ip_scale,
         aperture_composite=(aperture_mask is None),
         aperture_mask=aperture_mask,
+        bbox_latent=spliced_latent,
+        bbox_mask=bbox_mask_packed,
+        bbox_preserve=bbox_preserve_start,
         **shared)
 
-    # Pixel-resolution aperture mask for hard boundary enforcement
-    cy = cx = image_size / 2 + HVM_CENTER_FRAC * image_size
-    r  = HVM_RADIUS_FRAC * image_size
-    yy, xx = np.mgrid[:image_size, :image_size].astype(np.float32)
-    apt_px = ((yy - cy) ** 2 + (xx - cx) ** 2 <= r ** 2).astype(np.float32)[:, :, None]
-
-    arr_g = np.array(gen_global, dtype=np.float32)
-    arr_i = np.array(inter,      dtype=np.float32)
-    arr_o = np.array(orig,       dtype=np.float32)
-
-    # Blend pass-1 bbox into pass-2 inside bbox ∩ aperture
-    weight = np.zeros((image_size, image_size, 1), dtype=np.float32)
-    weight[y0:y1, x0:x1] = bbox_preserve
-    weight *= apt_px  # aperture takes priority — no blend outside circle
-
-    blended = weight * arr_i + (1 - weight) * arr_g
-    # hard-enforce aperture: outside circle always uses original pixels
-    result = apt_px * blended + (1 - apt_px) * arr_o
-    return Image.fromarray(result.clip(0, 255).astype(np.uint8))
+    return result
