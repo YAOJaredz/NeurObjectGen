@@ -861,9 +861,9 @@ def generate_img2img(
                 bbox_noisy = pipe.scheduler.scale_noise(bbox_latent_packed, t_next, noise)
             else:
                 bbox_noisy = bbox_latent_packed
-            # soft pin: linearly decay preserve weight from bbox_preserve at t=1 to 0.1 at t=0
+            # cosine decay: preserve weight = bbox_preserve at t=1, 0 at t=0
             t_frac = t.item() / 1000.0
-            effective_preserve = bbox_preserve * t_frac
+            effective_preserve = bbox_preserve * 0.5 * (1.0 + math.cos(math.pi * (1.0 - t_frac)))
             latents = bbox_mask_d * (effective_preserve * bbox_noisy + (1.0 - effective_preserve) * latents) \
                     + (1.0 - bbox_mask_d) * latents
 
@@ -901,13 +901,12 @@ def generate_obj_sequential(
     Pass 2: Start from the original init latent so global SigLIP denoises
     the full image naturally.  The pass-1 bbox latent is used as a per-step
     guidance reference: bbox tokens are blended toward the re-noised pass-1
-    content with a weight that decays linearly from ``bbox_preserve_start``
-    at t=1 down to 0.1 at t=0, so structure is anchored early and blending
-    is allowed late.
+    content with a weight that decays via cosine schedule from ``bbox_preserve_start``
+    at t=1 down to 0 at t=0, so structure is anchored early and released smoothly late.
 
     Args:
         bbox: dict with keys ``cx``, ``cy``, ``half`` in ``bbox_src`` pixel coords.
-        bbox_preserve_start: preserve weight at t=1 (high noise); decays linearly to 0 at t=0.
+        bbox_preserve_start: preserve weight at t=1 (high noise); decays via cosine to 0 at t=0.
         aperture_mask: packed-latent mask for pass-2 aperture compositing.
     """
     device = pipe.device

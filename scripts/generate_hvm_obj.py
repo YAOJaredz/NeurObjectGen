@@ -18,7 +18,7 @@ import torch
 from PIL import Image, ImageDraw, ImageFont
 from tqdm import tqdm
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+sys.path.append('.')
 from config_const import (
     CACHE_DIR, SEED,
     HVM_STIM_DIR, HVM_N_STIMULI, HVM_N_VAR, HVM_N_CAT, HVM_CATEGORIES,
@@ -34,7 +34,7 @@ from get_device import get_device
 
 STRENGTH      = 0.65
 IP_SCALE      = 1.0
-BBOX_PRESERVE = 1.0   # bbox preserve weight at t=1 (high noise); decays linearly to 0 at t=0
+BBOX_PRESERVE = 0.6   # bbox preserve weight at t=1 (high noise); decays linearly to 0 at t=0
 NUM_STEPS     = 20
 IMAGE_SIZE    = 512
 BBOX_SRC      = 276
@@ -157,8 +157,8 @@ def main(stim_limit):
     full_dir.mkdir(parents=True, exist_ok=True)
     crop_dir.mkdir(parents=True, exist_ok=True)
 
-    full_labels = ['Original', 'Control\n(null)', 'Text\n(cat CLIP)', 'Neural pred\n(sequential)', 'GT emb\n(sequential ↑)']
-    crop_labels = ['Crop',     'Control\n(null)', 'Text\n(cat CLIP)', 'Neural pred\n(obj)',         'GT emb\n(obj ↑)']
+    full_labels = ['Original', 'Control\n(null)', 'Text\n(cat CLIP + T5)', 'Neural pred\n(sequential)', 'GT emb\n(sequential ↑)']
+    crop_labels = ['Crop',     'Control\n(null)', 'Text\n(cat CLIP + T5)', 'Neural pred\n(obj)',         'GT emb\n(obj ↑)']
 
     seq_shared = dict(
         strength=STRENGTH, num_inference_steps=NUM_STEPS, guidance_scale=3.5,
@@ -173,7 +173,9 @@ def main(stim_limit):
         orig     = load_stimulus(stim_idx)
         crop_pil = get_crop(stim_idx, orig, bboxes)
         bbox     = bboxes[stim_idx]
-        _, clip_cat = cat_text_embeds(stim_idx)
+        cat_i    = int(stim_idx) // HVM_N_VAR
+        t5_cat   = cat_t5_embeds[cat_i:cat_i+1]
+        clip_cat = cat_clip_embeds[cat_i:cat_i+1]
 
         full_base = dict(
             height=IMAGE_SIZE, width=IMAGE_SIZE, num_inference_steps=NUM_STEPS,
@@ -193,7 +195,7 @@ def main(stim_limit):
         f_text = generate_img2img(
             pipe, image_proj, orig, zero_siglip,
             ip_adapter_scale=0.0,
-            prompt_embeds=zero_t5, pooled_prompt_embeds=clip_cat, **full_base)
+            prompt_embeds=t5_cat, pooled_prompt_embeds=clip_cat, **full_base)
         f_neural = generate_obj_sequential(
             pipe, image_proj, orig, bbox,
             obj_siglip=neural_pred_sig_obj[stim_idx],
@@ -216,7 +218,7 @@ def main(stim_limit):
         c_text = generate_img2img(
             pipe, image_proj, crop_pil, zero_siglip,
             ip_adapter_scale=0.0,
-            prompt_embeds=zero_t5, pooled_prompt_embeds=clip_cat, **crop_base)
+            prompt_embeds=t5_cat, pooled_prompt_embeds=clip_cat, **crop_base)
         c_neural = generate_img2img(
             pipe, image_proj, crop_pil, neural_pred_sig_obj[stim_idx],
             ip_adapter_scale=IP_SCALE,
