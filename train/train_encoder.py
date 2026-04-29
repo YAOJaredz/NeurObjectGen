@@ -30,9 +30,7 @@ import math
 from torch.optim import AdamW
 from torch.optim.lr_scheduler import LambdaLR
 
-# make repo root importable when run as a script
-REPO_ROOT = Path(__file__).resolve().parent.parent
-sys.path.insert(0, str(REPO_ROOT))
+sys.path.append('.')
 
 from config_const import SEED, SIGLIP_DIM, CLIP_DIM, CHECKPOINT_DIR, HVM_N_CAT
 

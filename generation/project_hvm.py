@@ -18,16 +18,13 @@ import math
 from functools import lru_cache
 from pathlib import Path
 
-from config_const import CACHE_DIR, HVM_RADIUS_FRAC
-
-_HVM_METADATA_PATH = CACHE_DIR / "hvm10_metadata.json"
-_HVM_BBOXES_PATH   = CACHE_DIR / "hvm10_bboxes.json"
+from config_const import HVM_METADATA_PATH, HVM_BBOXES_PATH, HVM_RADIUS_FRAC
 
 
 @lru_cache(maxsize=1)
 def load_hvm_metadata() -> list[dict]:
     """Load and cache hvm10_metadata.json (450 records, one per stimulus)."""
-    return json.loads(_HVM_METADATA_PATH.read_text())
+    return json.loads(HVM_METADATA_PATH.read_text())
 
 
 @lru_cache(maxsize=1)
@@ -38,7 +35,7 @@ def load_hvm_bboxes() -> list[dict]:
     cx/cy/half are in 276×276 pixel space.
     source is 'gdino' or 'projected'.
     """
-    return json.loads(_HVM_BBOXES_PATH.read_text())
+    return json.loads(HVM_BBOXES_PATH.read_text())
 
 
 def hvm_object_pixel_coords(

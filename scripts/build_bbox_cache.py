@@ -23,7 +23,7 @@ from PIL import Image
 from transformers import AutoModelForZeroShotObjectDetection, AutoProcessor
 
 sys.path.append('.')
-from config_const import CACHE_DIR, HVM_CATEGORIES, HVM_N_VAR, HVM_NOFIXATION_DIR
+from config_const import CACHE_DIR, HVM_CATEGORIES, HVM_N_VAR, HVM_NOFIXATION_DIR, HVM_BBOXES_PATH
 from generation.project_hvm import hvm_object_pixel_coords, load_hvm_metadata
 
 IMAGE_SIZE    = 276
@@ -32,7 +32,7 @@ TEXT_THRESHOLD = 0.25
 BASE_FRAC     = 0.5   # fallback bbox_frac at s=1
 
 GDINO_MODEL = "IDEA-Research/grounding-dino-base"
-OUT_PATH    = CACHE_DIR / "hvm10_bboxes.json"
+OUT_PATH    = HVM_BBOXES_PATH
 
 
 def _to_square(x0: float, y0: float, x1: float, y1: float) -> tuple[float, float, float]:

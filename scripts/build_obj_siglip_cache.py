@@ -20,7 +20,7 @@ from PIL import Image
 from tqdm import tqdm
 
 import sys
-sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+sys.path.append('.')
 
 from config_const import (
     HVM_STIM_DIR, HVM_N_STIMULI, HVM_OBJ_SIGLIP_EMBEDDINGS_PATH,

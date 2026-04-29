@@ -24,8 +24,7 @@ import torch
 from transformers import T5EncoderModel, T5Tokenizer
 from tqdm import tqdm
 
-REPO_ROOT = Path(__file__).resolve().parent.parent
-sys.path.insert(0, str(REPO_ROOT))
+sys.path.append('.')
 
 from config_const import (
     HVM_BLIP2_CAPTIONS_PATH,
