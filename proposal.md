@@ -57,7 +57,7 @@ HVM-specific generation details:
 
 - **Init latent:** the ground-truth stimulus image at 512 × 512 is VAE-encoded and noised to `strength=0.65`, so the generator begins from a perturbed version of the original stimulus
 - **Per-step aperture compositing:** at every scheduler step, latents inside the circular HVM stimulus aperture are updated by the adapter-conditioned transformer while latents outside are pinned to a re-noised copy of the original init latent, using a soft mask downsampled to FLUX's packed-latent grid (each position covers a 16 × 16 pixel block)
-- **Sequential two-pass generation** (`generate_obj_sequential`): reconstruction proceeds in two img2img passes. **Pass 1** crops the GDINO bbox region, upscales it to 512 × 512, and runs img2img conditioned on ẑ_sig_obj (`ip_adapter_scale=1.0`, no aperture compositing), producing an object-specific reconstruction. The generated crop is pasted back onto the original at pixel level and VAE-encoded into a *spliced latent*. **Pass 2** starts from the original init latent (not the spliced one) conditioned on ẑ_sig_global, while the spliced latent serves as a per-step bbox guidance reference: at each denoising step, bbox tokens are blended toward the re-noised spliced latent with a weight that decays linearly from `bbox_preserve_start=1.0` at t=1 to 0 at t=0. This anchors object structure early in diffusion and releases it late, allowing global coherence to emerge without leaving a hard boundary at the bbox edge.
+- **Sequential two-pass generation** (`generate_obj_sequential`): reconstruction proceeds in two img2img passes. **Pass 1** crops the GDINO bbox region, upscales it to 512 × 512, and runs img2img conditioned on ẑ_sig_obj (`ip_adapter_scale=1.0`, no aperture compositing), producing an object-specific reconstruction. The generated crop is pasted back onto the original at pixel level and VAE-encoded into a *spliced latent*. **Pass 2** starts from the original init latent (not the spliced one) conditioned on ẑ_sig_global, while the spliced latent serves as a per-step bbox guidance reference: at each denoising step, bbox tokens are blended toward the re-noised spliced latent with a weight that decays via cosine schedule from `bbox_preserve_start=0.6` at t=1 to 0 at t=0. This anchors object structure early in diffusion and releases it late, allowing global coherence to emerge without leaving a hard boundary at the bbox edge.
 - **Object-crop generation:** a separate img2img pass operates directly on the GDINO bbox crop resized to 512 × 512, with `aperture_composite=False` and `strength=0.65`. The generator refines object appearance conditioned on ẑ_sig_obj at full scale (`ip_adapter_scale=1.0`), providing an independent, background-free view of the reconstructed object
 - **Text conditioning:** T5 embeddings are zeroed out. The CLIP pooled embedding is predicted by the object model (ẑ_clip), providing stimulus-specific global context beyond the category name
 
@@ -68,11 +68,11 @@ Four conditions are compared on the 90 held-out test stimuli to isolate the cont
 | # | Condition | T5 | CLIP pooled | Pass 1 — obj SigLIP | Pass 2 — global SigLIP |
 |---|-----------|-----|-------------|---------------------|------------------------|
 | 1 | **Control** | null | null | disabled | disabled |
-| 2 | **Text (cat CLIP)** | zeroed | category-name CLIP | disabled | disabled |
+| 2 | **Text (cat CLIP + T5)** | category T5 | category-name CLIP | disabled | disabled |
 | 3 | **Neural pred (sequential)** | zeroed | ẑ_clip (obj model) | ẑ_sig_obj (obj model) | ẑ_sig_global (global model) |
 | 4 | **GT emb (sequential ↑)** | zeroed | category-name CLIP | GT SigLIP (crop) | GT SigLIP (full) |
 
-The **control** condition establishes the img2img baseline with no semantic conditioning. **Text (cat CLIP)** adds category-level semantic information via the CLIP pooled embedding of the category name. **Neural pred** uses the sequential two-pass approach: the object model's ẑ_sig_obj drives pass 1 (object recovery), ẑ_sig_global from the global model drives pass 2 (global coherence), and ẑ_clip provides stimulus-specific CLIP conditioning. **GT emb** substitutes ground-truth embeddings in both passes and serves as the upper bound on reconstruction quality.
+The **control** condition establishes the img2img baseline with no semantic conditioning. **Text (cat CLIP + T5)** adds category-level semantic information via both the T5 text encoder and the CLIP pooled embedding of the category name. **Neural pred** uses the sequential two-pass approach: the object model's ẑ_sig_obj drives pass 1 (object recovery), ẑ_sig_global from the global model drives pass 2 (global coherence), and ẑ_clip provides stimulus-specific CLIP conditioning. **GT emb** substitutes ground-truth embeddings in both passes and serves as the upper bound on reconstruction quality.
 
 ### Inference Pipeline
 
@@ -82,20 +82,20 @@ neural r (N×T) ─┤                └── CLIP head ─────▶ (un
                 │                                                                                          │
                 └─ object model ─┬── SigLIP head ──▶ ẑ_sig_obj                                             │
                                  └── CLIP head ─────▶ ẑ_clip ──────────────────────────────▶ CLIP pooled   │
-                                                          │                                               │
+                                                          │                                                │
                                                           ▼                                               │
                                               ┌─── Pass 1 (obj recovery) ───┐                            │
                                               │  init: bbox crop of orig    │                            │
                                               │  SigLIP: ẑ_sig_obj          │                            │
                                               │  scale: 1.0, no aperture    │                            │
                                               └──────────┬──────────────────┘                            │
-                                                         │ VAE-encode composite → spliced latent          │
+                                                         │ VAE-encode composite → spliced latent         │
                                                          ▼                                               ▼
                                               ┌─── Pass 2 (global recovery) ────────────────────────────┐
                                               │  init: original latent (not spliced)                    │
                                               │  SigLIP: ẑ_sig_global, scale: 1.0                       │
-                                              │  bbox guidance: spliced latent, preserve 1.0→0 over t   │
-                                              │  aperture compositing: HVM circular mask                 │
+                                              │  bbox guidance: spliced latent, preserve 0.6→0 cosine   │
+                                              │  aperture compositing: HVM circular mask                │
                                               └──────────┬──────────────────────────────────────────────┘
                                                          │
                                           ┌──────────────┴──────────────┐
@@ -106,61 +106,7 @@ neural r (N×T) ─┤                └── CLIP head ─────▶ (un
 
 ---
 
-## 4. Object-Specific Reconstruction Directions
-
-The main pipeline (Section 3) already incorporates object-specific SigLIP conditioning via the sequential two-pass approach: pass 1 recovers the object region conditioned on ẑ_sig_obj, and pass 2 restores global coherence guided by ẑ_sig_global with a time-decayed bbox preserve weight. Two additional directions target the object region via direct latent prediction, exploiting GDINO bounding boxes to constrain reconstruction to the object itself.
-
----
-
-### Direction A — Canonical Object Latent Prediction
-
-**Idea.** Crop the FLUX VAE latent at the GDINO bounding box and bilinearly resize to a fixed spatial resolution (16 × 16 patches), producing a *canonical object latent* of shape (16, 16, 16). A TemporalTransformer is trained to predict this canonical latent directly from neural activity. At inference the predicted patch is resized back to the bbox footprint in latent space and pasted into the full init latent before generation.
-
-**Residual formulation.** Because the category-mean latent (average over 45 training variants) explains ~57% of latent variance, the model predicts the *residual* `δ = latent − category_mean` instead of the full latent. This reduces the effective output variance by more than half and gives the model a strong prior for free. At inference: `predicted_latent = category_mean[category] + predicted_δ`.
-
-**Training details.**
-- Target: (16, 16, 16) canonical latent, per-channel whitened on training split
-- Loss: MSE + InfoNCE (weight 0.1) in whitened space
-- Augmentation: Gaussian input noise (σ = 0.05), neuron dropout (10%)
-- Hyperparameter sweep: d\_model ∈ {64, 128}, n\_layers ∈ {1, 2}, lr ∈ {1e-3, 3e-4}, residual ∈ {on, off}
-
-**Integration.** The predicted canonical patch is resized to the bbox extent in FLUX's packed-latent grid and pasted into the init latent. The existing `guidance_mask` mechanism (Section 3) restricts RF correction to the bbox region during generation, so the neural prediction shapes object content while the adapter handles global coherence.
-
-**Limitation.** With 270 training stimuli and a 4096-dimensional target, the regression is underdetermined. Val cosine similarity plateaus at ~0.34 even with regularisation, suggesting this direction benefits from additional structure (see Direction B).
-
----
-
-### Direction B — Category-Mean Conditioned Latent Prediction
-
-**Idea.** Decouple representation learning from latent decoding using a two-module architecture trained jointly:
-
-1. **NeuralEmbedder** — TemporalTransformer producing a compact embedding `e ∈ R^{embed_dim}` from neural activity.
-2. **LatentRefiner** — a 3-layer GELU MLP that receives `[e; proj(cat_mean_flat)]` and outputs the predicted canonical latent.
-
-The category-mean latent is projected to `embed_dim` and concatenated with the neural embedding before the MLP head. This gives the model an explicit latent-space prior: rather than subtracting the mean as a constant (Direction A), the MLP can learn nonlinear interactions between the object prior and the stimulus-specific neural signal.
-
-```
-Neural (N×T)  →  TemporalTransformer  →  embed (embed_dim)
-                                                ↓
-cat_mean (16,16,16)  →  Linear(D→embed_dim)  →  cat_feat
-                                                ↓
-                         concat([embed; cat_feat])
-                                                ↓
-                          MLP (3 layers, GELU)
-                                                ↓
-                         predicted latent (16,16,16)
-```
-
-**Training details.**
-- Same loss, augmentation, and inference-time splicing as Direction A
-- Additional sweep axis: refiner\_hidden ∈ {256, 512}
-- Category conditioning applied in the NeuralEmbedder (learned category embedding added to pooled token)
-
-**Advantage over Direction A.** The category-mean latent is an active input rather than a subtracted constant, allowing the refiner to selectively preserve, amplify, or override spatial regions of the prior based on the neural signal. This is particularly useful for within-category variation (pose, lighting, scale) where the category mean provides accurate coarse structure but incorrect fine detail.
-
----
-
-## 5. Deliverables & Evaluation
+## 4. Deliverables & Evaluation
 
 **Deliverables:**
 1. Two trained **MultiHeadTransformer** models: a global model targeting full-image SigLIP + CLIP-short, and an object model targeting bbox-crop SigLIP + CLIP-short
@@ -178,7 +124,7 @@ cat_mean (16,16,16)  →  Linear(D→embed_dim)  →  cat_feat
 
 ---
 
-## 6. Compute Plan
+## 5. Compute Plan
 
 **Stage 1 (MultiHeadTransformer × 2):** Hyperparameter sweep over d_model, n_layers, shared_dim, nce_weight, and regularisation coefficients, run via SLURM on the Issa Lab cluster inside an Apptainer container. Individual training runs are fast (a few minutes each on GPU). The global model is exported to `cache/best_hvm_multihead_config.json` and the object model to `cache/best_hvm_multihead_obj_config.json`.
 
