@@ -39,6 +39,7 @@ from data_utils.rust_loader import make_rust_loader
 from data_utils.hvm_loader import make_hvm_loader
 from encoders import BottleneckMLP, TemporalLSTM, TemporalTransformer
 from eval.metrics import two_afc_identification, retrieval_accuracy
+from train.losses import cosine_loss, info_nce_loss_with_bank, uniformity_loss
 from get_device import get_device
 
 
@@ -91,71 +92,6 @@ def load_checkpoint(path: Path, model, optimizer=None, scheduler=None):
     return ckpt["epoch"], ckpt["metrics"], ckpt["args"]
 
 
-# ---------------------------------------------------------------------------
-# Loss
-# ---------------------------------------------------------------------------
-
-def infonce_loss(
-    pred: torch.Tensor,
-    target: torch.Tensor,
-    temperature: float,
-    memory_bank: torch.Tensor | None = None,
-) -> torch.Tensor:
-    """Symmetric InfoNCE with optional memory-bank negative augmentation.
-
-    Args:
-        pred:        (B, D) L2-normalised predicted embeddings.
-        target:      (B, D) L2-normalised target embeddings (positives).
-        temperature: Scalar temperature for logit scaling.
-        memory_bank: (M, D) all training target embeddings. When provided,
-                     each query is evaluated against its in-batch positive
-                     plus all M bank embeddings as negatives. The bank should
-                     NOT be in the computation graph (detached).
-
-    Both pred→target and target→pred directions are averaged.
-    """
-    if memory_bank is not None:
-        # pred side: logits over [in-batch targets | bank]
-        # Positive for sample i is target[i]; negatives are all of bank + other in-batch targets.
-        # We build a combined key matrix: (B + M, D), labels point into [0..B-1].
-        keys = torch.cat([target, memory_bank], dim=0)   # (B+M, D)
-        logits_p = pred @ keys.T / temperature            # (B, B+M)
-        labels = torch.arange(len(pred), device=pred.device)
-        loss_p = F.cross_entropy(logits_p, labels)
-
-        # target side: each target embedding retrieves its own neural prediction
-        logits_t = target @ pred.T / temperature          # (B, B) — symmetric within batch only
-        loss_t = F.cross_entropy(logits_t, labels)
-    else:
-        logits = pred @ target.T / temperature            # (B, B)
-        labels = torch.arange(len(pred), device=pred.device)
-        loss_p = F.cross_entropy(logits, labels)
-        loss_t = F.cross_entropy(logits.T, labels)
-
-    return (loss_p + loss_t) / 2
-
-
-def cosine_loss(pred: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
-    """Mean cosine distance between predicted and target embeddings.
-
-    Both inputs should be L2-normalised. Returns a scalar in [0, 2].
-    Pair this with uniformity_loss to prevent collapse.
-    """
-    return (1.0 - F.cosine_similarity(pred, target, dim=-1)).mean()
-
-
-def uniformity_loss(z: torch.Tensor, t: float = 2.0) -> torch.Tensor:
-    """Uniformity loss (Wang & Isola 2020) on L2-normalised embeddings.
-
-    Encourages predicted embeddings to spread uniformly over the hypersphere,
-    preventing collapse onto a low-dimensional submanifold.
-
-    Args:
-        z: (B, D) L2-normalised embeddings.
-        t: bandwidth parameter (default 2).
-    """
-    sq_pdist = torch.pdist(z, p=2).pow(2)
-    return sq_pdist.mul(-t).exp().mean().log()
 
 
 # ---------------------------------------------------------------------------
@@ -275,7 +211,7 @@ def train_with_embeddings(args):
                 loss = cosine_loss(pred, siglip)
             else:
                 bank = all_train_targets.detach()
-                loss = infonce_loss(pred, siglip, temperature=args.temperature, memory_bank=bank)
+                loss = info_nce_loss_with_bank(pred, siglip, temperature=args.temperature, memory_bank=bank)
 
             if args.uniformity_weight > 0.0:
                 loss = loss + args.uniformity_weight * uniformity_loss(pred)
@@ -309,7 +245,7 @@ def train_with_embeddings(args):
                 if args.loss == "cosine":
                     val_loss += cosine_loss(pred, siglip).item()
                 else:
-                    val_loss += infonce_loss(pred, siglip, temperature=args.temperature).item()
+                    val_loss += info_nce_loss_with_bank(pred, siglip, temperature=args.temperature).item()
                 all_preds.append(pred.cpu())
                 all_targets.append(siglip.cpu())
 

@@ -27,6 +27,7 @@ from config_const import (
 from data_utils.hvm_loader import _load_hvm_neural, _category_stratified_split
 from encoders import MultiHeadTransformer
 from eval.metrics import two_afc_identification, retrieval_accuracy
+from train.losses import cosine_loss, info_nce_loss, head_loss, uniformity_loss
 from get_device import get_device
 
 from torch.utils.data import Dataset, DataLoader
@@ -83,34 +84,6 @@ def make_obj_loaders(batch_size: int = 64, seed: int = SEED):
         f"test={len(test_idx)}, neurons={rsp.shape[1]}, time={rsp.shape[2]}"
     )
     return train_loader, val_loader, test_loader
-
-
-# ---------------------------------------------------------------------------
-# Losses
-# ---------------------------------------------------------------------------
-
-def cosine_loss(pred, target):
-    return (1.0 - F.cosine_similarity(pred, target, dim=-1)).mean()
-
-
-def info_nce_loss(pred, target, temperature=0.07):
-    pred_n = F.normalize(pred, dim=-1)
-    tgt_n  = F.normalize(target, dim=-1)
-    logits = (pred_n @ tgt_n.T) / temperature
-    labels = torch.arange(logits.size(0), device=logits.device)
-    return 0.5 * (F.cross_entropy(logits, labels) + F.cross_entropy(logits.T, labels))
-
-
-def head_loss(pred, target, nce_weight, temperature):
-    l_cos = cosine_loss(pred, target)
-    if nce_weight > 0.0 and pred.size(0) > 1:
-        l_nce = info_nce_loss(pred, target, temperature)
-        return nce_weight * l_nce + (1.0 - nce_weight) * l_cos
-    return l_cos
-
-
-def uniformity_loss(z, t=2.0):
-    return torch.pdist(z, p=2).pow(2).mul(-t).exp().mean().log()
 
 
 # ---------------------------------------------------------------------------

@@ -28,38 +28,8 @@ from data_utils.rust_loader import make_multihead_loader
 from data_utils.hvm_loader import make_hvm_multihead_loader
 from encoders import MultiHeadTransformer
 from eval.metrics import two_afc_identification, retrieval_accuracy
+from train.losses import cosine_loss, info_nce_loss, head_loss, uniformity_loss
 from get_device import get_device
-
-
-# ---------------------------------------------------------------------------
-# Loss functions (reused from train_encoder.py)
-# ---------------------------------------------------------------------------
-
-def cosine_loss(pred: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
-    return (1.0 - F.cosine_similarity(pred, target, dim=-1)).mean()
-
-
-def info_nce_loss(pred: torch.Tensor, target: torch.Tensor, temperature: float = 0.07) -> torch.Tensor:
-    """Symmetric InfoNCE (CLIP-style). Directly optimises 2-AFC-like discrimination."""
-    pred_n = F.normalize(pred, dim=-1)
-    tgt_n  = F.normalize(target, dim=-1)
-    logits = (pred_n @ tgt_n.T) / temperature
-    labels = torch.arange(logits.size(0), device=logits.device)
-    return 0.5 * (F.cross_entropy(logits, labels) + F.cross_entropy(logits.T, labels))
-
-
-def head_loss(pred, target, nce_weight: float, temperature: float) -> torch.Tensor:
-    """InfoNCE (primary) + small cosine regulariser on magnitude/direction."""
-    l_cos = cosine_loss(pred, target)
-    if nce_weight > 0.0 and pred.size(0) > 1:
-        l_nce = info_nce_loss(pred, target, temperature)
-        return nce_weight * l_nce + (1.0 - nce_weight) * l_cos
-    return l_cos
-
-
-def uniformity_loss(z: torch.Tensor, t: float = 2.0) -> torch.Tensor:
-    sq_pdist = torch.pdist(z, p=2).pow(2)
-    return sq_pdist.mul(-t).exp().mean().log()
 
 
 # ---------------------------------------------------------------------------

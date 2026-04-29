@@ -6,6 +6,11 @@ import torch.nn.functional as F
 from skimage.metrics import structural_similarity
 
 
+def cosine_loss(pred: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
+    """Mean cosine distance loss: 1 − cos(pred, target), averaged over batch."""
+    return (1.0 - F.cosine_similarity(pred, target, dim=-1)).mean()
+
+
 def cosine_similarity(pred: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
     """Per-sample cosine similarity between predicted and target embeddings.
 
