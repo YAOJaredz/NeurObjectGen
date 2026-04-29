@@ -1,0 +1,32 @@
+name: objGen
+channels:
+  - pytorch
+  - nvidia
+  - conda-forge
+  - defaults
+dependencies:
+  - python=3.12
+  - pytorch::pytorch=2.6.0
+  - pytorch::pytorch-cuda=12.4
+  - torchvision=0.21.0
+  - numpy
+  - scipy
+  - scikit-image
+  - scikit-learn
+  - matplotlib
+  - h5py
+  - tqdm
+  - pip
+  - pip:
+      - diffusers==0.37.1
+      - transformers==5.5.3
+      - accelerate
+      - huggingface_hub
+      - safetensors
+      - tokenizers
+      - sentencepiece
+      - pillow
+      - hexpred==0.1.0
+      - onnxruntime-gpu
+      - timm
+      - kornia

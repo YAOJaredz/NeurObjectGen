@@ -10,13 +10,13 @@ The primate ventral visual stream transforms retinal input into a rich represent
 
 Recent work has achieved striking reconstructions by aligning brain responses with the latent spaces of pretrained generative models, first from fMRI [Takagi and Nishimoto, 2023, Scotti et al., 2024] and more recently from intracortical electrophysiology [Ciferri et al., 2026]. However, these successes rely on massive datasets (e.g., 22,000 images, 1024 channels) atypical of most primate neurophysiology and sidestep the question of whether reconstruction is possible in the data-limited regime.
 
-We address this using Neuropixels 1.0 recordings from primate IT cortex during passive viewing of the High-variation (HVM) object dataset [DiCarlo et al., 2012], which comprises 450 naturalistic images spanning 10 object categories. Pooling neural responses across sessions yields a large pseudo-population, enabling high-dimensional decoding despite the modest stimulus count.
+We address this using Neuropixels 1.0 recordings from marmoset visual ventral stream cortices during passive viewing of the High-variation (HVM) object dataset [DiCarlo et al., 2012], which comprises 450 naturalistic images spanning 10 object categories. Pooling neural responses across sessions yields a large pseudo-population, enabling high-dimensional decoding despite the modest stimulus count.
 
 ---
 
 ## 2. Problem Formulation
 
-We collect neural responses with Neuropixels 1.0 probes across multiple sessions from primate IT cortex during passive viewing of the 450-image HVM stimulus set (10 object categories × 45 variations each). Neural responses are pooled across sessions to form a pseudo-population. The goal is to reconstruct the perceived image from population activity.
+We collect neural responses with Neuropixels 1.0 probes across multiple sessions from marmoset visual ventral stream cortices during passive viewing of the 450-image HVM stimulus set (10 object categories × 45 variations each). Neural responses are pooled across sessions to form a pseudo-population. The goal is to reconstruct the perceived image from population activity.
 
 Formally, we train two decoders **f_global** and **f_obj**, each mapping the same neural response **r ∈ R^(N×T)** to dual embedding targets. **f_global** targets full-image embeddings: **ẑ_sig_global ∈ R^1152** (SigLIP-SO400M of the full stimulus) and **ẑ_clip ∈ R^768** (CLIP-short). **f_obj** targets object-crop embeddings: **ẑ_sig_obj ∈ R^1152** (SigLIP-SO400M of the GDINO-cropped object region). Both SigLIP predictions condition a pretrained image generation model — the global embedding shapes overall scene coherence and the object embedding steers the object region specifically — to produce a reconstruction **x̂** of the original stimulus **x**.
 
