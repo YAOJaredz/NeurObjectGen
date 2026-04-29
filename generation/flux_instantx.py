@@ -40,6 +40,7 @@ from diffusers.pipelines.flux.pipeline_flux import (
 from huggingface_hub import hf_hub_download
 from PIL import Image
 import torchvision.transforms as T
+import torchvision.transforms.functional as TF
 from tqdm import tqdm
 
 from config_const import (
@@ -883,6 +884,7 @@ def generate_obj_sequential(
     global_ip_scale: float = 1.0,
     bbox_preserve_start: float = 1.0,
     strength: float = 0.6,
+    obj_strength: float | None = None,
     num_inference_steps: int = 20,
     guidance_scale: float = 3.5,
     prompt_embeds: torch.Tensor | None = None,
@@ -919,11 +921,11 @@ def generate_obj_sequential(
     x1 = min(image_size, int((bbox['cx'] + bbox['half']) * scale + pad))
     y1 = min(image_size, int((bbox['cy'] + bbox['half']) * scale + pad))
 
-    shared = dict(
+    shared_base = dict(
         height=image_size, width=image_size,
         num_inference_steps=num_inference_steps,
         guidance_scale=guidance_scale,
-        strength=strength, seed=seed,
+        seed=seed,
         prompt_embeds=prompt_embeds,
         pooled_prompt_embeds=pooled_prompt_embeds,
         show_progress=show_progress,
@@ -935,7 +937,8 @@ def generate_obj_sequential(
         pipe, image_proj, crop, obj_siglip,
         ip_adapter_scale=obj_ip_scale,
         aperture_composite=False,
-        **shared)
+        strength=obj_strength if obj_strength is not None else strength,
+        **shared_base)
 
     # Paste pass-1 crop back onto orig at pixel level before encoding.
     # This lets the VAE encode the full composite at native resolution — no
@@ -949,12 +952,18 @@ def generate_obj_sequential(
 
     grid = image_size // 16
 
-    # Build packed bbox_mask: 1 at token positions inside bbox, 0 elsewhere
+    # Build packed bbox_mask with soft boundary: Gaussian-blur the binary pixel
+    # mask before avg-pooling so latent tokens near the bbox edge get a fractional
+    # blend weight instead of a hard 0/1 cut.
     bbox_mask_pixel = torch.zeros(1, 1, image_size, image_size)
     bbox_mask_pixel[:, :, y0:y1, x0:x1] = 1.0
+    sigma_px = 8.0
+    ks = int(6 * sigma_px) | 1
+    blurred = TF.gaussian_blur(bbox_mask_pixel, kernel_size=[ks, ks], sigma=sigma_px)
+    # Renormalize so the interior stays at 1.0 — only the boundary fringe tapers.
+    bbox_mask_pixel = (blurred / blurred.max().clamp(min=1e-6)).clamp(0.0, 1.0)
     bbox_mask_packed = F.avg_pool2d(bbox_mask_pixel, kernel_size=16).view(
         1, grid * grid, 1).to(device=device, dtype=dtype)
-    bbox_mask_packed = (bbox_mask_packed > 0.5).to(dtype=dtype)
 
     # Pass 2: start from the original init latent so global SigLIP denoises
     # the full image naturally.  The pass-1 bbox latent is used only as the
@@ -968,6 +977,7 @@ def generate_obj_sequential(
         bbox_latent=spliced_latent,
         bbox_mask=bbox_mask_packed,
         bbox_preserve=bbox_preserve_start,
-        **shared)
+        strength=strength,
+        **shared_base)
 
     return result

@@ -1,9 +1,9 @@
 """
 Generate HVM object-specific reconstructions for all test stimuli.
 
-For each stimulus, saves one PNG with 10 side-by-side columns:
-  Full image: Original | Control | Text (cat CLIP) | Neural pred (global+obj) | GT emb (↑)
-  Obj crop:   Crop     | Control | Text (cat CLIP) | Neural pred (obj)        | GT emb (↑)
+For each stimulus, saves one PNG with side-by-side columns:
+  Full image: Original | Control (img2img) | Control (seq) | Text (cat CLIP+T5, seq) | Neural pred (seq) | GT emb (seq ↑)
+  Obj crop:   Crop     | Control (null)    | Text (cat CLIP+T5)                       | Neural pred (obj) | GT emb (obj ↑)
 
 Global SigLIP comes from the full-image multihead model; obj-SigLIP comes from
 the obj multihead model (trained on bbox-crop embeddings) and is injected into
@@ -32,9 +32,10 @@ from generation.aperture import load_hvm_packed_aperture_mask
 from generation.project_hvm import load_hvm_bboxes
 from get_device import get_device
 
-STRENGTH      = 0.65
+STRENGTH      = 0.6
+OBJ_STRENGTH  = 0.75
 IP_SCALE      = 1.0
-BBOX_PRESERVE = 0.6   # bbox preserve weight at t=1 (high noise); decays linearly to 0 at t=0
+BBOX_PRESERVE = 0.55   # bbox preserve weight at t=1 (high noise); decays linearly to 0 at t=0
 NUM_STEPS     = 20
 IMAGE_SIZE    = 512
 BBOX_SRC      = 276
@@ -157,11 +158,12 @@ def main(stim_limit):
     full_dir.mkdir(parents=True, exist_ok=True)
     crop_dir.mkdir(parents=True, exist_ok=True)
 
-    full_labels = ['Original', 'Control\n(null)', 'Text\n(cat CLIP + T5)', 'Neural pred\n(sequential)', 'GT emb\n(sequential ↑)']
+    full_labels = ['Original', 'Control\n(null img2img)', 'Control\n(null seq)', 'Text\n(cat CLIP + T5)', 'Neural pred\n(sequential)', 'GT emb\n(sequential ↑)']
     crop_labels = ['Crop',     'Control\n(null)', 'Text\n(cat CLIP + T5)', 'Neural pred\n(obj)',         'GT emb\n(obj ↑)']
 
     seq_shared = dict(
-        strength=STRENGTH, num_inference_steps=NUM_STEPS, guidance_scale=3.5,
+        strength=STRENGTH, obj_strength=OBJ_STRENGTH,
+        num_inference_steps=NUM_STEPS, guidance_scale=3.5,
         bbox_preserve_start=BBOX_PRESERVE, image_size=IMAGE_SIZE, bbox_src=BBOX_SRC,
         aperture_mask=hvm_aperture, show_progress=False,
         prompt_embeds=zero_t5,
@@ -184,7 +186,7 @@ def main(stim_limit):
         )
         crop_base = dict(
             height=IMAGE_SIZE, width=IMAGE_SIZE, num_inference_steps=NUM_STEPS,
-            guidance_scale=3.5, strength=STRENGTH, seed=i,
+            guidance_scale=3.5, strength=OBJ_STRENGTH, seed=i,
             aperture_composite=False, show_progress=False,
         )
 
@@ -192,10 +194,19 @@ def main(stim_limit):
         f_control = generate_img2img(
             pipe, image_proj, orig, zero_siglip,
             ip_adapter_scale=0.0, prompt='', **full_base)
-        f_text = generate_img2img(
-            pipe, image_proj, orig, zero_siglip,
-            ip_adapter_scale=0.0,
-            prompt_embeds=t5_cat, pooled_prompt_embeds=clip_cat, **full_base)
+        f_control_seq = generate_obj_sequential(
+            pipe, image_proj, orig, bbox,
+            obj_siglip=zero_siglip, global_siglip=zero_siglip,
+            obj_ip_scale=0.0, global_ip_scale=0.0,
+            pooled_prompt_embeds=clip_cat * 0,
+            seed=i, **seq_shared)
+        seq_shared_text = {**seq_shared, 'prompt_embeds': t5_cat}
+        f_text_seq = generate_obj_sequential(
+            pipe, image_proj, orig, bbox,
+            obj_siglip=zero_siglip, global_siglip=zero_siglip,
+            obj_ip_scale=0.0, global_ip_scale=0.0,
+            pooled_prompt_embeds=clip_cat,
+            seed=i, **seq_shared_text)
         f_neural = generate_obj_sequential(
             pipe, image_proj, orig, bbox,
             obj_siglip=neural_pred_sig_obj[stim_idx],
@@ -230,7 +241,7 @@ def main(stim_limit):
             prompt_embeds=zero_t5,
             pooled_prompt_embeds=clip_gt[stim_idx].unsqueeze(0), **crop_base)
 
-        add_labels([orig, f_control, f_text, f_neural, f_gt], full_labels).save(
+        add_labels([orig, f_control, f_control_seq, f_text_seq, f_neural, f_gt], full_labels).save(
             full_dir / f'stim{stim_idx:04d}.png')
         add_labels([crop_pil, c_control, c_text, c_neural, c_gt], crop_labels).save(
             crop_dir / f'stim{stim_idx:04d}.png')
