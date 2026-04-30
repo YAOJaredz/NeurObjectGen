@@ -132,6 +132,22 @@ neural r (N×T) ─┤                └── CLIP head ─────▶ (un
 
 ---
 
+## 6. Next Steps
+
+### 6.1 Train Without Category Conditioning
+
+The current architecture adds a learned category embedding to the shared latent at both training and inference time (Section 3, Stage 1). Removing this conditioning will test whether the transformer encoder learns stimulus-specific representations from neural activity alone, without access to category labels. This is a stricter evaluation of decoding fidelity: if identification accuracy drops substantially, it suggests the model is partially leveraging category structure rather than fine-grained within-category variation. Conversely, if performance is preserved, it demonstrates that the shared latent captures image-level information beyond category membership. The ablation requires retraining both the global and object models with the category embedding removed and re-evaluating all four comparison conditions on the held-out test set.
+
+### 6.2 Encoder Attention Mask Analysis: Neuron × Time Contribution
+
+The transformer encoder produces a scalar attention weight over all tokens (CLS + time-step tokens) before attention pooling. Analyzing these weights across the test set will reveal which neurons and which time bins contribute most to the pooled representation. Specifically, the attention weights can be decomposed into a neuron × time contribution matrix by projecting each token's attention scalar back through the input projection. Aggregating these across stimuli and comparing within versus across categories will indicate whether the encoder attends preferentially to late time bins (consistent with IT's slow integration), to particular neurons that are known to be category-selective, or to both. This analysis is fully non-parametric and requires no additional training, only a forward pass with attention weights logged.
+
+### 6.3 Analysis of the Shared Embedding
+
+The shared latent (shared_dim-dimensional vector produced after attention pooling and projection) can be treated as a learned population vector and analyzed with standard systems neuroscience tools. Because it is computed independently for each stimulus, the 450 × shared_dim matrix is a direct analogue to a neural population response matrix. Standard analyses apply: a linear decoder (ridge regression or LDA) can test how well category, object identity, or viewpoint can be read out from this space; classification accuracy across object identities within a category will measure within-category discriminability; and RSA can compare the shared latent geometry to the raw neural population geometry and to the SigLIP target geometry. Together these characterize whether the encoder's learned transformation increases or decreases the linear separability of object representations relative to the input population, framing it as a question about the geometry of the neural code rather than about the generative model.
+
+---
+
 ## References
 
 - Y. Takagi and S. Nishimoto. High-resolution image reconstruction with latent diffusion models from human brain activity. In *CVPR*, 2023.
