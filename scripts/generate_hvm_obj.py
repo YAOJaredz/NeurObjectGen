@@ -33,9 +33,10 @@ from generation.project_hvm import load_hvm_bboxes
 from get_device import get_device
 
 STRENGTH      = 0.6
-OBJ_STRENGTH  = 0.75
+OBJ_STRENGTH  = 0.7
 IP_SCALE      = 1.0
-BBOX_PRESERVE = 0.55   # bbox preserve weight at t=1 (high noise); decays linearly to 0 at t=0
+BBOX_PRESERVE    = 0.55   # bbox preserve weight at t=1 (high noise); decays cosine to 0 at t=0
+BBOX_TRANSITION  = 10     # inward transition width in pixels at each bbox edge
 NUM_STEPS     = 20
 IMAGE_SIZE    = 512
 BBOX_SRC      = 276
@@ -76,11 +77,10 @@ def load_stimulus(global_idx: int, size: int = IMAGE_SIZE) -> Image.Image:
 def get_crop(stim_idx: int, orig: Image.Image, bboxes, image_size: int = IMAGE_SIZE) -> Image.Image:
     b = bboxes[stim_idx]
     scale = image_size / BBOX_SRC
-    pad = 5
-    x0 = max(0, int((b['cx'] - b['half']) * scale - pad))
-    y0 = max(0, int((b['cy'] - b['half']) * scale - pad))
-    x1 = min(image_size, int((b['cx'] + b['half']) * scale + pad))
-    y1 = min(image_size, int((b['cy'] + b['half']) * scale + pad))
+    x0 = max(0, int((b['cx'] - b['half']) * scale))
+    y0 = max(0, int((b['cy'] - b['half']) * scale))
+    x1 = min(image_size, int((b['cx'] + b['half']) * scale))
+    y1 = min(image_size, int((b['cy'] + b['half']) * scale))
     return orig.crop((x0, y0, x1, y1)).resize((image_size, image_size), Image.LANCZOS)
 
 
@@ -164,7 +164,7 @@ def main(stim_limit):
     seq_shared = dict(
         strength=STRENGTH, obj_strength=OBJ_STRENGTH,
         num_inference_steps=NUM_STEPS, guidance_scale=3.5,
-        bbox_preserve_start=BBOX_PRESERVE, image_size=IMAGE_SIZE, bbox_src=BBOX_SRC,
+        bbox_preserve_start=BBOX_PRESERVE, image_size=IMAGE_SIZE, bbox_src=BBOX_SRC, bbox_transition=BBOX_TRANSITION,
         aperture_mask=hvm_aperture, show_progress=False,
         prompt_embeds=zero_t5,
     )

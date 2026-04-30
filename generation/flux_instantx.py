@@ -40,7 +40,6 @@ from diffusers.pipelines.flux.pipeline_flux import (
 from huggingface_hub import hf_hub_download
 from PIL import Image
 import torchvision.transforms as T
-import torchvision.transforms.functional as TF
 from tqdm import tqdm
 
 from config_const import (
@@ -892,6 +891,7 @@ def generate_obj_sequential(
     aperture_mask: torch.Tensor | None = None,
     image_size: int = 512,
     bbox_src: int = 276,
+    bbox_transition: int = 15,
     seed: int = 0,
     show_progress: bool = False,
 ) -> Image.Image:
@@ -914,12 +914,11 @@ def generate_obj_sequential(
     device = pipe.device
     dtype  = torch.bfloat16
 
-    pad   = 5
     scale = image_size / bbox_src
-    x0 = max(0, int((bbox['cx'] - bbox['half']) * scale - pad))
-    y0 = max(0, int((bbox['cy'] - bbox['half']) * scale - pad))
-    x1 = min(image_size, int((bbox['cx'] + bbox['half']) * scale + pad))
-    y1 = min(image_size, int((bbox['cy'] + bbox['half']) * scale + pad))
+    x0 = max(0, int((bbox['cx'] - bbox['half']) * scale))
+    y0 = max(0, int((bbox['cy'] - bbox['half']) * scale))
+    x1 = min(image_size, int((bbox['cx'] + bbox['half']) * scale))
+    y1 = min(image_size, int((bbox['cy'] + bbox['half']) * scale))
 
     shared_base = dict(
         height=image_size, width=image_size,
@@ -952,16 +951,18 @@ def generate_obj_sequential(
 
     grid = image_size // 16
 
-    # Build packed bbox_mask with soft boundary: Gaussian-blur the binary pixel
-    # mask before avg-pooling so latent tokens near the bbox edge get a fractional
-    # blend weight instead of a hard 0/1 cut.
-    bbox_mask_pixel = torch.zeros(1, 1, image_size, image_size)
-    bbox_mask_pixel[:, :, y0:y1, x0:x1] = 1.0
-    sigma_px = 8.0
-    ks = int(6 * sigma_px) | 1
-    blurred = TF.gaussian_blur(bbox_mask_pixel, kernel_size=[ks, ks], sigma=sigma_px)
-    # Renormalize so the interior stays at 1.0 — only the boundary fringe tapers.
-    bbox_mask_pixel = (blurred / blurred.max().clamp(min=1e-6)).clamp(0.0, 1.0)
+    # Build packed bbox_mask: 1.0 in the interior, inward ramp of width
+    # bbox_transition px at each edge, 0 outside the bbox.
+    # Use a distance-to-edge ramp: each pixel's value = min distance to any
+    # bbox edge, clamped and normalized to [0, 1] over bbox_transition px.
+    # Interior pixels are exactly 1.0; no blur is applied.
+    ys = torch.arange(image_size).float()
+    xs = torch.arange(image_size).float()
+    dist_y = torch.min(ys - y0, torch.tensor(float(y1)) - ys).clamp(0)
+    dist_x = torch.min(xs - x0, torch.tensor(float(x1)) - xs).clamp(0)
+    ramp_y = (dist_y / bbox_transition).clamp(0.0, 1.0)  # (H,)
+    ramp_x = (dist_x / bbox_transition).clamp(0.0, 1.0)  # (W,)
+    bbox_mask_pixel = (ramp_y[:, None] * ramp_x[None, :]).unsqueeze(0).unsqueeze(0)
     bbox_mask_packed = F.avg_pool2d(bbox_mask_pixel, kernel_size=16).view(
         1, grid * grid, 1).to(device=device, dtype=dtype)
 
