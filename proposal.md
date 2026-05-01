@@ -146,6 +146,17 @@ The transformer encoder produces a scalar attention weight over all tokens (CLS 
 
 The shared latent (shared_dim-dimensional vector produced after attention pooling and projection) can be treated as a learned population vector and analyzed with standard systems neuroscience tools. Because it is computed independently for each stimulus, the 450 × shared_dim matrix is a direct analogue to a neural population response matrix. Standard analyses apply: a linear decoder (ridge regression or LDA) can test how well category, object identity, or viewpoint can be read out from this space; classification accuracy across object identities within a category will measure within-category discriminability; and RSA can compare the shared latent geometry to the raw neural population geometry and to the SigLIP target geometry. Together these characterize whether the encoder's learned transformation increases or decreases the linear separability of object representations relative to the input population, framing it as a question about the geometry of the neural code rather than about the generative model.
 
+### 6.4 Quantitative Image Quality Assessment
+
+Beyond embedding-space metrics, reconstruction fidelity should be measured directly in pixel and perceptual space to characterize what the generative model actually produces. We evaluate four complementary metrics on the 90 held-out test stimuli across all four comparison conditions, comparing each reconstruction to the ground-truth stimulus inside the HVM circular aperture:
+
+- **SSIM (Structural Similarity Index)** — captures luminance, contrast, and structural agreement at the patch level; sensitive to spatial misalignment but interpretable as a low-level fidelity score
+- **LPIPS (Learned Perceptual Image Patch Similarity)** — VGG-based perceptual distance that correlates better with human judgments of image similarity than pixel metrics; lower is better
+- **FID (Fréchet Inception Distance)** — measures the distributional distance between reconstructions and ground-truth stimuli in Inception-v3 feature space; computed across all 90 test pairs per condition, reflecting both fidelity and diversity
+- **PixCorr (pixel correlation)** — Pearson correlation between flattened pixel intensities of reconstruction and ground-truth, computed per stimulus and averaged; a coarse but widely reported baseline in brain-to-image literature [Scotti et al., 2024; Ciferri et al., 2026]
+
+All metrics are computed inside the HVM aperture mask to avoid penalizing the gray surround. SSIM and PixCorr are averaged per stimulus; LPIPS is averaged per stimulus then reported as mean ± s.e.m. across test images; FID is computed once per condition over the full 90-image set. Comparing these across the four conditions (control, text, neural pred, GT emb) will quantify the pixel-level gain from neural conditioning beyond the img2img baseline and establish how close neural predictions come to the ground-truth embedding upper bound.
+
 ---
 
 ## References
