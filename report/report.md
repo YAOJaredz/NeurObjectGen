@@ -22,7 +22,9 @@ We train two lightweight MultiHeadTransformer encoders (Figure 1). The **global 
 
 The training loss combines per-head InfoNCE and cosine regression with a uniformity penalty on the shared latent:
 
-$$\mathcal{L} = w_{\text{sig}} \Bigl[\alpha\,\mathcal{L}^{\text{sig}}_{\text{NCE}} + (1-\alpha)\,\mathcal{L}^{\text{sig}}_{\text{cos}}\Bigr] + w_{\text{clip}} \Bigl[\alpha\,\mathcal{L}^{\text{clip}}_{\text{NCE}} + (1-\alpha)\,\mathcal{L}^{\text{clip}}_{\text{cos}}\Bigr] + w_{\text{unif}}\,\mathcal{L}_{\text{unif}}$$
+$$
+\mathcal{L} = w_{\text{sig}} \Bigl[\alpha\,\mathcal{L}^{\text{sig}}_{\text{NCE}} + (1-\alpha)\,\mathcal{L}^{\text{sig}}_{\text{cos}}\Bigr] + w_{\text{clip}} \Bigl[\alpha\,\mathcal{L}^{\text{clip}}_{\text{NCE}} + (1-\alpha)\,\mathcal{L}^{\text{clip}}_{\text{cos}}\Bigr] + w_{\text{unif}}\,\mathcal{L}_{\text{unif}}
+$$
 
 where $\alpha$ controls the InfoNCE/cosine tradeoff and $\mathcal{L}_{\text{unif}}$ penalises collapsed shared latents. Hyperparameters are swept on SLURM; the best configuration is d_model=64, n_heads=4, n_layers=2, shared_dim=512.
 
@@ -47,10 +49,10 @@ Four conditions are evaluated: Control, Text-only (category name), Neural pred (
 
 Both models generalize to held-out test stimuli, confirming that 270 training examples are sufficient to recover stimulus-specific embedding information from noisy pseudo-population responses.
 
-| Model | SigLIP cos sim | CLIP cos sim | SigLIP 2-AFC | CLIP 2-AFC |
-|---|---|---|---|---|
-| Global model | TBD | TBD | TBD | TBD |
-| Object model | TBD | TBD | TBD | TBD |
+| Model        | SigLIP cos sim | CLIP cos sim | SigLIP 2-AFC | CLIP 2-AFC |
+| ------------ | -------------- | ------------ | ------------ | ---------- |
+| Global model | 0.8331         | 0.9834       | 0.9663       | 0.9101     |
+| Object model | 0.8804         | 0.9886       | 0.9582       | 0.9101     |
 
 *[Table 1: Embedding cosine similarity and 2-AFC identification accuracy (chance = 0.5) on the 90 test stimuli.]*
 
@@ -62,7 +64,7 @@ Across the 90 test stimuli, neural pred reconstructions are visually comparable 
 
 *[Figure 3: Five-column composite strips (Original | Control | Text | Neural Pred | GT upper bound) for representative test stimuli.]*
 
-### Decoding Object Gesture
+### Decoding Object Gesture 
 
 The most diagnostic cases are stimuli where object pose, viewpoint, or spatial configuration varies substantially within a category. Neural pred reconstructions recover these within-category variations in several examples, producing outputs where the object gesture (e.g., limb position, orientation, facing direction) matches the original stimulus more closely than the text condition, which is blind to pose. This provides direct evidence that the encoder captures stimulus-specific visual structure beyond category membership.
 
