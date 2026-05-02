@@ -33,7 +33,7 @@ Neural response r (N neurons × 250 ms)
      full reconstruction x̂        obj-crop reconstruction x̂_obj
 ```
 
-**Stage 1 — MultiHeadTransformer (×2).** Each model maps neural population responses to dual embedding targets. The *global model* targets full-image SigLIP-SO400M (1152-d) + CLIP-short (768-d). The *object model* targets bbox-crop SigLIP + CLIP-short. Both use a pre-LN transformer encoder with attention pooling, a shared projection to `shared_dim`, optional category conditioning (learned embedding added to shared latent), and two L2-normalised head projections. Loss: `w_sig · head_loss(ẑ_sig, z_sig) + w_clip · head_loss(ẑ_clip, z_clip) + w_unif · L_unif`, where `head_loss = nce_weight · InfoNCE + (1 − nce_weight) · cosine`.
+**Stage 1 — MultiHeadTransformer (×2).** Each model maps neural population responses to dual embedding targets. The *global model* targets full-image SigLIP-SO400M (1152-d) + CLIP (768-d). The *object model* targets bbox-crop SigLIP + CLIP. Both use a pre-LN transformer encoder with attention pooling, a shared projection to `shared_dim`, optional category conditioning (learned embedding added to shared latent), and two L2-normalised head projections. Loss: `w_sig · head_loss(ẑ_sig, z_sig) + w_clip · head_loss(ẑ_clip, z_clip) + w_unif · L_unif`, where `head_loss = nce_weight · InfoNCE + (1 − nce_weight) · cosine`.
 
 **Stage 2 — FLUX.1-dev + InstantX IP-Adapter (inference only).** No adapter training. The pretrained `MLPProjModel` (SigLIP 1152 → 128 × 4096 image tokens) conditions all 57 FLUX transformer blocks via installed `IPAFluxAttnProcessor` key/value projections. Generation is a sequential two-pass img2img:
 
@@ -91,26 +91,23 @@ python scripts/generate_hvm_obj.py
 python scripts/generate_hvm_obj.py --n 10
 ```
 
-Outputs are saved to `outputs/generate_hvm_obj/full/` and `outputs/generate_hvm_obj/crop/` as labeled 5-column PNG composites:
+Outputs are saved to `outputs/generate_hvm_obj/full/` and `outputs/generate_hvm_obj/crop/` as labeled PNG composites. Four conditions are evaluated:
 
-| Column | Condition            | T5          | CLIP                | SigLIP                                   |
-| ------ | -------------------- | ----------- | ------------------- | ---------------------------------------- |
-| 1      | Original             | —          | —                  | —                                       |
-| 2      | Control              | null        | null                | disabled                                 |
-| 3      | Text (cat CLIP + T5) | category T5 | category CLIP       | disabled                                 |
-| 4      | Neural pred          | zeroed      | ẑ_clip (obj model) | ẑ_sig_obj → ẑ_sig_global (sequential) |
-| 5      | GT emb (upper bound) | zeroed      | category CLIP       | GT SigLIP crop → GT SigLIP full         |
+| Condition            | T5          | CLIP                | SigLIP                                   |
+| -------------------- | ----------- | ------------------- | ---------------------------------------- |
+| Control              | null        | null                | disabled                                 |
+| Text (cat CLIP + T5) | category T5 | category CLIP       | disabled                                 |
+| Neural pred          | zeroed      | ẑ_clip (obj model) | ẑ_sig_obj → ẑ_sig_global (sequential) |
+| GT emb (upper bound) | zeroed      | category CLIP       | GT SigLIP crop → GT SigLIP full         |
 
 ---
 
 ## Evaluation Metrics
 
-- **Cosine similarity** — mean cosine between predicted and ground-truth embeddings
-- **2-AFC identification** — pairwise forced-choice accuracy (chance = 0.5): for each test sample, check whether the predicted embedding is closer to its own ground-truth than to all other ground-truths
-- **Top-k retrieval** — fraction of test samples whose correct target ranks in the top k by cosine similarity
-- **SSIM** — structural similarity on generated images
+- **Cosine similarity** — mean cosine between predicted and ground-truth embeddings (SigLIP and CLIP separately)
+- **2-AFC identification** — pairwise forced-choice accuracy (chance = 0.5): for each test sample, check whether the predicted embedding is closer to its own ground-truth than to each of the 89 distractors
 
-Success criteria: (a) neural-only 2-AFC > chance, (b) neural pred 2-AFC > text condition.
+Success criteria: (a) neural-only 2-AFC > chance on both heads, (b) neural pred reconstruction quality matches or exceeds the text condition.
 
 ---
 
@@ -118,4 +115,3 @@ Success criteria: (a) neural-only 2-AFC > chance, (b) neural pred 2-AFC > text c
 
 - N. C. Rust and J. J. DiCarlo. Selectivity and tolerance ("invariance") both increase as visual information propagates from cortical area V4 to IT. *Journal of Neuroscience*, 30(39):12978–12995, 2010.
 - J. J. DiCarlo, D. Zoccolan, and N. C. Rust. How does the brain solve visual object recognition? *Neuron*, 73(3):415–434, 2012.
-- M. Ciferri, M. Ferrante, and N. Toschi. Simple models, rich representations: Visual decoding from primate intracortical neural signals. *arXiv:2601.11108*, 2026.
