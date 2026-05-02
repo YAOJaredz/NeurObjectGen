@@ -109,7 +109,7 @@ def predict_all(model, neural_tensor, cat_indices):
     return torch.cat(sigs), torch.cat(clips)
 
 
-def main(stim_limit):
+def main(stim_limit, ip_lora_path=None):
     device = get_device()
     torch.cuda.empty_cache()
 
@@ -140,7 +140,9 @@ def main(stim_limit):
         test_idx = test_idx[:stim_limit]
 
     # ── FLUX pipeline ─────────────────────────────────────────────────────────
-    pipe, image_proj = load_pipeline(device=device, default_scale=1.0)
+    pipe, image_proj = load_pipeline(device=device, default_scale=1.0, ip_lora_path=ip_lora_path)
+    if ip_lora_path is not None:
+        print(f"[generate_hvm_obj] using IP-Adapter LoRA: {ip_lora_path}")
     hvm_aperture = load_hvm_packed_aperture_mask(image_size=IMAGE_SIZE, device='cpu', dtype=torch.bfloat16)
 
     cat_clip_embeds, cat_t5_embeds = encode_text_embeds(pipe, list(HVM_CATEGORIES))
@@ -253,5 +255,8 @@ if __name__ == '__main__':
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--n', type=int, default=None,
                         help='limit to first N test stimuli (default: all)')
+    parser.add_argument('--ip-lora', type=str, default=None,
+                        help='path to IP-Adapter LoRA checkpoint (from train/train_ip_lora.py); '
+                             'when omitted, uses the frozen InstantX adapter')
     args = parser.parse_args()
-    main(args.n)
+    main(args.n, ip_lora_path=args.ip_lora)

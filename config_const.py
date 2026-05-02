@@ -66,6 +66,12 @@ SIGLIP_DIM = 1152  # google/siglip-so400m-patch14-384
 CLIP_DIM = 768     # FLUX CLIP pooled embedding dim
 CHECKPOINT_DIR = REPO_ROOT / "checkpoints"
 
+IP_LORA_DIR              = CHECKPOINT_DIR / "ip_lora"
+IP_LORA_DEFAULT_PATH     = IP_LORA_DIR / "hvm_r8.safetensors"
+IP_LORA_RANK_DEFAULT     = 8
+IP_LORA_ALPHA_DEFAULT    = 16
+IP_LORA_PDROP_DEFAULT    = 0.5
+
 T5_PCA_K          = 128
 T5_PCA_BASIS_PATH = CACHE_DIR / f"t5_pca_basis_k{T5_PCA_K}.pt"   # (K, 4096)
 T5_PCA_MEAN_PATH  = CACHE_DIR / f"t5_pca_mean_k{T5_PCA_K}.pt"    # (4096,)
