@@ -1,24 +1,28 @@
-"""Fine-tune the InstantX IP-Adapter to the HVM stimulus distribution via LoRA.
+"""Fine-tune the FLUX transformer backbone to the HVM stimulus distribution via LoRA.
 
-We train rank-r LoRA adapters on ``to_k_ip`` and ``to_v_ip`` of every
-IPAFluxAttnProcessor (57 blocks × 2 layers) using the standard FLUX
-flow-matching denoising objective on the 450 HVM PNGs. Stochastic IP-Adapter
-dropout (CFG-style) drops the SigLIP conditioning at probability ``p_drop``
-each step so the LoRA learns to behave both with and without guidance.
+Wraps Q/K/V/O of the main attention path, the joint-attention text-side
+projections, and both feed-forward modules across all 57 FLUX transformer
+blocks (19 double-stream + 38 single-stream). At rank 8 this gives ~30-40M
+trainable parameters while the FLUX base weights, VAE, text encoders,
+MLPProjModel, and SigLIP encoder all stay frozen. The InstantX IP-Adapter
+remains loaded and runs at scale=1.0 throughout, providing the SigLIP
+conditioning signal the LoRA learns to denoise against.
 
-Everything else stays frozen: FLUX transformer, VAE, text encoders,
-MLPProjModel, SigLIP. Only ~6M LoRA parameters are trainable for rank 8.
+Stochastic IP-Adapter dropout (CFG-style) drops the SigLIP conditioning at
+probability ``p_drop`` per sample, so the LoRA learns to behave both with
+and without guidance.
 
-Multi-GPU: wraps the LoRA params (only) in DDP via ``accelerate``. Launch with
-``accelerate launch`` or ``torchrun`` to scale the effective batch size with
-the number of GPUs (each GPU loads its own copy of the frozen FLUX transformer
-but only ~6.5M LoRA grads are reduced across ranks).
+Multi-GPU: each rank loads its own frozen FLUX, and we manually all-reduce
+LoRA grads across ranks before each optimizer step. We do NOT call
+``Accelerator.prepare`` on the model (DDP-on-empty-forward semantics caused
+a 'no grad_fn' crash in earlier versions of this script). Launch with
+``accelerate launch --num_processes N`` to scale effective batch size.
 
 Usage:
     # single GPU
-    python -m train.train_ip_lora --steps 2000 --rank 8 --alpha 16 --p-drop 0.1
-    # multi-GPU on one node (e.g. 4 GPUs on ax11)
-    accelerate launch --num_processes 4 -m train.train_ip_lora --steps 2000 ...
+    python -m train.train_flux_lora --steps 2000 --rank 8 --alpha 16 --p-drop 0.1
+    # multi-GPU on one node (e.g. 2 GPUs on ax11)
+    accelerate launch --num_processes 2 -m train.train_flux_lora --steps 2000 ...
 """
 
 from __future__ import annotations
@@ -45,20 +49,20 @@ sys.path.append('.')
 from config_const import (
     HVM_CATEGORIES, HVM_N_VAR, HVM_STIM_DIR,
     HVM_SIGLIP_EMBEDDINGS_PATH, SIGLIP_DIM,
-    IP_LORA_DEFAULT_PATH, IP_LORA_DIR,
-    IP_LORA_RANK_DEFAULT, IP_LORA_ALPHA_DEFAULT, IP_LORA_PDROP_DEFAULT,
+    FLUX_LORA_DEFAULT_PATH, FLUX_LORA_DIR,
+    FLUX_LORA_RANK_DEFAULT, FLUX_LORA_ALPHA_DEFAULT, FLUX_LORA_PDROP_DEFAULT,
 )
 from generation.flux_instantx import (
     encode_image, encode_text_embeds, load_pipeline,
     _siglip_to_image_emb,
 )
-from generation.ip_lora import add_ip_lora, save_ip_lora
+from generation.flux_lora import add_flux_lora, save_flux_lora
 
 
 def _allreduce_grads(params, world_size: int) -> None:
     """All-reduce LoRA grads across ranks. Equivalent to DDP's grad-bucket sync,
-    but applied directly to the unwrapped LoRA params — avoids the fragile
-    DDP-on-empty-forward semantics that caused 'no grad_fn' on rank 1.
+    but applied directly to the LoRA params — avoids the fragile DDP-on-empty-
+    forward semantics that caused 'no grad_fn' on rank 1 in earlier versions.
     """
     if world_size <= 1:
         return
@@ -146,15 +150,7 @@ def training_step(
     latents = pipe._pack_latents(latents_unpacked, batch_size, latent_channels, h, w)
     latent_image_ids = pipe._prepare_latent_image_ids(batch_size, h // 2, w // 2, device, dtype)
 
-    # --- IP conditioning, with stochastic dropout for CFG-style training ---
-    # We always project the SigLIP and route it through the IP-Adapter LoRA
-    # path; "dropout" is implemented by zeroing the IP tokens for dropped
-    # samples. We deliberately do NOT set image_emb=None when all samples drop,
-    # because that would skip the LoRA-wrapped to_k_ip/to_v_ip entirely and
-    # produce a loss with no grad graph — fatal under multi-rank DDP, where
-    # one rank can drop while another keeps conditioning, causing grad-sync
-    # mismatches. Zeroed IP tokens still exercise the LoRA modules (delta
-    # contribution is exactly 0 numerically, but a grad path exists for sync).
+    # --- SigLIP conditioning, with stochastic dropout for CFG-style training ---
     drop_mask = torch.rand((batch_size,), generator=generator, device=device) < p_drop
     siglip_batch = siglip_batch.to(device=device, dtype=dtype)
     with torch.no_grad():
@@ -175,7 +171,7 @@ def training_step(
     pooled_embeds = null_pooled_embeds.expand(batch_size, -1)
     text_ids = null_text_ids
 
-    # --- Forward through FLUX transformer ---
+    # --- Forward through FLUX transformer (LoRA-wrapped backbone) ---
     timesteps_in = (t * 1000.0).to(dtype)  # FLUX expects timestep / 1000 inside transformer
     guidance = torch.full((batch_size,), 3.5, device=device, dtype=dtype)
 
@@ -213,14 +209,14 @@ def parse_args():
     p.add_argument("--lr", type=float, default=1e-4)
     p.add_argument("--weight-decay", type=float, default=0.0)
     p.add_argument("--warmup-steps", type=int, default=100)
-    p.add_argument("--rank", type=int, default=IP_LORA_RANK_DEFAULT)
-    p.add_argument("--alpha", type=int, default=IP_LORA_ALPHA_DEFAULT)
+    p.add_argument("--rank", type=int, default=FLUX_LORA_RANK_DEFAULT)
+    p.add_argument("--alpha", type=int, default=FLUX_LORA_ALPHA_DEFAULT)
     p.add_argument("--lora-dropout", type=float, default=0.0)
-    p.add_argument("--p-drop", type=float, default=IP_LORA_PDROP_DEFAULT,
+    p.add_argument("--p-drop", type=float, default=FLUX_LORA_PDROP_DEFAULT,
                    help="probability of dropping the SigLIP conditioning per sample (CFG-style)")
     p.add_argument("--image-size", type=int, default=512)
     p.add_argument("--seed", type=int, default=42)
-    p.add_argument("--save-path", type=Path, default=IP_LORA_DEFAULT_PATH)
+    p.add_argument("--save-path", type=Path, default=FLUX_LORA_DEFAULT_PATH)
     p.add_argument("--save-every", type=int, default=500)
     p.add_argument("--log-every", type=int, default=10)
     p.add_argument("--gradient-checkpointing", action="store_true")
@@ -232,33 +228,25 @@ def main():
     dtype = torch.bfloat16
 
     # ── Accelerator (device + dataloader sharding + seed; no DDP wrap) ──────
-    # We do NOT use Accelerator.prepare on the model, because the LoRA layers
-    # live inside IPAFluxAttnProcessor (deep in the FLUX transformer's attn
-    # processor dict), and a DDP-wrapped holder module would either silently
-    # drop the grad sync or, worse, set requires_grad=False on the wrapped
-    # params (which is what produced the rank-1 'no grad_fn' crash). Instead
-    # we keep the LoRA params unwrapped and all-reduce their grads manually
-    # before each optimizer step — that's exactly what DDP does, just without
-    # the empty-forward foot-gun.
     accelerator = Accelerator()
     set_seed(args.seed)
     device = accelerator.device
     world_size = accelerator.num_processes
 
     if accelerator.is_main_process:
-        print(f"[ip_lora] world_size={world_size} device={device} dtype={dtype}")
-        print(f"[ip_lora] rank={args.rank} alpha={args.alpha} per-rank-batch={args.batch_size} grad_accum={args.grad_accum}")
+        print(f"[flux_lora] world_size={world_size} device={device} dtype={dtype}")
+        print(f"[flux_lora] rank={args.rank} alpha={args.alpha} per-rank-batch={args.batch_size} grad_accum={args.grad_accum}")
         eff_batch = args.batch_size * args.grad_accum * world_size
-        print(f"[ip_lora] effective batch (samples per optim step) = {eff_batch}")
+        print(f"[flux_lora] effective batch (samples per optim step) = {eff_batch}")
 
     # ── Pipeline + LoRA injection (each rank loads its own frozen FLUX) ─────
     pipe, image_proj = load_pipeline(device=device, dtype=dtype, default_scale=1.0)
     if args.gradient_checkpointing:
         pipe.transformer.enable_gradient_checkpointing()
-    lora_params = add_ip_lora(pipe, rank=args.rank, alpha=args.alpha, dropout=args.lora_dropout)
+    lora_params = add_flux_lora(pipe, rank=args.rank, alpha=args.alpha, dropout=args.lora_dropout)
     n_trainable = sum(p.numel() for p in lora_params)
     if accelerator.is_main_process:
-        print(f"[ip_lora] trainable params: {n_trainable:,} ({n_trainable / 1e6:.2f}M)")
+        print(f"[flux_lora] trainable params: {n_trainable:,} ({n_trainable / 1e6:.2f}M)")
 
     n_other = sum(p.numel() for p in pipe.transformer.parameters() if p.requires_grad) - n_trainable
     assert n_other == 0, f"non-LoRA trainable params leaked: {n_other:,}"
@@ -294,7 +282,7 @@ def main():
     # ── Training loop ────────────────────────────────────────────────────────
     if accelerator.is_main_process:
         args.save_path.parent.mkdir(parents=True, exist_ok=True)
-        IP_LORA_DIR.mkdir(parents=True, exist_ok=True)
+        FLUX_LORA_DIR.mkdir(parents=True, exist_ok=True)
 
     # Per-rank generator: offset by rank so dropout / noise differ across GPUs.
     generator = torch.Generator(device=device).manual_seed(args.seed + accelerator.process_index)
@@ -305,7 +293,7 @@ def main():
 
     pipe.transformer.train()
     optim.zero_grad(set_to_none=True)
-    pbar = tqdm(total=args.steps, desc="ip_lora", dynamic_ncols=True,
+    pbar = tqdm(total=args.steps, desc="flux_lora", dynamic_ncols=True,
                 disable=not accelerator.is_main_process)
     data_iter = iter(loader)
     while step < args.steps:
@@ -326,7 +314,6 @@ def main():
         loss_window.append(loss.detach().float().item())
 
         if accum >= args.grad_accum:
-            # Sync LoRA grads across ranks, then step.
             _allreduce_grads(lora_params, world_size)
             torch.nn.utils.clip_grad_norm_(lora_params, max_norm=1.0)
             optim.step()
@@ -348,13 +335,13 @@ def main():
                     ckpt_path = args.save_path.with_name(
                         args.save_path.stem + f"_step{step}" + args.save_path.suffix
                     )
-                    save_ip_lora(pipe, ckpt_path, rank=args.rank, alpha=args.alpha)
+                    save_flux_lora(pipe, ckpt_path)
 
     accelerator.wait_for_everyone()
     if accelerator.is_main_process:
-        save_ip_lora(pipe, args.save_path, rank=args.rank, alpha=args.alpha)
+        save_flux_lora(pipe, args.save_path)
         pbar.close()
-        print(f"[ip_lora] done. wallclock={time.time() - t0:.1f}s. ckpt={args.save_path}")
+        print(f"[flux_lora] done. wallclock={time.time() - t0:.1f}s. ckpt={args.save_path}")
 
 
 if __name__ == "__main__":

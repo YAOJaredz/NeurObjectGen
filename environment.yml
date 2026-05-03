@@ -23,7 +23,7 @@ dependencies:
       - accelerate
       - huggingface_hub
       - safetensors
-      - peft>=0.11,<0.14
+      - peft>=0.17,<0.20
       - tokenizers
       - sentencepiece
       - pillow

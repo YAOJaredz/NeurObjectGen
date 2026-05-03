@@ -288,18 +288,21 @@ def load_pipeline(
     device: str = "cuda",
     dtype: torch.dtype = torch.bfloat16,
     default_scale: float = 1.0,
-    ip_lora_path: str | Path | None = None,
+    flux_lora_path: str | Path | None = None,
+    fuse_flux_lora: bool = False,
 ) -> tuple[FluxPipeline, MLPProjModel]:
     """Load FLUX.1-dev with the InstantX IP-Adapter installed on every block.
 
     Args:
-        device:        Target device.
-        dtype:         Working dtype (bf16 recommended).
-        default_scale: Initial value for every IP attention processor's ``scale``.
-        ip_lora_path:  Optional path to a LoRA checkpoint produced by
-                       ``train/train_ip_lora.py``. When set, ``to_k_ip`` and
-                       ``to_v_ip`` on every IP processor are wrapped with the
-                       saved LoRA adapter before generation.
+        device:         Target device.
+        dtype:          Working dtype (bf16 recommended).
+        default_scale:  Initial value for every IP attention processor's ``scale``.
+        flux_lora_path: Path to a FLUX-backbone LoRA checkpoint produced by
+                        ``train/train_flux_lora.py``. Loaded via the standard
+                        ``pipe.load_lora_weights`` API.
+        fuse_flux_lora: If True, merge the FLUX LoRA into the base weights
+                        for a small inference speedup (~5%). Makes the LoRA
+                        non-removable; use False if you plan to swap LoRAs.
 
     Returns:
         (pipe, image_proj) — pipe is a frozen FluxPipeline with IP-enabled
@@ -324,16 +327,12 @@ def load_pipeline(
     image_proj = _install_ip_adapter(pipe, device=device, dtype=dtype)
     set_ip_adapter_scale(pipe, default_scale)
 
-    if ip_lora_path is not None:
-        from generation.ip_lora import load_ip_lora
-        load_ip_lora(pipe, ip_lora_path)
-        # Inference: freeze the LoRA params too.
-        for proc in pipe.transformer.attn_processors.values():
-            if isinstance(proc, IPAFluxAttnProcessor):
-                for p in proc.to_k_ip.parameters():
-                    p.requires_grad_(False)
-                for p in proc.to_v_ip.parameters():
-                    p.requires_grad_(False)
+    if flux_lora_path is not None:
+        pipe.load_lora_weights(str(flux_lora_path))
+        if fuse_flux_lora:
+            pipe.fuse_lora()
+        for p in pipe.transformer.parameters():
+            p.requires_grad_(False)
 
     return pipe, image_proj
 
