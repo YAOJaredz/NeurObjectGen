@@ -147,7 +147,15 @@ The current architecture adds a learned category embedding to the shared latent 
 
 The 450 × shared_dim matrix of shared latents is a direct analogue to a neural population response matrix and can be analyzed with standard systems neuroscience tools. A linear decoder (ridge regression or LDA) will test readout of category, object identity, and viewpoint; RSA will compare the shared latent geometry to the raw population geometry and to the SigLIP target geometry. Together these characterize whether the encoder's learned transformation increases the linear separability of object representations relative to the input population.
 
-### 6.3 Five-Fold Cross-Validation for Full-Dataset Coverage
+### 6.3 Time and Neuron Ablation
+
+Neural responses used in the current pipeline are binned over a fixed 70–170 ms window and averaged across all recorded sites. Two ablations will test sensitivity to these choices. For time ablation, the spike-count window will be varied across biologically motivated intervals (e.g., 50–100 ms, 100–150 ms, 150–200 ms) to determine whether the early feedforward sweep or later recurrent activity carries more recoverable image information. For neuron ablation, randomly sampled subsets of recording sites (10%, 25%, 50%, 75%) will be used at inference to produce a capacity curve showing how reconstruction quality degrades as the pseudo-population shrinks. Together these characterize the temporal and spatial requirements of the decoding pipeline.
+
+### 6.4 Update Rust Dataset Pipeline
+
+The current stimulus set is drawn from the Rust et al. recording sessions. Updating this pipeline to incorporate additional sessions or newer preprocessing will increase stimulus coverage and electrode count, directly benefiting the five-fold evaluation and the neuron-ablation analysis above. This includes re-running spike sorting, quality filtering, and pseudo-population alignment to confirm compatibility with the existing encoder architecture.
+
+### 6.5 Five-Fold Cross-Validation for Full-Dataset Coverage
 
 The current evaluation covers only 90 of 450 stimuli. A **five-fold cross-validation** (each fold a disjoint, category-stratified 90-stimulus test partition) would generate reconstructions for every image exactly once, enabling fold-level standard errors on all metrics and per-stimulus analysis across the full set. Both models are retrained from scratch per fold. Systematically difficult stimuli — those where neural predictions consistently fail across folds — can then be identified to reveal limits of the pseudo-population decoder or the IP-Adapter's conditioning capacity.
 
