@@ -24,6 +24,7 @@ from config_const import (
     HVM_STIM_DIR, HVM_N_STIMULI, HVM_N_VAR, HVM_N_CAT, HVM_CATEGORIES,
     HVM_SIGLIP_EMBEDDINGS_PATH, HVM_OBJ_SIGLIP_EMBEDDINGS_PATH,
     HVM_CLIP_EMBEDS_PATH, SIGLIP_DIM,
+    FLUX_LORA_DEFAULT_PATH,
 )
 from data_utils.hvm_loader import _category_stratified_split, _load_hvm_neural
 from encoders import MultiHeadTransformer
@@ -32,8 +33,8 @@ from generation.aperture import load_hvm_packed_aperture_mask
 from generation.project_hvm import load_hvm_bboxes
 from get_device import get_device
 
-STRENGTH      = 0.6
-OBJ_STRENGTH  = 0.7
+STRENGTH      = 0.65
+OBJ_STRENGTH  = 0.75
 IP_SCALE      = 1.0
 BBOX_PRESERVE    = 0.55   # bbox preserve weight at t=1 (high noise); decays cosine to 0 at t=0
 BBOX_TRANSITION  = 10     # inward transition width in pixels at each bbox edge
@@ -109,7 +110,7 @@ def predict_all(model, neural_tensor, cat_indices):
     return torch.cat(sigs), torch.cat(clips)
 
 
-def main(stim_limit, flux_lora_path=None):
+def main(stim_limit, flux_lora_path=FLUX_LORA_DEFAULT_PATH):
     device = get_device()
     torch.cuda.empty_cache()
 
@@ -117,7 +118,7 @@ def main(stim_limit, flux_lora_path=None):
     cfg_global = json.loads((CACHE_DIR / 'best_hvm_multihead_config.json').read_text())
     cfg_obj    = json.loads((CACHE_DIR / 'best_hvm_multihead_obj_config.json').read_text())
 
-    rsp = _load_hvm_neural()
+    rsp, _, _ = _load_hvm_neural()
     _, n_neurons, _ = rsp.shape
     neural_tensor = torch.from_numpy(rsp).float()
     cat_indices   = torch.arange(HVM_N_STIMULI) // HVM_N_VAR
@@ -255,8 +256,5 @@ if __name__ == '__main__':
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--n', type=int, default=None,
                         help='limit to first N test stimuli (default: all)')
-    parser.add_argument('--flux-lora', type=str, default=None,
-                        help='path to FLUX backbone LoRA checkpoint (from train/train_flux_lora.py); '
-                             'when omitted, uses the frozen FLUX backbone')
     args = parser.parse_args()
-    main(args.n, flux_lora_path=args.flux_lora)
+    main(args.n)
