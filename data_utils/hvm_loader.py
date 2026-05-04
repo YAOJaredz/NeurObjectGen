@@ -1,10 +1,16 @@
+import re
 import numpy as np
+import pandas as pd
 import torch
 import torch.nn.functional as F
 from torch.utils.data import TensorDataset, DataLoader, Dataset
 
 from HexPred.object_response.get_hvm_response import get_hvm_responses, get_hvm_category_vector
 from HexPred.constants import ALL_MONKEYS
+from HexPred.stim_responses.get_stim_response import get_target_stim_channel_func, build_channel_mask
+from HexPred.stim_responses.channels_area_target import (
+    convert_channel_range, BRAIN_MAP_PATH, BRAIN_MAP_MONKEY_KEY,
+)
 
 from config_const import (
     SEED,
@@ -13,24 +19,141 @@ from config_const import (
 )
 
 
-def _load_hvm_neural() -> np.ndarray:
-    """Return (450, neurons, time) mean-trial response across all monkeys, dead neurons dropped."""
-    monkey_responses = []
+def _session_channel_area_map(session: str, monkey: str) -> dict[int, str]:
+    """Return {raw_channel_idx: area_name} for one session using the brain-map Excel file."""
+    mapping = (
+        pd.read_excel(BRAIN_MAP_PATH, sheet_name=BRAIN_MAP_MONKEY_KEY[monkey])
+        .dropna(subset=['penetration'])
+    )
+    mapping = mapping[mapping['date'] != 'no data available']
+    all_areas = ['TE0', 'TE2', 'TE3', 'PHC', 'ENT', 'PRH', 'V2', 'V3', 'WM', 'HC', 'Ventricle']
+    all_penetrations = {
+        tuple(x.replace(' ', '').split(',')): i
+        for i, x in enumerate(mapping['penetration'])
+    }
+    m = re.search(r'(H\d+)_(P\d+)', session)
+    if not m:
+        return {}
+    h, p = m.group(1), m.group(2)
+    if (h, p) not in all_penetrations:
+        return {}
+    row = mapping.iloc[all_penetrations[(h, p)]]
+    ch_to_area: dict[int, str] = {}
+    for area in all_areas:
+        if area not in row.index:
+            continue
+        for ch in convert_channel_range(row[area]):
+            ch_to_area[int(ch)] = area
+    return ch_to_area
+
+
+def get_neuron_map(
+    dead_mask: np.ndarray,
+    monkey_sessions: dict[str, list[str]],
+) -> list[dict]:
+    """Return a mapping from each neuron in the final vector to its origin.
+
+    Uses the session lists already returned by ``_load_hvm_neural`` (second return
+    value per monkey) so no additional data loading is needed.  Applies the same
+    ``valid_channels_only=True`` mask and dead-neuron filter as ``_load_hvm_neural``.
+
+    Each entry corresponds to one neuron in ``_load_hvm_neural``'s output (axis=1)
+    and contains:
+
+        monkey     - str, e.g. 'West' or 'Bourgeois'
+        session    - str, full session name
+        local_idx  - int, 0-based channel index within the raw 384-channel array
+                     for that session (before validity filtering)
+        area       - str, brain area label (e.g. 'TE2', 'V3'); 'unknown' if the
+                     channel falls outside all labelled ranges in the brain-map file
+
+    Args:
+        dead_mask:       Boolean array of shape ``(N_valid_channels_across_all_monkeys,)``
+                         where True marks all-zero / NaN neurons dropped by
+                         ``_load_hvm_neural``.
+        monkey_sessions: Dict mapping each monkey name to the sessions list returned
+                         by the corresponding ``get_hvm_responses(mode='area', ...)``
+                         call inside ``_load_hvm_neural``, e.g.
+                         ``{'West': [...], 'Bourgeois': [...]}``.
+
+    Returns:
+        List of dicts, one per surviving neuron, in the same order as axis=1 of
+        ``_load_hvm_neural``'s return value.
+    """
+    entries: list[dict] = []
+
     for monkey in ALL_MONKEYS:
-        rsp, _ = get_hvm_responses(mode='area', monkey=monkey, area='all',
-                                   time_window=HVM_TIME_WINDOW)
+        sessions = monkey_sessions[monkey]
+        channel_func = get_target_stim_channel_func('all', monkey=monkey)
+
+        valid_sessions: list[str] = []
+        per_session_channels: list[np.ndarray] = []
+        for session in sessions:
+            try:
+                channels = channel_func(session)
+            except Exception:
+                continue
+            valid_sessions.append(session)
+            per_session_channels.append(channels)
+
+        n_total = sum(len(ch) for ch in per_session_channels)
+        valid_mask = build_channel_mask(
+            valid_sessions, 'all', monkey,
+            experiment_id='object',
+            valid_channels_only=True,
+            n_channels=n_total,
+        )
+
+        offset = 0
+        for session, channels in zip(valid_sessions, per_session_channels):
+            n_ch = len(channels)
+            sess_valid = valid_mask[offset : offset + n_ch]
+            sess_area  = _session_channel_area_map(session, monkey)
+            for local_idx, keep in enumerate(sess_valid):
+                if keep:
+                    raw_ch = int(channels[local_idx])
+                    entries.append({
+                        'monkey':    monkey,
+                        'session':   session,
+                        'local_idx': local_idx,
+                        'area':      sess_area.get(raw_ch, 'unknown'),
+                    })
+            offset += n_ch
+
+    assert len(entries) == len(dead_mask), (
+        f"Entry count {len(entries)} != dead_mask length {len(dead_mask)}."
+    )
+    return [e for e, dead in zip(entries, dead_mask) if not dead]
+
+
+def _load_hvm_neural() -> tuple[np.ndarray, np.ndarray, dict[str, list[str]]]:
+    """Load HVM neural responses across all monkeys.
+
+    Returns:
+        rsp:             (450, neurons, time) mean-trial response, dead neurons dropped.
+        dead_mask:       Boolean array (N_valid_pre_dead_filter,) — True = dead neuron.
+                         Pass to ``get_neuron_map`` together with ``monkey_sessions``.
+        monkey_sessions: Dict mapping each monkey to the session list returned by
+                         ``get_hvm_responses``, needed by ``get_neuron_map``.
+    """
+    monkey_responses = []
+    monkey_sessions: dict[str, list[str]] = {}
+    for monkey in ALL_MONKEYS:
+        rsp, sessions = get_hvm_responses(mode='area', monkey=monkey, area='all',
+                                          time_window=HVM_TIME_WINDOW)
         monkey_responses.append(rsp)
+        monkey_sessions[monkey] = sessions
     rsp = np.concatenate(monkey_responses, axis=1)  # (450, all_neurons, time)
-    dead = (
+    dead_mask = (
         np.all((rsp == 0) | np.isnan(rsp), axis=(0, 2))
         | np.any(np.isnan(rsp), axis=(0, 2))
     )
-    rsp = rsp[:, ~dead, :]
+    rsp = rsp[:, ~dead_mask, :]
     assert not np.isnan(rsp).any(), "NaN values remain after neuron filtering."
     assert rsp.shape[0] == HVM_N_STIMULI, (
         f"expected {HVM_N_STIMULI} stimuli, got {rsp.shape[0]}"
     )
-    return rsp
+    return rsp, dead_mask, monkey_sessions
 
 
 def _category_stratified_split(
@@ -95,7 +218,7 @@ def make_hvm_loader(
     Returns:
         ``(train_loader, val_loader, test_loader)``
     """
-    rsp = _load_hvm_neural()
+    rsp, _, _ = _load_hvm_neural()
     neural_tensor = torch.from_numpy(rsp).float()  # (450, neurons, time)
 
     if use_embeddings:
@@ -185,7 +308,7 @@ def make_hvm_multihead_loader(
     Split: 270 train / 90 val / 90 test, stratified across 10 HVM categories
     (identical split layout to make_hvm_loader for comparability).
     """
-    rsp = _load_hvm_neural()
+    rsp, _, _ = _load_hvm_neural()
     neural_tensor = torch.from_numpy(rsp).float()  # (450, neurons, time)
 
     if not HVM_SIGLIP_EMBEDDINGS_PATH.exists():

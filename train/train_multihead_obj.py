@@ -53,7 +53,7 @@ class HVMObjMultiHeadDataset(Dataset):
 
 
 def make_obj_loaders(batch_size: int = 64, seed: int = SEED):
-    rsp = _load_hvm_neural()
+    rsp, _, _ = _load_hvm_neural()
     neural_t = torch.from_numpy(rsp).float()  # (450, neurons, time)
 
     obj_siglip_t = torch.load(HVM_OBJ_SIGLIP_EMBEDDINGS_PATH, weights_only=True)  # (450, 1152)
