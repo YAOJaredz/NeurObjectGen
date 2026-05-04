@@ -47,11 +47,15 @@ head_loss = nce_weight * L_InfoNCE + (1 − nce_weight) * L_cos
 
 Hyperparameters (d_model, n_layers, shared_dim, nce_weight, and others) are swept on the Issa Lab SLURM cluster; the best configuration for each model is selected by mean validation cosine similarity `(cos_siglip + cos_clip) / 2` and saved for inference. Because object-crop SigLIP embeddings are more view- and scale-sensitive than full-image embeddings, the object model is encouraged to capture stimulus-specific pose and appearance rather than global scene statistics.
 
+**Attention and neuron analysis.** The learned scalar attention weights over CLS and time-step tokens reveal the encoder's temporal preference independent of stimulus content. Neuron importance is quantified as the L1 column norm of the input-projection weight matrix, measuring the total absolute influence each neuron exerts on the transformer's internal representation. Importances are mapped back to recording session and brain area (TE0, TE2, TE3, PHC, etc.) via the brain-map Excel file, enabling a comparison of which cortical areas drive the global versus object decoder.
+
 ### Stage 2 — Pretrained IP-Adapter (InstantX/FLUX.1-dev-IP-Adapter)
 
 The predicted SigLIP and CLIP-short embeddings condition a pretrained **FLUX.1-dev** model via the **pretrained InstantX/FLUX.1-dev-IP-Adapter**. The adapter ships a SigLIP-SO400M encoder matching our cached embeddings and implements a real cross-attention path via a learned resampler (`MLPProjModel`: SigLIP 1152 → 128 × 4096 image tokens) and per-block IP key/value projections on all 57 FLUX transformer blocks.
 
-Because diffusers' generic loader does not accept InstantX's checkpoint layout for FLUX, we vendor the minimal adapter components directly: the `MLPProjModel` and an `IPAFluxAttnProcessor` installed on all 57 attention blocks (19 double-stream + 38 single-stream). Image conditioning is threaded via `pipe(..., joint_attention_kwargs={"image_emb": image_emb, "scale": ip_adapter_scale})`. **No adapter training is performed** — Stage 2 is a pure inference component.
+Because diffusers' generic loader does not accept InstantX's checkpoint layout for FLUX, we vendor the minimal adapter components directly: the `MLPProjModel` and an `IPAFluxAttnProcessor` installed on all 57 attention blocks (19 double-stream + 38 single-stream). Image conditioning is threaded via `pipe(..., joint_attention_kwargs={"image_emb": image_emb, "scale": ip_adapter_scale})`.
+
+To close the domain gap between natural photographs and HVM stimuli (controlled lighting, plain backgrounds, circular aperture), we fine-tuned the adapter's key/value projections via **LoRA** (rank 16) on the 270 HVM training images using the standard diffusion denoising objective, with all other weights frozen. The fine-tuned checkpoint is loaded by default at inference time.
 
 HVM-specific generation details:
 
@@ -117,6 +121,7 @@ neural r (N×T) ─┤                └── CLIP head ─────▶ (un
 **Evaluation:** Fixed category-stratified 270/90/90 train/val/test split. Metrics:
 - **Embedding cosine similarity** — mean cosine similarity between predicted and GT embeddings (SigLIP and CLIP-short separately)
 - **Identification accuracy** — 2-AFC forced-choice identification on the test set for both embedding heads
+- **Pixel and perceptual metrics** — computed inside the HVM aperture mask for both full-image and object-crop conditions: SSIM (structural fidelity), LPIPS (VGG perceptual distance), FID (Inception-v3 distributional distance over the 90-image test set), and PixCorr (Pearson correlation of flattened pixel intensities [Scotti et al., 2024; Ciferri et al., 2026])
 
 **Success criteria:**
 - (a) Neural-only reconstructions achieve above-chance 2-AFC identification
@@ -138,23 +143,11 @@ neural r (N×T) ─┤                └── CLIP head ─────▶ (un
 
 The current architecture adds a learned category embedding to the shared latent at training and inference time. Removing it will test whether the encoder learns stimulus-specific representations from neural activity alone. If identification accuracy drops substantially, the model was partially leveraging category structure rather than fine-grained within-category variation; if performance is preserved, the shared latent captures image-level information beyond category membership. Both models are retrained without the category embedding and re-evaluated on the held-out test set.
 
-### 6.2 Encoder Attention Mask Analysis: Neuron × Time Contribution
-
-The transformer produces a scalar attention weight over CLS and time-step tokens before pooling. Projecting these weights back through the input projection yields a neuron × time contribution matrix. Aggregating across stimuli and comparing within versus across categories will reveal whether the encoder attends preferentially to late time bins (consistent with IT's slow integration) or to particular category-selective neurons. No additional training is required; only a forward pass with attention weights logged.
-
-### 6.3 Analysis of the Shared Embedding
+### 6.2 Analysis of the Shared Embedding
 
 The 450 × shared_dim matrix of shared latents is a direct analogue to a neural population response matrix and can be analyzed with standard systems neuroscience tools. A linear decoder (ridge regression or LDA) will test readout of category, object identity, and viewpoint; RSA will compare the shared latent geometry to the raw population geometry and to the SigLIP target geometry. Together these characterize whether the encoder's learned transformation increases the linear separability of object representations relative to the input population.
 
-### 6.4 Quantitative Image Quality Assessment
-
-Beyond embedding-space metrics, we evaluate four pixel and perceptual metrics on the 90 held-out test stimuli across all comparison conditions, computed inside the HVM aperture mask: **SSIM** (patch-level structural fidelity), **LPIPS** (VGG perceptual distance), **FID** (Inception-v3 distributional distance over the 90-image test set), and **PixCorr** (Pearson correlation of flattened pixel intensities, a standard brain-to-image baseline [Scotti et al., 2024; Ciferri et al., 2026]). Comparing these across conditions will quantify the pixel-level gain from neural conditioning beyond the img2img baseline and how close neural predictions come to the ground-truth embedding upper bound.
-
-### 6.5 LoRA Fine-Tuning of the IP-Adapter Toward HVM Stimuli
-
-The IP-Adapter is currently used frozen, relying on generalization from its natural-photograph training distribution to HVM stimuli (controlled lighting, plain backgrounds, circular aperture). We apply **LoRA** (rank 4–16) to the adapter's key/value projections across the 57 FLUX transformer blocks, fine-tuning on the 270 HVM training images via the standard diffusion denoising objective while all other weights remain frozen. After fine-tuning, reconstruction quality is compared to the frozen-adapter baseline across all four conditions using the metrics from Section 6.4, testing whether domain adaptation improves pixel-level fidelity and whether the neural conditioning signal benefits more from fine-tuning than the text or GT embedding baselines.
-
-### 6.6 Five-Fold Cross-Validation for Full-Dataset Coverage
+### 6.3 Five-Fold Cross-Validation for Full-Dataset Coverage
 
 The current evaluation covers only 90 of 450 stimuli. A **five-fold cross-validation** (each fold a disjoint, category-stratified 90-stimulus test partition) would generate reconstructions for every image exactly once, enabling fold-level standard errors on all metrics and per-stimulus analysis across the full set. Both models are retrained from scratch per fold. Systematically difficult stimuli — those where neural predictions consistently fail across folds — can then be identified to reveal limits of the pseudo-population decoder or the IP-Adapter's conditioning capacity.
 
