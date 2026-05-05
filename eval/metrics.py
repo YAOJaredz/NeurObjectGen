@@ -1,8 +1,9 @@
-"""Reconstruction metrics: cosine similarity, SSIM, 2AFC identification, R²."""
+"""Reconstruction metrics: cosine similarity, SSIM, LPIPS, PixCorr, 2AFC identification, R²."""
 
 import numpy as np
 import torch
 import torch.nn.functional as F
+import lpips as lpips_lib
 from skimage.metrics import structural_similarity
 
 
@@ -24,28 +25,70 @@ def cosine_similarity(pred: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
     return F.cosine_similarity(pred, target, dim=-1)
 
 
-def ssim(pred_image: torch.Tensor, target_image: torch.Tensor) -> float:
-    """Mean SSIM over a batch of images.
+def ssim(pred_image: torch.Tensor, target_image: torch.Tensor) -> np.ndarray:
+    """Per-image SSIM scores.
 
     Args:
         pred_image:   (N, C, H, W) tensor, values in [0, 1]
         target_image: (N, C, H, W) tensor, values in [0, 1]
 
     Returns:
-        Scalar mean SSIM across the batch.
+        (N,) array of SSIM scores.
     """
-    pred_np = pred_image.detach().cpu().numpy()
+    pred_np   = pred_image.detach().cpu().numpy()
     target_np = target_image.detach().cpu().numpy()
+    return np.array([
+        structural_similarity(
+            p.transpose(1, 2, 0), t.transpose(1, 2, 0),
+            channel_axis=-1, data_range=1.0)
+        for p, t in zip(pred_np, target_np)
+    ])
 
-    scores = []
-    for p, t in zip(pred_np, target_np):
-        # skimage expects (H, W, C); images are (C, H, W)
-        p_hwc = p.transpose(1, 2, 0)
-        t_hwc = t.transpose(1, 2, 0)
-        score = structural_similarity(p_hwc, t_hwc, channel_axis=-1, data_range=1.0)
-        scores.append(score)
 
-    return sum(scores) / len(scores)
+def lpips_distance(
+    pred_images: torch.Tensor,
+    target_images: torch.Tensor,
+    net: str = 'vgg',
+    batch_size: int = 8,
+) -> np.ndarray:
+    """Per-image LPIPS perceptual distance (lower is better).
+
+    Args:
+        pred_images:   (N, C, H, W) tensor, values in [0, 1]
+        target_images: (N, C, H, W) tensor, values in [0, 1]
+        net: backbone for LPIPS ('vgg' or 'alex')
+        batch_size: images per forward pass
+
+    Returns:
+        (N,) array of LPIPS scores.
+    """
+    fn = lpips_lib.LPIPS(net=net).cpu()
+    vals = []
+    with torch.no_grad():
+        for i in range(0, len(pred_images), batch_size):
+            r_b = pred_images[i:i + batch_size].cpu() * 2 - 1
+            o_b = target_images[i:i + batch_size].cpu() * 2 - 1
+            vals.extend(fn(r_b, o_b).squeeze().tolist())
+    return np.array(vals)
+
+
+def pixcorr(
+    pred_images: torch.Tensor,
+    target_images: torch.Tensor,
+) -> np.ndarray:
+    """Per-image Pearson correlation on flattened pixels.
+
+    Args:
+        pred_images:   (N, C, H, W) tensor, values in [0, 1]
+        target_images: (N, C, H, W) tensor, values in [0, 1]
+
+    Returns:
+        (N,) array of Pearson r values.
+    """
+    n = pred_images.shape[0]
+    rec_flat  = pred_images.numpy().reshape(n, -1)
+    orig_flat = target_images.numpy().reshape(n, -1)
+    return np.array([np.corrcoef(rec_flat[i], orig_flat[i])[0, 1] for i in range(n)])
 
 
 def two_afc_identification(

@@ -53,6 +53,8 @@ HVM_N_CAT      = 10
 HVM_N_VAR      = 45   # variations per category
 HVM_N_VAL      = 90   # 9 per category × 10
 HVM_N_TEST     = 90   # 9 per category × 10
+HVM_IMG_SIZE   = 512  # pixel side length of generated images
+HVM_STRIP_LABEL_H = 36  # pixel height of the condition label row in strip PNGs
 
 HVM_SRC_DIR        = Path('/mnt/smb/locker/issa-locker/Data/West/Saved_Images/E8')
 HVM_RAW_DIR        = STIMULI_ROOT / 'hvm'

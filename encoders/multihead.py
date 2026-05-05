@@ -1,5 +1,6 @@
 """Multi-head transformer encoder: shared backbone → SigLIP and CLIP heads."""
 
+import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -108,3 +109,35 @@ class MultiHeadTransformer(nn.Module):
             "clip":   F.normalize(self.clip_head(shared),   dim=-1),
             "shared": F.normalize(shared, dim=-1),
         }
+
+
+def extract_attn_weights(model: MultiHeadTransformer, n_categories: int) -> np.ndarray:
+    """Return (n_categories, T+1) softmax attention weights from a zero-input pass.
+
+    Token 0 is the CLS token; tokens 1..T are the time bins. One forward pass
+    per category is run so category embeddings are applied.
+    """
+    captured = []
+
+    def hook(module, inp, out):
+        captured.append(torch.softmax(out, dim=1).squeeze(-1).detach().cpu())
+
+    handle = model.attn.register_forward_hook(hook)
+    n_time    = model.pos_embed.size(1) - 1
+    n_neurons = model.input_proj.weight.size(1)
+    x_dummy   = torch.zeros(1, n_time, n_neurons)
+    with torch.no_grad():
+        for c in range(n_categories):
+            model(x_dummy, torch.tensor([c]))
+    handle.remove()
+    return torch.cat(captured, dim=0).numpy()  # (n_categories, T+1)
+
+
+def neuron_importance(model: MultiHeadTransformer) -> np.ndarray:
+    """L1 column norm of input_proj.weight — (N_neurons,) array.
+
+    Measures each neuron's total absolute influence on the transformer's
+    internal representation, independent of input magnitude.
+    """
+    W = model.input_proj.weight.detach().cpu()  # (d_model, N_neurons)
+    return W.abs().sum(dim=0).numpy()           # (N_neurons,)
