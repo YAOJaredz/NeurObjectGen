@@ -298,6 +298,7 @@ def make_hvm_multihead_loader(
     batch_size: int = 64,
     seed: int = SEED,
     verbose: bool = True,
+    neuron_indices: np.ndarray | None = None,
 ) -> tuple[DataLoader, DataLoader, DataLoader]:
     """Build category-stratified train/val/test DataLoaders for HVM multi-head training.
 
@@ -307,8 +308,14 @@ def make_hvm_multihead_loader(
 
     Split: 270 train / 90 val / 90 test, stratified across 10 HVM categories
     (identical split layout to make_hvm_loader for comparability).
+
+    Args:
+        neuron_indices: Optional 1-D array of neuron indices to keep. If None,
+                        all neurons are used.
     """
     rsp, _, _ = _load_hvm_neural()
+    if neuron_indices is not None:
+        rsp = rsp[:, neuron_indices, :]
     neural_tensor = torch.from_numpy(rsp).float()  # (450, neurons, time)
 
     if not HVM_SIGLIP_EMBEDDINGS_PATH.exists():
@@ -349,10 +356,11 @@ def make_hvm_multihead_loader(
     test_loader  = make(test_idx,  shuffle=False)
 
     if verbose:
+        neuron_str = f"{rsp.shape[1]}" + (" (subset)" if neuron_indices is not None else "")
         print(
             f"HVM multihead loaders (all monkeys): "
             f"train={len(train_idx)}, val={len(val_idx)}, test={len(test_idx)}, "
-            f"neurons={rsp.shape[1]}, time={rsp.shape[2]}, "
+            f"neurons={neuron_str}, time={rsp.shape[2]}, "
             f"targets=(siglip=1152, clip_short=768) [stratified by category]"
         )
 

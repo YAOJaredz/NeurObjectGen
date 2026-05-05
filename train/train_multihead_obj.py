@@ -12,6 +12,7 @@ import math
 import sys
 from pathlib import Path
 
+import numpy as np
 import torch
 import torch.nn.functional as F
 from torch.optim import AdamW
@@ -52,8 +53,11 @@ class HVMObjMultiHeadDataset(Dataset):
         return self.neural[i], {k: v[i] for k, v in self.targets.items()}, self.cat[i]
 
 
-def make_obj_loaders(batch_size: int = 64, seed: int = SEED):
+def make_obj_loaders(batch_size: int = 64, seed: int = SEED,
+                     neuron_indices: np.ndarray | None = None):
     rsp, _, _ = _load_hvm_neural()
+    if neuron_indices is not None:
+        rsp = rsp[:, neuron_indices, :]
     neural_t = torch.from_numpy(rsp).float()  # (450, neurons, time)
 
     obj_siglip_t = torch.load(HVM_OBJ_SIGLIP_EMBEDDINGS_PATH, weights_only=True)  # (450, 1152)
@@ -79,9 +83,10 @@ def make_obj_loaders(batch_size: int = 64, seed: int = SEED):
     val_loader   = make(val_idx,   shuffle=False)
     test_loader  = make(test_idx,  shuffle=False)
 
+    neuron_str = f"{rsp.shape[1]}" + (" (subset)" if neuron_indices is not None else "")
     print(
         f"HVM obj-multihead loaders: train={len(train_idx)}, val={len(val_idx)}, "
-        f"test={len(test_idx)}, neurons={rsp.shape[1]}, time={rsp.shape[2]}"
+        f"test={len(test_idx)}, neurons={neuron_str}, time={rsp.shape[2]}"
     )
     return train_loader, val_loader, test_loader
 
@@ -91,7 +96,7 @@ def make_obj_loaders(batch_size: int = 64, seed: int = SEED):
 # ---------------------------------------------------------------------------
 
 def run_name(args):
-    return (
+    base = (
         f"d{args.d_model}_nh{args.n_heads}_nl{args.n_layers}"
         f"_sd{args.shared_dim}"
         f"_do{args.dropout}_lr{args.lr}_wd{args.weight_decay}"
@@ -101,6 +106,9 @@ def run_name(args):
         f"_uw{args.uniformity_weight}"
         f"_nw{args.nce_weight}_nt{args.nce_temperature}"
     )
+    if args.n_neurons is not None:
+        base += f"_nn{args.n_neurons}_ns{args.neuron_seed}"
+    return base
 
 
 def run_dir(args):
@@ -108,7 +116,8 @@ def run_dir(args):
     return CHECKPOINT_DIR / "multihead" / tag / run_name(args)
 
 
-def save_checkpoint(path, model, optimizer, scheduler, epoch, metrics, args):
+def save_checkpoint(path, model, optimizer, scheduler, epoch, metrics, args,
+                    neuron_indices: np.ndarray | None = None):
     torch.save({
         "epoch": epoch,
         "model_state": model.state_dict(),
@@ -116,6 +125,7 @@ def save_checkpoint(path, model, optimizer, scheduler, epoch, metrics, args):
         "scheduler_state": scheduler.state_dict(),
         "metrics": metrics,
         "args": vars(args),
+        "neuron_indices": neuron_indices,
     }, path)
 
 
@@ -127,7 +137,21 @@ def train(args):
     torch.manual_seed(SEED)
     device = get_device()
 
-    train_loader, val_loader, test_loader = make_obj_loaders(batch_size=args.batch_size)
+    neuron_indices = None
+    if args.n_neurons is not None:
+        rsp, _, _ = _load_hvm_neural()
+        n_total = rsp.shape[1]
+        if args.n_neurons >= n_total:
+            print(f"--n-neurons {args.n_neurons} >= full count {n_total}; using all neurons.")
+        else:
+            rng = np.random.default_rng(args.neuron_seed)
+            neuron_indices = rng.choice(n_total, size=args.n_neurons, replace=False)
+            neuron_indices.sort()
+            print(f"Neuron subset: {args.n_neurons}/{n_total} (seed={args.neuron_seed})")
+
+    train_loader, val_loader, test_loader = make_obj_loaders(
+        batch_size=args.batch_size, neuron_indices=neuron_indices
+    )
 
     sample_neural = next(iter(train_loader))[0]
     _, n_neurons, n_time = sample_neural.shape
@@ -252,10 +276,10 @@ def train(args):
             "val_mean_cos": mean_cos,
         }
 
-        save_checkpoint(ckpt_dir / "last.pt", model, optimizer, scheduler, epoch, metrics, args)
+        save_checkpoint(ckpt_dir / "last.pt", model, optimizer, scheduler, epoch, metrics, args, neuron_indices)
         if epoch > warmup_epochs and mean_cos > best_mean_cos:
             best_mean_cos = mean_cos
-            save_checkpoint(ckpt_dir / "best.pt", model, optimizer, scheduler, epoch, metrics, args)
+            save_checkpoint(ckpt_dir / "best.pt", model, optimizer, scheduler, epoch, metrics, args, neuron_indices)
 
     # --- test ---
     best_ckpt = torch.load(ckpt_dir / "best.pt", weights_only=False)
@@ -301,6 +325,7 @@ def train(args):
         "test_cos_siglip": test_cos_sig, "test_cos_clip": test_cos_clip,
     }
     best_ckpt["test_metrics"] = test_metrics
+    best_ckpt["neuron_indices"] = neuron_indices
     torch.save(best_ckpt, ckpt_dir / "best.pt")
 
 
@@ -333,6 +358,12 @@ def parse_args():
     p.add_argument("--lr",           type=float, default=3e-4)
     p.add_argument("--weight-decay", type=float, default=0.01)
     p.add_argument("--warmup-frac",  type=float, default=0.1)
+
+    # Neuron subset ablation
+    p.add_argument("--n-neurons",    type=int,   default=None,
+                   help="Number of neurons to randomly sample. None = use all neurons.")
+    p.add_argument("--neuron-seed",  type=int,   default=0,
+                   help="RNG seed for neuron subset sampling.")
 
     return p.parse_args()
 

@@ -16,6 +16,7 @@ import math
 import sys
 from pathlib import Path
 
+import numpy as np
 import torch
 import torch.nn.functional as F
 from torch.optim import AdamW
@@ -37,7 +38,7 @@ from get_device import get_device
 # ---------------------------------------------------------------------------
 
 def run_name(args) -> str:
-    return (
+    base = (
         f"d{args.d_model}_nh{args.n_heads}_nl{args.n_layers}"
         f"_sd{args.shared_dim}"
         f"_do{args.dropout}_lr{args.lr}_wd{args.weight_decay}"
@@ -47,6 +48,9 @@ def run_name(args) -> str:
         f"_uw{args.uniformity_weight}"
         f"_nw{args.nce_weight}_nt{args.nce_temperature}"
     )
+    if args.n_neurons is not None:
+        base += f"_nn{args.n_neurons}_ns{args.neuron_seed}"
+    return base
 
 
 def run_dir(args) -> Path:
@@ -54,7 +58,8 @@ def run_dir(args) -> Path:
     return CHECKPOINT_DIR / "multihead" / tag / run_name(args)
 
 
-def save_checkpoint(path: Path, model, optimizer, scheduler, epoch: int, metrics: dict, args):
+def save_checkpoint(path: Path, model, optimizer, scheduler, epoch: int, metrics: dict, args,
+                    neuron_indices: np.ndarray | None = None):
     torch.save({
         "epoch": epoch,
         "model_state": model.state_dict(),
@@ -62,6 +67,7 @@ def save_checkpoint(path: Path, model, optimizer, scheduler, epoch: int, metrics
         "scheduler_state": scheduler.state_dict(),
         "metrics": metrics,
         "args": vars(args),
+        "neuron_indices": neuron_indices,
     }, path)
 
 
@@ -73,8 +79,22 @@ def train(args):
     torch.manual_seed(SEED)
     device = get_device()
 
+    neuron_indices = None
     if args.dataset == "hvm":
-        train_loader, val_loader, test_loader = make_hvm_multihead_loader(batch_size=args.batch_size)
+        if args.n_neurons is not None:
+            from data_utils.hvm_loader import _load_hvm_neural
+            rsp, _, _ = _load_hvm_neural()
+            n_total = rsp.shape[1]
+            if args.n_neurons >= n_total:
+                print(f"--n-neurons {args.n_neurons} >= full count {n_total}; using all neurons.")
+            else:
+                rng = np.random.default_rng(args.neuron_seed)
+                neuron_indices = rng.choice(n_total, size=args.n_neurons, replace=False)
+                neuron_indices.sort()
+                print(f"Neuron subset: {args.n_neurons}/{n_total} (seed={args.neuron_seed})")
+        train_loader, val_loader, test_loader = make_hvm_multihead_loader(
+            batch_size=args.batch_size, neuron_indices=neuron_indices
+        )
         clip_key = "clip_short"
     else:
         train_loader, val_loader, test_loader = make_multihead_loader(batch_size=args.batch_size)
@@ -215,11 +235,11 @@ def train(args):
             "val_mean_cos": mean_cos,
         }
 
-        save_checkpoint(ckpt_dir / "last.pt", model, optimizer, scheduler, epoch, metrics, args)
+        save_checkpoint(ckpt_dir / "last.pt", model, optimizer, scheduler, epoch, metrics, args, neuron_indices)
         # Guard against noisy early-epoch cos_sim: only checkpoint after warmup
         if epoch > warmup_epochs and mean_cos > best_mean_cos:
             best_mean_cos = mean_cos
-            save_checkpoint(ckpt_dir / "best.pt", model, optimizer, scheduler, epoch, metrics, args)
+            save_checkpoint(ckpt_dir / "best.pt", model, optimizer, scheduler, epoch, metrics, args, neuron_indices)
 
     # --- test ---
     best_ckpt = torch.load(ckpt_dir / "best.pt", weights_only=False)
@@ -265,6 +285,7 @@ def train(args):
         "test_cos_siglip": test_cos_sig, "test_cos_clip": test_cos_clip,
     }
     best_ckpt["test_metrics"] = test_metrics
+    best_ckpt["neuron_indices"] = neuron_indices
     torch.save(best_ckpt, ckpt_dir / "best.pt")
 
     return model
@@ -314,6 +335,12 @@ def parse_args():
     p.add_argument("--lr",           type=float, default=3e-4)
     p.add_argument("--weight-decay", type=float, default=0.01)
     p.add_argument("--warmup-frac",  type=float, default=0.1)
+
+    # Neuron subset ablation
+    p.add_argument("--n-neurons",    type=int,   default=None,
+                   help="Number of neurons to randomly sample. None = use all neurons.")
+    p.add_argument("--neuron-seed",  type=int,   default=0,
+                   help="RNG seed for neuron subset sampling.")
 
     return p.parse_args()
 
