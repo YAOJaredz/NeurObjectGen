@@ -311,7 +311,7 @@ def train(args):
 def parse_args():
     p = argparse.ArgumentParser()
 
-    p.add_argument("--use-category", action="store_true", default=True)
+    p.add_argument("--use-category", action="store_true", default=False)
 
     p.add_argument("--d-model",    type=int,   default=128)
     p.add_argument("--n-heads",    type=int,   default=4)
