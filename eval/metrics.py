@@ -50,19 +50,21 @@ def lpips_distance(
     target_images: torch.Tensor,
     net: str = 'vgg',
     batch_size: int = 8,
+    lpips_fn: lpips_lib.LPIPS | None = None,
 ) -> np.ndarray:
     """Per-image LPIPS perceptual distance (lower is better).
 
     Args:
         pred_images:   (N, C, H, W) tensor, values in [0, 1]
         target_images: (N, C, H, W) tensor, values in [0, 1]
-        net: backbone for LPIPS ('vgg' or 'alex')
+        net: backbone for LPIPS ('vgg' or 'alex'); ignored if lpips_fn is given
         batch_size: images per forward pass
+        lpips_fn: pre-built LPIPS instance to reuse across calls
 
     Returns:
         (N,) array of LPIPS scores.
     """
-    fn = lpips_lib.LPIPS(net=net).cpu()
+    fn = lpips_fn if lpips_fn is not None else lpips_lib.LPIPS(net=net).cpu()
     vals = []
     with torch.no_grad():
         for i in range(0, len(pred_images), batch_size):
