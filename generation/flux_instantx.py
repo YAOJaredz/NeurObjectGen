@@ -175,15 +175,15 @@ class IPAFluxAttnProcessor(nn.Module):
             # image-only (img_seq_len tokens).  In single-stream blocks the full txt+img sequence
             # is already in query; we must address only the image tail.
             img_seq_len = object_mask.shape[1]
-            bbox_idx = object_mask[0, :, 0].bool()          # (img_seq_len,)
             q_img = query[:, :, -img_seq_len:, :]            # (B, heads, img_seq_len, head_dim)
-            q_bbox = q_img[:, :, bbox_idx, :]                # (B, heads, n_bbox, head_dim)
-            obj_out = F.scaled_dot_product_attention(
-                q_bbox, obj_k, obj_v, dropout_p=0.0, is_causal=False
-            )  # (B, heads, n_bbox, head_dim)
-            # scatter into image-sized zero tensor → reshape to (B, img_seq_len, hidden)
             obj_full = torch.zeros_like(q_img)               # (B, heads, img_seq_len, head_dim)
-            obj_full[:, :, bbox_idx, :] = obj_out
+            for b in range(batch_size):
+                bbox_idx_b = object_mask[b, :, 0].bool()    # (img_seq_len,) — per-sample
+                q_bbox_b = q_img[b:b+1, :, bbox_idx_b, :]  # (1, heads, n_bbox_b, head_dim)
+                obj_out_b = F.scaled_dot_product_attention(
+                    q_bbox_b, obj_k[b:b+1], obj_v[b:b+1], dropout_p=0.0, is_causal=False,
+                )                                            # (1, heads, n_bbox_b, head_dim)
+                obj_full[b:b+1, :, bbox_idx_b, :] = obj_out_b
             ip_hidden_states_obj = obj_full.transpose(1, 2).reshape(
                 batch_size, -1, attn.heads * head_dim
             ).to(query.dtype)
@@ -606,7 +606,7 @@ def invert_image(
 def generate_img2img(
     pipe: FluxPipeline,
     image_proj: MLPProjModel,
-    init_image: Image.Image,
+    init_image: Image.Image | list[Image.Image],
     siglip_embedding: torch.Tensor,
     *,
     strength: float = 0.75,
@@ -639,7 +639,7 @@ def generate_img2img(
     bbox_mask: torch.Tensor | None = None,
     bbox_preserve: float = 1.0,
     show_progress: bool = True,
-) -> Image.Image:
+) -> Image.Image | list[Image.Image]:
     """Img2img generation with per-step aperture compositing.
 
     Starts from the VAE-encoded ``init_image`` noised to ``strength``,
@@ -689,14 +689,36 @@ def generate_img2img(
     dtype = torch.bfloat16
     generator = torch.Generator(device).manual_seed(seed)
 
+    if siglip_embedding.dim() == 1:
+        siglip_embedding = siglip_embedding.unsqueeze(0)
+    B = siglip_embedding.shape[0]
+
+    if isinstance(init_image, Image.Image):
+        init_images = [init_image] * B
+    else:
+        init_images = list(init_image)
+        if len(init_images) != B:
+            raise ValueError(f"len(init_image)={len(init_images)} must match siglip batch B={B}")
+
+    if B > 1 and use_rf_inversion:
+        raise NotImplementedError("use_rf_inversion not supported for B > 1")
+    if B > 1 and guidance_latent is not None:
+        raise NotImplementedError("guidance_latent not supported for B > 1")
+    if B > 1 and bbox_latent is not None:
+        raise NotImplementedError("bbox_latent not supported for B > 1")
+
     if ip_adapter_schedule is None:
         set_ip_adapter_scale(pipe, ip_adapter_scale)
 
     image_emb = _siglip_to_image_emb(image_proj, siglip_embedding, device, dtype)
+    if image_emb.shape[0] == 1 and B > 1:
+        image_emb = image_emb.expand(B, -1, -1).contiguous()
 
     object_image_emb = None
     if object_siglip_embedding is not None:
         object_image_emb = _siglip_to_image_emb(image_proj, object_siglip_embedding, device, dtype)
+        if object_image_emb.shape[0] == 1 and B > 1:
+            object_image_emb = object_image_emb.expand(B, -1, -1).contiguous()
 
     if prompt_embeds is not None:
         # Pre-computed path: move to device/dtype, derive text_ids from seq length.
@@ -712,16 +734,24 @@ def generate_img2img(
             max_sequence_length=512,
         )
 
+    if prompt_embeds.shape[0] == 1 and B > 1:
+        prompt_embeds = prompt_embeds.expand(B, -1, -1)
+        pooled_embeds = pooled_embeds.expand(B, -1)
+
     if init_latent is not None:
         init_latent = init_latent.to(device=device, dtype=dtype)
+        if init_latent.shape[0] == 1 and B > 1:
+            init_latent = init_latent.expand(B, -1, -1, -1).contiguous()
     else:
-        init_resized = init_image.resize((width, height), Image.LANCZOS)
-        init_latent = encode_image(pipe, init_resized).to(device=device, dtype=dtype)
+        init_latent = torch.cat(
+            [encode_image(pipe, img.resize((width, height), Image.LANCZOS)) for img in init_images],
+            dim=0,
+        ).to(device=device, dtype=dtype)  # (B, C, H, W)
 
     h = 2 * (height // (pipe.vae_scale_factor * 2))
     w = 2 * (width // (pipe.vae_scale_factor * 2))
     latent_channels = init_latent.shape[1]
-    init_latent_packed = pipe._pack_latents(init_latent, 1, latent_channels, h, w)
+    init_latent_packed = pipe._pack_latents(init_latent, B, latent_channels, h, w)
     latent_image_ids = pipe._prepare_latent_image_ids(1, h // 2, w // 2, device, dtype)
 
     if guidance_latent is not None:
@@ -778,6 +808,8 @@ def generate_img2img(
 
     if object_mask is not None:
         object_mask = object_mask.to(device=device, dtype=dtype)
+        if object_mask.shape[0] == 1 and B > 1:
+            object_mask = object_mask.expand(B, -1, -1).contiguous()  # (B, seq, 1)
 
     if bbox_latent is not None and bbox_mask is not None:
         bbox_latent_packed = pipe._pack_latents(
@@ -792,7 +824,7 @@ def generate_img2img(
     if use_rf_inversion:
         noise = torch.randn(init_latent_packed.shape, dtype=dtype, device=device, generator=generator)
 
-    guidance = torch.full([1], guidance_scale, device=device, dtype=dtype)
+    guidance = torch.full([B], guidance_scale, device=device, dtype=dtype)
     effective_object_scale = object_ip_scale
 
     iterator = tqdm(enumerate(timesteps), total=len(timesteps)) if show_progress else enumerate(timesteps)
@@ -883,7 +915,9 @@ def generate_img2img(
                     + (1.0 - bbox_mask_d) * latents
 
     latents = pipe._unpack_latents(latents, height, width, pipe.vae_scale_factor)
-    return decode_latent(pipe, latents)
+    if B == 1:
+        return decode_latent(pipe, latents)
+    return [decode_latent(pipe, latents[b:b+1]) for b in range(B)]
 
 
 def generate_obj_sequential(
