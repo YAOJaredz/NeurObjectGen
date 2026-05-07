@@ -360,7 +360,7 @@ def encode_image(pipe: FluxPipeline, pil_image: Image.Image) -> torch.Tensor:
     x = x * 2 - 1
     x = x.unsqueeze(0).to(pipe.vae.device, dtype=pipe.vae.dtype)
     with torch.no_grad():
-        latent = pipe.vae.encode(x).latent_dist.sample()
+        latent = pipe.vae.encode(x).latent_dist.mode()
         latent = (latent - pipe.vae.config.shift_factor) * pipe.vae.config.scaling_factor
     return latent
 
@@ -792,7 +792,8 @@ def generate_img2img(
         retrieve_timesteps(pipe.scheduler, num_inference_steps, device, mu=mu)
         pipe.scheduler.set_begin_index(start_step)
     else:
-        noise = torch.randn(init_latent_packed.shape, dtype=dtype, device=device, generator=generator)
+        noise_one = torch.randn(init_latent_packed.shape[1:], dtype=dtype, device=device, generator=generator)
+        noise = noise_one.unsqueeze(0).expand(B, -1, -1).contiguous()
         t_start = timesteps[0:1].to(dtype)
         latents = pipe.scheduler.scale_noise(init_latent_packed, t_start, noise)
         image_latents = None
@@ -822,7 +823,8 @@ def generate_img2img(
     # Aperture compositing re-noises the init latent at each step; RF path needs
     # a fresh noise tensor since scale_noise is not called during init.
     if use_rf_inversion:
-        noise = torch.randn(init_latent_packed.shape, dtype=dtype, device=device, generator=generator)
+        noise_one = torch.randn(init_latent_packed.shape[1:], dtype=dtype, device=device, generator=generator)
+        noise = noise_one.unsqueeze(0).expand(B, -1, -1).contiguous()
 
     guidance = torch.full([B], guidance_scale, device=device, dtype=dtype)
     effective_object_scale = object_ip_scale
