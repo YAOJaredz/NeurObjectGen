@@ -126,8 +126,15 @@ def get_neuron_map(
     return [e for e, dead in zip(entries, dead_mask) if not dead]
 
 
-def _load_hvm_neural() -> tuple[np.ndarray, np.ndarray, dict[str, list[str]]]:
+def _load_hvm_neural(
+    area: str = 'all',
+) -> tuple[np.ndarray, np.ndarray, dict[str, list[str]]]:
     """Load HVM neural responses across all monkeys.
+
+    Args:
+        area: Brain area passed to ``get_hvm_responses`` — individual names
+              ('TE0', 'TE2', 'TE3', 'PHC', 'ENT', 'PRH', ...), compound
+              shorthands ('IT' → TE0+TE2+TE3, 'MT' → PHC+PRH), or 'all'.
 
     Returns:
         rsp:             (450, neurons, time) mean-trial response, dead neurons dropped.
@@ -139,11 +146,11 @@ def _load_hvm_neural() -> tuple[np.ndarray, np.ndarray, dict[str, list[str]]]:
     monkey_responses = []
     monkey_sessions: dict[str, list[str]] = {}
     for monkey in ALL_MONKEYS:
-        rsp, sessions = get_hvm_responses(mode='area', monkey=monkey, area='all',
+        rsp, sessions = get_hvm_responses(mode='area', monkey=monkey, area=area,
                                           time_window=HVM_TIME_WINDOW)
         monkey_responses.append(rsp)
         monkey_sessions[monkey] = sessions
-    rsp = np.concatenate(monkey_responses, axis=1)  # (450, all_neurons, time)
+    rsp = np.concatenate(monkey_responses, axis=1)
     dead_mask = (
         np.all((rsp == 0) | np.isnan(rsp), axis=(0, 2))
         | np.any(np.isnan(rsp), axis=(0, 2))
@@ -298,6 +305,7 @@ def make_hvm_multihead_loader(
     batch_size: int = 64,
     seed: int = SEED,
     verbose: bool = True,
+    area: str = 'all',
     neuron_indices: np.ndarray | None = None,
 ) -> tuple[DataLoader, DataLoader, DataLoader]:
     """Build category-stratified train/val/test DataLoaders for HVM multi-head training.
@@ -310,10 +318,12 @@ def make_hvm_multihead_loader(
     (identical split layout to make_hvm_loader for comparability).
 
     Args:
-        neuron_indices: Optional 1-D array of neuron indices to keep. If None,
-                        all neurons are used.
+        area:           Brain area — individual names ('TE2', 'PRH', ...),
+                        compound shorthands ('IT', 'MT'), or 'all'. Default 'all'.
+        neuron_indices: Optional index subset applied after area filtering.
+                        Used for random-ablation experiments (--n-neurons).
     """
-    rsp, _, _ = _load_hvm_neural()
+    rsp, _, _ = _load_hvm_neural(area)
     if neuron_indices is not None:
         rsp = rsp[:, neuron_indices, :]
     neural_tensor = torch.from_numpy(rsp).float()  # (450, neurons, time)
@@ -356,7 +366,8 @@ def make_hvm_multihead_loader(
     test_loader  = make(test_idx,  shuffle=False)
 
     if verbose:
-        neuron_str = f"{rsp.shape[1]}" + (" (subset)" if neuron_indices is not None else "")
+        suffix = f" (area={area})" if area != 'all' else (" (subset)" if neuron_indices is not None else "")
+        neuron_str = f"{rsp.shape[1]}{suffix}"
         print(
             f"HVM multihead loaders (all monkeys): "
             f"train={len(train_idx)}, val={len(val_idx)}, test={len(test_idx)}, "

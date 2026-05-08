@@ -55,6 +55,8 @@ def run_name(args) -> str:
 
 def run_dir(args) -> Path:
     tag = args.dataset + ("_cat" if getattr(args, "use_category", False) else "")
+    if getattr(args, "area", None):
+        tag += f"_{args.area.upper()}"
     return CHECKPOINT_DIR / "multihead" / tag / run_name(args)
 
 
@@ -81,10 +83,11 @@ def train(args):
 
     neuron_indices = None
     if args.dataset == "hvm":
-        if args.n_neurons is not None:
+        area = getattr(args, "area", None) or 'all'
+        if area == 'all' and args.n_neurons is not None:
             from data_utils.hvm_loader import _load_hvm_neural
-            rsp, _, _ = _load_hvm_neural()
-            n_total = rsp.shape[1]
+            full_rsp, _, _ = _load_hvm_neural()
+            n_total = full_rsp.shape[1]
             if args.n_neurons >= n_total:
                 print(f"--n-neurons {args.n_neurons} >= full count {n_total}; using all neurons.")
             else:
@@ -93,7 +96,7 @@ def train(args):
                 neuron_indices.sort()
                 print(f"Neuron subset: {args.n_neurons}/{n_total} (seed={args.neuron_seed})")
         train_loader, val_loader, test_loader = make_hvm_multihead_loader(
-            batch_size=args.batch_size, neuron_indices=neuron_indices
+            batch_size=args.batch_size, area=area, neuron_indices=neuron_indices,
         )
         clip_key = "clip_short"
     else:
@@ -341,6 +344,11 @@ def parse_args():
                    help="Number of neurons to randomly sample. None = use all neurons.")
     p.add_argument("--neuron-seed",  type=int,   default=0,
                    help="RNG seed for neuron subset sampling.")
+
+    # Brain-area subset
+    p.add_argument("--area",         type=str,   default=None,
+                   help="Restrict to neurons from one brain area, e.g. 'TE2', 'PRH'. "
+                        "Mutually exclusive with --n-neurons.")
 
     return p.parse_args()
 
