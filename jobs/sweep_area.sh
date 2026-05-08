@@ -73,5 +73,5 @@ $PYTHON -m train.train_multihead \
     --target-noise        0.02 \
     --input-noise         0.05 \
     --neuron-dropout      0.1 \
-    --nce-weight          0.1 \
+    --nce-weight          0.5 \
     --nce-temperature     0.07
