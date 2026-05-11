@@ -14,7 +14,7 @@ from HexPred.stim_responses.channels_area_target import (
 
 from config_const import (
     SEED,
-    HVM_SIGLIP_EMBEDDINGS_PATH, HVM_CLIP_EMBEDS_PATH,
+    HVM_SIGLIP_EMBEDDINGS_PATH, HVM_OBJ_SIGLIP_EMBEDDINGS_PATH, HVM_CLIP_EMBEDS_PATH,
     HVM_TIME_WINDOW, HVM_N_STIMULI, HVM_N_VAL, HVM_N_VAR,
 )
 
@@ -284,13 +284,13 @@ def make_hvm_loader(
 
 
 class HVMMultiHeadDataset(Dataset):
-    """Dataset yielding (neural, {'siglip', 'clip_short'}, cat_idx) for HVM multi-head training."""
+    """Dataset yielding (neural, {'siglip', 'siglip_obj', 'clip_short'}, cat_idx)."""
 
     def __init__(self, neural: torch.Tensor, siglip: torch.Tensor,
-                 clip_short: torch.Tensor, cat: torch.Tensor):
+                 siglip_obj: torch.Tensor, clip_short: torch.Tensor, cat: torch.Tensor):
         self.neural  = neural
         self.cat     = cat
-        self.targets = {"siglip": siglip, "clip_short": clip_short}
+        self.targets = {"siglip": siglip, "siglip_obj": siglip_obj, "clip_short": clip_short}
 
     def __len__(self) -> int:
         return len(self.neural)
@@ -333,16 +333,22 @@ def make_hvm_multihead_loader(
             f"SigLIP cache not found at {HVM_SIGLIP_EMBEDDINGS_PATH}. "
             "Run: python scripts/cache_siglip.py --dataset hvm"
         )
+    if not HVM_OBJ_SIGLIP_EMBEDDINGS_PATH.exists():
+        raise FileNotFoundError(
+            f"Obj SigLIP cache not found at {HVM_OBJ_SIGLIP_EMBEDDINGS_PATH}. "
+            "Run: python scripts/cache_siglip.py --dataset hvm --obj"
+        )
     if not HVM_CLIP_EMBEDS_PATH.exists():
         raise FileNotFoundError(
             f"CLIP short-caption cache not found at {HVM_CLIP_EMBEDS_PATH}. "
             "Run: python scripts/cache_text_embeds.py --dataset hvm"
         )
 
-    siglip_t     = torch.load(HVM_SIGLIP_EMBEDDINGS_PATH, weights_only=True)        # (450, 1152) already L2-normed
-    clip_short_t = F.normalize(torch.load(HVM_CLIP_EMBEDS_PATH, weights_only=True), dim=-1)  # (450, 768)
+    siglip_t     = torch.load(HVM_SIGLIP_EMBEDDINGS_PATH,     weights_only=True)        # (450, 1152) already L2-normed
+    siglip_obj_t = F.normalize(torch.load(HVM_OBJ_SIGLIP_EMBEDDINGS_PATH, weights_only=True), dim=-1)  # (450, 1152)
+    clip_short_t = F.normalize(torch.load(HVM_CLIP_EMBEDS_PATH,           weights_only=True), dim=-1)  # (450, 768)
 
-    for name, t in [("siglip", siglip_t), ("clip_short", clip_short_t)]:
+    for name, t in [("siglip", siglip_t), ("siglip_obj", siglip_obj_t), ("clip_short", clip_short_t)]:
         if t.shape[0] != HVM_N_STIMULI:
             raise ValueError(
                 f"{name} cache has {t.shape[0]} rows, expected {HVM_N_STIMULI}."
@@ -357,7 +363,7 @@ def make_hvm_multihead_loader(
 
     def make(idx, shuffle):
         ds = HVMMultiHeadDataset(
-            neural_tensor[idx], siglip_t[idx], clip_short_t[idx], cat_indices[idx]
+            neural_tensor[idx], siglip_t[idx], siglip_obj_t[idx], clip_short_t[idx], cat_indices[idx]
         )
         return DataLoader(ds, batch_size=batch_size, shuffle=shuffle)
 
@@ -372,7 +378,7 @@ def make_hvm_multihead_loader(
             f"HVM multihead loaders (all monkeys): "
             f"train={len(train_idx)}, val={len(val_idx)}, test={len(test_idx)}, "
             f"neurons={neuron_str}, time={rsp.shape[2]}, "
-            f"targets=(siglip=1152, clip_short=768) [stratified by category]"
+            f"targets=(siglip=1152, siglip_obj=1152, clip_short=768) [stratified by category]"
         )
 
     return train_loader, val_loader, test_loader
