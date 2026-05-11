@@ -1,21 +1,23 @@
 #!/bin/bash
 # Sweep MultiHeadTransformerV2 on HVM (global SigLIP + obj SigLIP + CLIP-short).
 #
-# Grid: cat_mode x d_model x n_layers x shared_dim = 2x3x2x2 = 24 runs
-#   cat_mode:   predict, given
+# Grid: d_model x n_layers x shared_dim x wrong_cat_prob = 3x2x2x2 = 24 runs
+#   cat_mode:   predict only
 #   d_model:    64, 128, 256
 #   n_layers:   2, 4
 #   shared_dim: 256, 512
 #
 # Three heads: global SigLIP (1152-d) + obj SigLIP (1152-d) + CLIP-short (768-d).
 # "given" mode: conditions on GT category label.
-# "predict" mode: independent CategoryClassifier transformer, separate optimizer, CE loss.
+# "predict" mode: train multihead heads with GT category first, then freeze the
+# backbone and train CategoryClassifier on the learned neural embedding.
 # Checkpoint criterion: best val_mean_cos = (cos_sg + cos_so + cos_clip) / 3.
 #
 # Fixed: nce_weight=0.1, lr=3e-4, n_heads=4, weight_decay=0.01, dropout=0.1,
 #        loss_weight_siglip=1.0, loss_weight_siglip_obj=1.0, loss_weight_clip=1.0,
 #        uniformity_weight=0.1, target_noise=0.02, input_noise=0.05,
-#        neuron_dropout=0.1, nce_temperature=0.07, epochs=200, batch_size=128.
+#        neuron_dropout=0.1, nce_temperature=0.07, epochs=200, batch_size=128,
+#        clf_epochs=500, clf_lr=1e-3, wrong_cat_prob in {0.0, 0.1}.
 
 #SBATCH --job-name=hvm_v2_sweep
 #SBATCH --account=yy3658
@@ -28,7 +30,7 @@
 #SBATCH --partition=issa
 #SBATCH --exclude=ax09,ax10,ax11
 #SBATCH --output=/home/yy3658/NeurObjectGen/jobs/logs/hvm_v2_sweep_%A_%a.log
-#SBATCH --array=0-23%12        # 24 runs, max 12 concurrent
+#SBATCH --array=0-23%12        # 24 predict-mode runs
 
 # ---------------------------------------------------------------------------
 # Environment
@@ -45,7 +47,6 @@ $PYTHON -V
 # ---------------------------------------------------------------------------
 # Hyperparameter grid
 # ---------------------------------------------------------------------------
-CAT_MODES=(predict given)
 D_MODELS=(64 128 256)
 N_LAYERS=(2 4)
 SHARED_DIMS=(256 512)
@@ -53,27 +54,31 @@ N_HEADS=4
 NCE_WEIGHT=0.1
 DROPOUT=0.1
 NCE_TEMP=0.07
+CAT_MODE=predict
+CLF_EPOCHS=500
+CLF_LR=1e-3
+WRONG_CAT_PROBS=(0.0 0.1)
 
-N_CM=${#CAT_MODES[@]}         # 2
 N_DM=${#D_MODELS[@]}          # 3
 N_NL=${#N_LAYERS[@]}          # 2
 N_SD=${#SHARED_DIMS[@]}       # 2
+N_WC=${#WRONG_CAT_PROBS[@]}   # 2
 
-# 2 x 3 x 2 x 2 = 24 total
+# 3 x 2 x 2 x 2 = 24 total
 TASK_ID=${SLURM_ARRAY_TASK_ID:-0}
 
 idx=$TASK_ID
+WC_IDX=$((idx % N_WC));  idx=$((idx / N_WC))
 SD_IDX=$((idx % N_SD));  idx=$((idx / N_SD))
 NL_IDX=$((idx % N_NL));  idx=$((idx / N_NL))
 DM_IDX=$((idx % N_DM));  idx=$((idx / N_DM))
-CM_IDX=$((idx % N_CM))
 
-CAT_MODE=${CAT_MODES[$CM_IDX]}
 D_MODEL=${D_MODELS[$DM_IDX]}
 N_LAYER=${N_LAYERS[$NL_IDX]}
 SHARED_DIM=${SHARED_DIMS[$SD_IDX]}
+WRONG_CAT_PROB=${WRONG_CAT_PROBS[$WC_IDX]}
 
-echo "Task ${SLURM_ARRAY_TASK_ID}: cat_mode=${CAT_MODE} nce_weight=${NCE_WEIGHT} d_model=${D_MODEL} n_layers=${N_LAYER} shared_dim=${SHARED_DIM}"
+echo "Task ${SLURM_ARRAY_TASK_ID}: cat_mode=${CAT_MODE} nce_weight=${NCE_WEIGHT} d_model=${D_MODEL} n_layers=${N_LAYER} shared_dim=${SHARED_DIM} clf_epochs=${CLF_EPOCHS} clf_lr=${CLF_LR} wrong_cat_prob=${WRONG_CAT_PROB}"
 
 # ---------------------------------------------------------------------------
 # Train
@@ -97,4 +102,7 @@ $PYTHON train/train_multihead_v2.py \
     --nce-weight            "${NCE_WEIGHT}"   \
     --nce-temperature       "${NCE_TEMP}"    \
     --epochs                200              \
-    --batch-size            128
+    --batch-size            128              \
+    --clf-epochs            "${CLF_EPOCHS}"  \
+    --clf-lr                "${CLF_LR}"       \
+    --wrong-cat-prob        "${WRONG_CAT_PROB}"

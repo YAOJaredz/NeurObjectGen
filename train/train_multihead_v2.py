@@ -6,14 +6,17 @@ Loss:
     + w_clip * cosine_loss(pred_clip,       tgt_clip)  # cosine only (no InfoNCE)
     + w_unif * mean(uniformity across all four outputs)
 
-In predict mode, CategoryClassifier is pre-trained first (--clf-pretrain-epochs), then
-the main backbone trains with the warm classifier (separate optimizer, decoupled gradients).
+In predict mode, the multi-head model is still trained with GT category
+conditioning. After the best multi-head checkpoint is selected, the backbone is
+frozen and CategoryClassifier is trained on the learned no-category neural
+embedding. At inference, predict mode uses the classifier output to retrieve the
+learned category embedding.
 
 Checkpoint criterion: best mean cosine similarity across all three heads (after warmup).
 
 Usage:
     python train/train_multihead_v2.py --cat-mode given
-    python train/train_multihead_v2.py --cat-mode predict --clf-pretrain-epochs 50
+    python train/train_multihead_v2.py --cat-mode predict
 """
 
 import argparse
@@ -56,6 +59,11 @@ def run_name(args) -> str:
 
     if args.n_neurons is not None:
         base += f"_nn{args.n_neurons}_ns{args.neuron_seed}"
+    if args.cat_mode == "predict":
+        base += (
+            f"_cle{args.clf_epochs}_clr{args.clf_lr}_cwd{args.clf_weight_decay}"
+            f"_wcp{args.wrong_cat_prob}"
+        )
     return base
 
 
@@ -80,6 +88,27 @@ def save_checkpoint(path: Path, model, optimizer, scheduler, epoch: int, metrics
         "args": vars(args),
         "neuron_indices": neuron_indices,
     }, path)
+
+
+def random_wrong_categories(cat: torch.Tensor, n_categories: int, prob: float) -> tuple[torch.Tensor, float]:
+    """Randomly replace labels with an explicitly wrong category.
+
+    Returns the possibly corrupted labels and the fraction of the batch that was
+    replaced. A nonzero probability is useful in predict mode, where the
+    embedding heads should see occasional classifier-like category mistakes.
+    """
+    if prob <= 0.0:
+        return cat, 0.0
+
+    replace = torch.rand(cat.shape, device=cat.device) < prob
+    if not replace.any():
+        return cat, 0.0
+
+    # Draw an offset in [1, n_categories - 1], then wrap, guaranteeing != cat.
+    offset = torch.randint(1, n_categories, cat.shape, device=cat.device)
+    wrong = (cat + offset) % n_categories
+    out = torch.where(replace, wrong, cat)
+    return out, replace.float().mean().item()
 
 
 # ---------------------------------------------------------------------------
@@ -124,87 +153,20 @@ def train(args):
 
     n_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
     print(f"MultiHeadTransformerV2 | params: {n_params:,} | cat_mode: {args.cat_mode}")
+    if args.cat_mode == "predict":
+        print("Predict mode: training multi-head heads with GT category first; classifier trains after best checkpoint.")
+        if args.wrong_cat_prob > 0.0:
+            print(f"Predict mode: randomly replacing category conditioning with wrong labels at p={args.wrong_cat_prob:.3f}.")
 
     clf_params  = set(model.cat_clf.parameters())
     main_params = [p for p in model.parameters() if p not in clf_params]
-
-    # Dedicated optimizer for the independent CategoryClassifier
-    clf_optimizer = AdamW(model.cat_clf.parameters(), lr=args.lr, weight_decay=args.weight_decay)
 
     ckpt_dir = run_dir(args)
     ckpt_dir.mkdir(parents=True, exist_ok=True)
     print(f"Checkpoints -> {ckpt_dir}")
 
     # -----------------------------------------------------------------------
-    # Phase 1 (predict mode only): pre-train CategoryClassifier until
-    # val accuracy converges, then load best classifier weights.
-    # -----------------------------------------------------------------------
-    if args.cat_mode == "predict":
-        print("\n=== Phase 1: CategoryClassifier pre-training (patience=15, min_delta=0.001) ===")
-
-        clf_scheduler_pre = LambdaLR(clf_optimizer, lr_lambda=lambda e: 1.0)  # constant LR for pre-train
-
-        best_clf_acc = -1.0
-        best_clf_state = None
-        patience, min_delta, no_improve = 15, 0.001, 0
-        min_pretrain_epochs = 50
-
-        for epoch in range(1, 501):  # hard cap 500 epochs
-            model.train()
-            total_ce = correct = total = 0
-            for batch in train_loader:
-                neural, _, cat = batch
-                cat = cat.to(device)
-                x = neural.permute(0, 2, 1).to(device)
-                if args.input_noise > 0.0:
-                    x = x + torch.randn_like(x) * args.input_noise
-                if args.neuron_dropout > 0.0:
-                    mask = (torch.rand(x.shape[0], 1, x.shape[2], device=device) > args.neuron_dropout).float()
-                    x = x * mask
-                logits = model.cat_clf(x)
-                l_ce = F.cross_entropy(logits, cat)
-                clf_optimizer.zero_grad()
-                l_ce.backward()
-                clf_optimizer.step()
-                total_ce += l_ce.item()
-                correct  += (logits.argmax(-1) == cat).sum().item()
-                total    += cat.size(0)
-
-            train_acc = correct / total
-
-            model.eval()
-            val_correct = val_total = 0
-            with torch.no_grad():
-                for batch in val_loader:
-                    neural, _, cat = batch
-                    cat = cat.to(device)
-                    x = neural.permute(0, 2, 1).to(device)
-                    logits = model.cat_clf(x)
-                    val_correct += (logits.argmax(-1) == cat).sum().item()
-                    val_total   += cat.size(0)
-            val_acc = val_correct / val_total
-
-            print(f"  clf epoch {epoch:3d}  ce={total_ce/len(train_loader):.4f}  "
-                  f"train_acc={train_acc:.3f}  val_acc={val_acc:.3f}")
-
-            if val_acc > best_clf_acc + min_delta:
-                best_clf_acc = val_acc
-                best_clf_state = {k: v.clone() for k, v in model.cat_clf.state_dict().items()}
-                no_improve = 0
-            else:
-                no_improve += 1
-                if no_improve >= patience and epoch >= min_pretrain_epochs:
-                    print(f"  Early stop at epoch {epoch} (no improvement for {patience} epochs).")
-                    break
-
-        model.cat_clf.load_state_dict(best_clf_state)
-        print(f"=== Classifier pre-training done. Best val_acc={best_clf_acc:.3f} ===\n")
-
-        # Reset clf_optimizer for Phase 2
-        clf_optimizer = AdamW(model.cat_clf.parameters(), lr=args.lr, weight_decay=args.weight_decay)
-
-    # -----------------------------------------------------------------------
-    # Phase 2: train main backbone (+ continue classifier)
+    # Phase 1: train main backbone/heads with GT category conditioning.
     # -----------------------------------------------------------------------
     optimizer = AdamW(main_params, lr=args.lr, weight_decay=args.weight_decay)
     warmup_epochs = max(1, int(args.epochs * args.warmup_frac)) if args.warmup_frac > 0 else 0
@@ -216,7 +178,6 @@ def train(args):
         return 0.5 * (1.0 + math.cos(math.pi * progress))
 
     scheduler = LambdaLR(optimizer, lr_lambda=lr_lambda)
-    clf_scheduler = LambdaLR(clf_optimizer, lr_lambda=lr_lambda)
 
     best_mean_cos = -1.0
 
@@ -224,6 +185,7 @@ def train(args):
         # --- train ---
         model.train()
         train_loss = train_l_sg = train_l_so = train_l_clip = train_l_ce = 0.0
+        train_wrong_cat_frac = 0.0
 
         for batch in train_loader:
             neural, tgt, cat = batch
@@ -245,7 +207,12 @@ def train(args):
                 mask = (torch.rand(x.shape[0], 1, x.shape[2], device=device) > args.neuron_dropout).float()
                 x = x * mask
 
-            pred = model(x, cat, cat_mode=args.cat_mode)
+            cond_cat = cat
+            wrong_frac = 0.0
+            if args.cat_mode == "predict":
+                cond_cat, wrong_frac = random_wrong_categories(cat, HVM_N_CAT, args.wrong_cat_prob)
+
+            pred = model(x, cond_cat, cat_mode="given")
 
             l_sg   = head_loss(pred["siglip_global"], sg_tgt,   args.nce_weight, args.nce_temperature)
             l_so   = head_loss(pred["siglip_obj"],    so_tgt,   args.nce_weight, args.nce_temperature)
@@ -271,21 +238,17 @@ def train(args):
 
             # Main backbone step — cat_clf params excluded from this optimizer
             optimizer.zero_grad()
-            loss.backward(retain_graph=args.cat_mode == "predict")
+            loss.backward()
             optimizer.step()
 
             l_ce = torch.tensor(0.0, device=device)
-            if args.cat_mode == "predict" and pred["cat_logits"] is not None:
-                l_ce = F.cross_entropy(pred["cat_logits"], cat)
-                clf_optimizer.zero_grad()
-                l_ce.backward()
-                clf_optimizer.step()
 
             train_loss   += loss.item()
             train_l_sg   += l_sg.item()
             train_l_so   += l_so.item()
             train_l_clip += l_clip.item()
             train_l_ce   += l_ce.item()
+            train_wrong_cat_frac += wrong_frac
 
         n_batches = len(train_loader)
         train_loss   /= n_batches
@@ -293,9 +256,8 @@ def train(args):
         train_l_so   /= n_batches
         train_l_clip /= n_batches
         train_l_ce   /= n_batches
+        train_wrong_cat_frac /= n_batches
         scheduler.step()
-        if args.cat_mode == "predict":
-            clf_scheduler.step()
 
         # --- val ---
         model.eval()
@@ -308,7 +270,7 @@ def train(args):
                 neural, tgt, cat = batch
                 cat = cat.to(device)
                 x = neural.permute(0, 2, 1).to(device)
-                pred = model(x, cat, cat_mode=args.cat_mode)
+                pred = model(x, cat, cat_mode="given")
                 preds_sg.append(pred["siglip_global"].cpu())
                 preds_so.append(pred["siglip_obj"].cpu())
                 preds_clip.append(pred["clip"].cpu())
@@ -337,10 +299,11 @@ def train(args):
         cat_acc   = cat_correct / cat_total if cat_total > 0 else float("nan")
 
         cat_str = f"  cat_acc={cat_acc:.3f}" if cat_total > 0 else ""
+        wrong_cat_str = f" wrong_cat={train_wrong_cat_frac:.3f}" if args.cat_mode == "predict" else ""
         print(
             f"epoch {epoch:3d}/{args.epochs}  "
             f"loss={train_loss:.4f} (sg={train_l_sg:.3f} so={train_l_so:.3f} "
-            f"clip={train_l_clip:.3f} ce={train_l_ce:.3f})  "
+            f"clip={train_l_clip:.3f} ce={train_l_ce:.3f}{wrong_cat_str})  "
             f"val: cos_sg={cos_sg:.3f} cos_so={cos_so:.3f} cos_clip={cos_clip:.3f}  "
             f"2afc_sg={afc_sg:.3f} 2afc_so={afc_so:.3f}  "
             f"crit(cos)={mean_cos:.4f}{cat_str}"
@@ -351,6 +314,7 @@ def train(args):
             "train_loss": train_loss,
             "train_l_siglip_global": train_l_sg, "train_l_siglip_obj": train_l_so,
             "train_l_clip": train_l_clip, "train_l_ce": train_l_ce,
+            "train_wrong_cat_frac": train_wrong_cat_frac,
             "val_2afc_siglip_global": afc_sg, "val_2afc_siglip_obj": afc_so,
             "val_mean_2afc": mean_2afc,
             "val_cos_siglip_global": cos_sg, "val_cos_siglip_obj": cos_so,
@@ -358,19 +322,109 @@ def train(args):
             "val_cat_acc": cat_acc,
         }
 
-        _clf_opt = clf_optimizer if args.cat_mode == "predict" else None
-        _clf_sch = clf_scheduler if args.cat_mode == "predict" else None
         save_checkpoint(ckpt_dir / "last.pt", model, optimizer, scheduler, epoch, metrics, args, neuron_indices,
-                        clf_optimizer=_clf_opt, clf_scheduler=_clf_sch)
+                        clf_optimizer=None, clf_scheduler=None)
         if epoch > warmup_epochs and mean_cos > best_mean_cos:
             best_mean_cos = mean_cos
             save_checkpoint(ckpt_dir / "best.pt", model, optimizer, scheduler, epoch, metrics, args, neuron_indices,
-                            clf_optimizer=_clf_opt, clf_scheduler=_clf_sch)
+                            clf_optimizer=None, clf_scheduler=None)
 
     # --- test ---
     best_ckpt = torch.load(ckpt_dir / "best.pt", weights_only=False)
     model.load_state_dict(best_ckpt["model_state"])
     model.eval()
+
+    if args.cat_mode == "predict":
+        print("\n=== Phase 2: train CategoryClassifier on frozen neural embedding ===")
+
+        for p in model.parameters():
+            p.requires_grad_(False)
+        for p in model.cat_clf.parameters():
+            p.requires_grad_(True)
+
+        clf_optimizer = AdamW(model.cat_clf.parameters(), lr=args.clf_lr, weight_decay=args.clf_weight_decay)
+        clf_scheduler = LambdaLR(
+            clf_optimizer,
+            lr_lambda=lambda e: 0.5 * (1.0 + math.cos(math.pi * e / max(1, args.clf_epochs))),
+        )
+
+        best_clf_acc = -1.0
+        best_clf_state = {k: v.detach().clone() for k, v in model.cat_clf.state_dict().items()}
+        no_improve = 0
+
+        def classifier_accuracy(loader):
+            model.eval()
+            correct = total = 0
+            with torch.no_grad():
+                for neural, _, cat in loader:
+                    x = neural.permute(0, 2, 1).to(device)
+                    cat = cat.to(device)
+                    emb = model.encode_neural_embedding(x)
+                    logits = model.cat_clf(emb)
+                    correct += (logits.argmax(-1) == cat).sum().item()
+                    total += cat.size(0)
+            return correct / total
+
+        for clf_epoch in range(1, args.clf_epochs + 1):
+            model.eval()
+            model.cat_clf.train()
+            total_ce = correct = total = 0
+
+            for neural, _, cat in train_loader:
+                x = neural.permute(0, 2, 1).to(device)
+                cat = cat.to(device)
+
+                if args.input_noise > 0.0:
+                    x = x + torch.randn_like(x) * args.input_noise
+                if args.neuron_dropout > 0.0:
+                    mask = (torch.rand(x.shape[0], 1, x.shape[2], device=device) > args.neuron_dropout).float()
+                    x = x * mask
+
+                with torch.no_grad():
+                    emb = model.encode_neural_embedding(x)
+                logits = model.cat_clf(emb)
+                l_ce = F.cross_entropy(logits, cat)
+
+                clf_optimizer.zero_grad()
+                l_ce.backward()
+                clf_optimizer.step()
+
+                total_ce += l_ce.item()
+                correct += (logits.argmax(-1) == cat).sum().item()
+                total += cat.size(0)
+
+            clf_scheduler.step()
+            train_acc = correct / total
+            val_acc = classifier_accuracy(val_loader)
+            print(
+                f"  clf epoch {clf_epoch:3d}/{args.clf_epochs}  "
+                f"ce={total_ce/len(train_loader):.4f}  "
+                f"train_acc={train_acc:.3f}  val_acc={val_acc:.3f}"
+            )
+
+            if val_acc > best_clf_acc + args.clf_min_delta:
+                best_clf_acc = val_acc
+                best_clf_state = {k: v.detach().clone() for k, v in model.cat_clf.state_dict().items()}
+                no_improve = 0
+            else:
+                no_improve += 1
+                if no_improve >= args.clf_patience:
+                    print(f"  Early stop at epoch {clf_epoch} (no improvement for {args.clf_patience} epochs).")
+                    break
+
+        model.cat_clf.load_state_dict(best_clf_state)
+        for p in model.parameters():
+            p.requires_grad_(True)
+
+        best_ckpt["model_state"] = model.state_dict()
+        best_ckpt["clf_optimizer_state"] = clf_optimizer.state_dict()
+        best_ckpt["clf_scheduler_state"] = clf_scheduler.state_dict()
+        best_ckpt["posthoc_cat_metrics"] = {
+            "val_cat_acc": best_clf_acc,
+            "train_cat_acc": classifier_accuracy(train_loader),
+        }
+        torch.save(best_ckpt, ckpt_dir / "best.pt")
+        print(f"=== Classifier done. Best val_acc={best_clf_acc:.3f} ===\n")
 
     test_sg, test_so, test_clip = [], [], []
     test_gt_sg, test_gt_so, test_gt_clip = [], [], []
@@ -488,6 +542,20 @@ def parse_args():
     p.add_argument("--lr",           type=float, default=3e-4)
     p.add_argument("--weight-decay", type=float, default=0.01)
     p.add_argument("--warmup-frac",  type=float, default=0.1)
+
+    # Post-hoc category classifier for predict mode
+    p.add_argument("--clf-epochs",       type=int,   default=500,
+                   help="Max epochs for post-hoc classifier training in predict mode.")
+    p.add_argument("--clf-lr",           type=float, default=1e-3,
+                   help="Learning rate for post-hoc classifier training.")
+    p.add_argument("--clf-weight-decay", type=float, default=0.01,
+                   help="Weight decay for post-hoc classifier training.")
+    p.add_argument("--clf-patience",     type=int,   default=50,
+                   help="Early-stop patience for post-hoc classifier validation accuracy.")
+    p.add_argument("--clf-min-delta",    type=float, default=0.001,
+                   help="Minimum validation accuracy improvement for classifier early stopping.")
+    p.add_argument("--wrong-cat-prob",   type=float, default=0.0,
+                   help="Predict mode only: probability of replacing GT category conditioning with a random wrong category during multi-head training.")
 
     # Neuron subset ablation
     p.add_argument("--n-neurons",   type=int, default=None,

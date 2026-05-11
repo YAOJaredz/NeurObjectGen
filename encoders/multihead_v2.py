@@ -3,9 +3,8 @@
 Adds two features over MultiHeadTransformer:
   1. A third head for object-crop SigLIP embeddings (siglip_obj).
   2. Dual category conditioning: "given" (GT label as input) or "predict"
-     (dedicated CategoryClassifier transformer reads the same neural input
-     independently, predicts the category, and feeds the predicted embedding
-     into the main backbone — zero shared weights, fully decoupled gradients).
+     (CategoryClassifier reads the learned neural embedding, predicts the
+     category, and retrieves the corresponding learned category embedding).
 """
 
 import numpy as np
@@ -15,48 +14,45 @@ import torch.nn.functional as F
 
 
 class CategoryClassifier(nn.Module):
-    """Mean-pool MLP classifier for neural population → object category.
+    """MLP classifier for learned neural embedding → object category.
 
-    Shares no weights with the main MultiHeadTransformerV2 backbone.
-    Trained purely via cross-entropy loss; gradients do not flow into the
-    embedding heads.
-
-    Architecture: mean-pool over time → LayerNorm → Linear → GELU →
-                  Linear → GELU → Linear (logits).
+    It is trained after the embedding heads have converged, using the
+    no-category shared latent produced by the neural backbone.
 
     Args:
-        n_neurons:    Number of input neurons (must match main backbone).
+        in_dim:       Input embedding dimension.
         n_categories: Number of output classes.
         dropout:      Dropout probability (default 0.1).
     """
 
     def __init__(
         self,
-        n_neurons: int,
+        in_dim: int,
         n_categories: int,
         dropout: float = 0.1,
     ):
         super().__init__()
+        hidden = max(32, min(256, in_dim // 2))
         self.net = nn.Sequential(
-            nn.LayerNorm(n_neurons),
-            nn.Linear(n_neurons, 64),
+            nn.LayerNorm(in_dim),
+            nn.Linear(in_dim, hidden),
             nn.GELU(),
             nn.Dropout(dropout),
-            nn.Linear(64, 32),
+            nn.Linear(hidden, hidden // 2),
             nn.GELU(),
             nn.Dropout(dropout),
-            nn.Linear(32, n_categories),
+            nn.Linear(hidden // 2, n_categories),
         )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """
         Args:
-            x: (B, T, N_neurons) neural firing rates.
+            x: (B, D) learned neural embedding.
 
         Returns:
             (B, n_categories) unnormalised logits.
         """
-        return self.net(x.mean(dim=1))                       # mean-pool over time
+        return self.net(x)
 
 
 class MultiHeadTransformerV2(nn.Module):
@@ -73,10 +69,9 @@ class MultiHeadTransformerV2(nn.Module):
 
       "given"   — caller supplies ground-truth category indices; the
                   corresponding embedding is added to the shared latent.
-      "predict" — a dedicated CategoryClassifier MLP (own weights,
-                  decoupled gradients) classifies the category from the raw
-                  neural input; its predicted label is used to condition the
-                  shared latent. `cat_logits` is returned for CE loss.
+      "predict" — a dedicated CategoryClassifier MLP classifies the category
+                  from the learned no-category neural embedding; its predicted
+                  label is used to retrieve the category embedding.
 
     Args:
         n_neurons:    Number of input neurons.
@@ -136,12 +131,65 @@ class MultiHeadTransformerV2(nn.Module):
         self.cat_emb = nn.Embedding(n_categories, shared_dim)
         nn.init.zeros_(self.cat_emb.weight)
 
-        # Dedicated category classifier — independent mean-pool MLP, no shared weights
+        # Dedicated category classifier trained after the embedding heads.
         self.cat_clf = CategoryClassifier(
-            n_neurons=n_neurons,
+            in_dim=shared_dim,
             n_categories=n_categories,
             dropout=dropout,
         )
+
+    def load_state_dict(self, state_dict, strict: bool = True):
+        """Load checkpoints while tolerating obsolete raw-neural cat_clf weights.
+
+        Older V2 checkpoints stored a classifier whose first layer matched the
+        raw neuron count. The embedding heads and category table are still
+        compatible, so skip only classifier tensors whose shapes no longer match.
+        """
+        own_state = self.state_dict()
+        filtered = {}
+        skipped_cat_clf = []
+        for key, value in state_dict.items():
+            if key.startswith("cat_clf.") and key in own_state and own_state[key].shape != value.shape:
+                skipped_cat_clf.append(key)
+                continue
+            filtered[key] = value
+
+        result = super().load_state_dict(filtered, strict=False)
+        if strict:
+            missing = [k for k in result.missing_keys if k not in skipped_cat_clf]
+            unexpected = list(result.unexpected_keys)
+            if missing or unexpected:
+                raise RuntimeError(
+                    "Error(s) in loading state_dict for MultiHeadTransformerV2:\n"
+                    + "\n".join([f"\tMissing key(s): {missing}", f"\tUnexpected key(s): {unexpected}"])
+                )
+        return result
+
+    def encode_neural_embedding(self, x: torch.Tensor) -> torch.Tensor:
+        """Return shared_pre: neural embedding before adding any category embedding.
+
+        Args:
+            x: (B, T, N_neurons) neural firing rates.
+
+        Returns:
+            (B, shared_dim) unnormalised no-category neural embedding.
+        """
+        x = self.input_norm(x)
+        x = self.input_proj(x)                               # (B, T, d_model)
+        cls = self.cls_token.expand(x.size(0), -1, -1)       # (B, 1, d_model)
+        x = torch.cat([cls, x], dim=1)                       # (B, T+1, d_model)
+        T_plus_1 = x.size(1)
+        if T_plus_1 > self.pos_embed.size(1):
+            raise ValueError(
+                f"Input has {T_plus_1} tokens but pos_embed only supports "
+                f"{self.pos_embed.size(1)}. Increase max_time."
+            )
+        x = x + self.pos_embed[:, :T_plus_1]
+        x = self.encoder(x)                                  # (B, T+1, d_model)
+
+        w = torch.softmax(self.attn(x), dim=1)               # (B, T+1, 1)
+        pooled = (w * x).sum(dim=1)                          # (B, d_model)
+        return F.gelu(self.shared_proj(pooled))              # (B, shared_dim)
 
     def forward(
         self,
@@ -162,25 +210,7 @@ class MultiHeadTransformerV2(nn.Module):
             shared:        (B, shared_dim) L2-normalised
             cat_logits:    (B, n_categories) or None (only set in "predict" mode)
         """
-        x_raw = x                                              # save for CategoryClassifier
-        x = self.input_norm(x)
-        x = self.input_proj(x)                               # (B, T, d_model)
-        cls = self.cls_token.expand(x.size(0), -1, -1)       # (B, 1, d_model)
-        x = torch.cat([cls, x], dim=1)                       # (B, T+1, d_model)
-        T_plus_1 = x.size(1)
-        if T_plus_1 > self.pos_embed.size(1):
-            raise ValueError(
-                f"Input has {T_plus_1} tokens but pos_embed only supports "
-                f"{self.pos_embed.size(1)}. Increase max_time."
-            )
-        x = x + self.pos_embed[:, :T_plus_1]
-        x = self.encoder(x)                                  # (B, T+1, d_model)
-
-        w = torch.softmax(self.attn(x), dim=1)               # (B, T+1, 1)
-        pooled = (w * x).sum(dim=1)                          # (B, d_model)
-
-        shared_pre = F.gelu(self.shared_proj(pooled))        # (B, shared_dim)
-
+        shared_pre = self.encode_neural_embedding(x)
         cat_logits = None
 
         if cat_mode == "given":
@@ -189,7 +219,7 @@ class MultiHeadTransformerV2(nn.Module):
             shared = shared_pre + self.cat_emb(cat)
 
         elif cat_mode == "predict":
-            cat_logits = self.cat_clf(x_raw)                 # independent transformer
+            cat_logits = self.cat_clf(shared_pre)
             cat_pred   = cat_logits.argmax(dim=-1)
             shared = shared_pre + self.cat_emb(cat_pred)
 
