@@ -134,6 +134,123 @@ def two_afc_identification(
     return correct / total if total > 0 else 0.0
 
 
+def _cosine_similarity_matrix(
+    pred_embeddings: torch.Tensor,
+    target_embeddings: torch.Tensor,
+) -> torch.Tensor:
+    pred_norm = F.normalize(pred_embeddings, dim=-1)
+    target_norm = F.normalize(target_embeddings, dim=-1)
+    return pred_norm @ target_norm.T
+
+
+def retrieval_ranks(
+    pred_embeddings: torch.Tensor,
+    target_embeddings: torch.Tensor,
+) -> torch.Tensor:
+    """One-indexed rank of the correct target for each prediction.
+
+    Args:
+        pred_embeddings:   (N, D) predicted embeddings
+        target_embeddings: (N, D) ground-truth embeddings; target_embeddings[i]
+                           is the correct match for pred_embeddings[i]
+
+    Returns:
+        (N,) tensor of one-indexed ranks, where 1 means nearest neighbor.
+    """
+    sim = _cosine_similarity_matrix(pred_embeddings, target_embeddings)
+    n = sim.size(0)
+    order = sim.argsort(dim=1, descending=True)
+    correct = torch.arange(n, device=sim.device).unsqueeze(1)
+    return (order == correct).nonzero(as_tuple=False)[:, 1] + 1
+
+
+def retrieval_summary(
+    pred_embeddings: torch.Tensor,
+    target_embeddings: torch.Tensor,
+    k: int | list[int] = (1, 5),
+) -> dict[str, float]:
+    """Full retrieval summary over all targets.
+
+    Reports top-k accuracy plus mean/median rank over the N-way retrieval task.
+    """
+    ks = [k] if isinstance(k, int) else list(k)
+    ranks = retrieval_ranks(pred_embeddings, target_embeddings).float()
+    out = {f"top{ki}": float((ranks <= ki).float().mean().item()) for ki in ks}
+    out["mean_rank"] = float(ranks.mean().item())
+    out["median_rank"] = float(ranks.median().item())
+    return out
+
+
+def two_afc_identification_masked(
+    pred_embeddings: torch.Tensor,
+    target_embeddings: torch.Tensor,
+    distractor_mask: torch.Tensor,
+    tie_policy: str = "half",
+) -> float:
+    """2-AFC accuracy using a caller-supplied distractor mask.
+
+    Args:
+        pred_embeddings:   (N, D) predicted embeddings
+        target_embeddings: (N, D) ground-truth embeddings
+        distractor_mask:   (N, N) bool tensor. True entries are distractors for
+                           that row. The diagonal is ignored even if True.
+        tie_policy:        "half" gives ties 0.5 credit; "incorrect" gives 0.
+
+    Returns:
+        Scalar pairwise forced-choice accuracy. Returns NaN if no distractors
+        are selected by the mask.
+    """
+    if tie_policy not in {"half", "incorrect"}:
+        raise ValueError("tie_policy must be 'half' or 'incorrect'.")
+
+    sim = _cosine_similarity_matrix(pred_embeddings, target_embeddings)
+    n = sim.size(0)
+    mask = distractor_mask.to(device=sim.device, dtype=torch.bool).clone()
+    mask[torch.arange(n, device=sim.device), torch.arange(n, device=sim.device)] = False
+
+    diag = sim.diag().unsqueeze(1)
+    wins = (diag > sim).float()
+    if tie_policy == "half":
+        wins = wins + 0.5 * (diag == sim).float()
+
+    selected = wins[mask]
+    if selected.numel() == 0:
+        return float("nan")
+    return float(selected.mean().item())
+
+
+def category_aware_retrieval_metrics(
+    pred_embeddings: torch.Tensor,
+    target_embeddings: torch.Tensor,
+    categories: torch.Tensor,
+    k: int | list[int] = (1, 5),
+    tie_policy: str = "half",
+) -> dict[str, float]:
+    """N-way retrieval plus all/within/cross-category 2-AFC metrics.
+
+    The row order must align across ``pred_embeddings``, ``target_embeddings``,
+    and ``categories`` so the diagonal remains the correct target.
+    """
+    cats = categories.to(torch.long)
+    same_cat = cats.unsqueeze(0) == cats.unsqueeze(1)
+    eye = torch.eye(len(cats), dtype=torch.bool, device=same_cat.device)
+    within_mask = same_cat & ~eye
+    cross_mask = ~same_cat
+    all_mask = ~eye
+
+    out = retrieval_summary(pred_embeddings, target_embeddings, k=k)
+    out["2afc_all"] = two_afc_identification_masked(
+        pred_embeddings, target_embeddings, all_mask, tie_policy=tie_policy
+    )
+    out["2afc_within_category"] = two_afc_identification_masked(
+        pred_embeddings, target_embeddings, within_mask, tie_policy=tie_policy
+    )
+    out["2afc_cross_category"] = two_afc_identification_masked(
+        pred_embeddings, target_embeddings, cross_mask, tie_policy=tie_policy
+    )
+    return out
+
+
 def retrieval_accuracy(
     pred_embeddings: torch.Tensor,
     target_embeddings: torch.Tensor,
