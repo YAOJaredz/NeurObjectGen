@@ -1,0 +1,65 @@
+[project]
+name = "neurobjectgen"
+version = "0.1.0"
+requires-python = ">=3.12,<3.13"
+dependencies = [
+    # core numerics
+    "numpy==2.4.3",
+    "scipy==1.17.1",
+    "pandas==3.0.2",
+    "scikit-image==0.26.0",
+    "scikit-learn==1.8.0",
+    "h5py==3.16.0",
+    "tqdm==4.67.3",
+    "pillow==12.1.1",
+    "matplotlib==3.10.8",
+
+    # torch (cu124 wheels come from the pytorch index, see [tool.uv.sources])
+    "torch==2.6.0",
+    "torchvision==0.21.0",
+
+    # generative / model stack
+    "diffusers==0.37.1",
+    "transformers==5.5.3",
+    "accelerate==1.13.0",
+    "peft==0.19.1",
+    "huggingface-hub==1.10.1",
+    "safetensors==0.7.0",
+    "tokenizers==0.22.2",
+    "sentencepiece==0.2.1",   # T5-XXL tokenizer (scripts/cache_hvm_t5_xxl_tokens.py)
+    "lpips==0.1.4",
+
+    # notebooks
+    "ipython==9.12.0",
+
+    # inherited from the HexPred loaders this repo calls (from HexPred.* via
+    # extra_paths.pth). openpyxl: npix.read_area_label_sheets reads the .xlsx area
+    # sheets; natsort: used by the mkTurk helpers on adjacent HexPred code paths.
+    "openpyxl==3.1.5",
+    "natsort==8.4.0",
+    # HexPred's waveforms/__init__ eagerly imports the classifier, so importing the
+    # HVM/Rust loaders pulls these even though objGen never invokes the classifier
+    # (build_channel_mask is called without neuron_type). networkx is already above.
+    "umap-learn",
+    "hdbscan",
+    "python-louvain",
+]
+
+[project.optional-dependencies]
+dev = ["mypy==1.20.0", "pyright==1.1.408"]
+
+[tool.uv]
+# This repo runs from its own root with '.' on sys.path; it is not installed as a
+# package, and HexPred is reached via a path entry (see the post-sync .pth step),
+# not as a dependency. So uv manages the venv without building this project.
+package = false
+
+# torch/torchvision resolve to the cu124 CUDA builds, not the PyPI CPU wheels.
+[[tool.uv.index]]
+name = "pytorch-cu124"
+url = "https://download.pytorch.org/whl/cu124"
+explicit = true
+
+[tool.uv.sources]
+torch = { index = "pytorch-cu124" }
+torchvision = { index = "pytorch-cu124" }
