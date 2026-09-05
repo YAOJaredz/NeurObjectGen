@@ -1,6 +1,6 @@
 # From Spikes to Scenes: Neural Image Reconstruction from Marmoset Visual Cortex in the Data-Limited Regime
 
-Reconstructs the image a marmoset was looking at, directly from Neuropixels population activity, by decoding neural responses into vision-language embeddings and conditioning a frozen FLUX.1-dev diffusion model on them.
+Reconstructs the image a marmoset was looking at, directly from Neuropixels population activity, by decoding neural responses into vision-language embeddings and conditioning a FLUX.1-dev diffusion model on them.
 
 Prior brain-to-image work needs 22,000+ images or thousands of trials. This repo does it with **270 training examples**, the regime typical of primate electrophysiology.
 
@@ -19,55 +19,28 @@ Two lightweight transformer encoders map a 2,330-neuron pseudo-population to Sig
 1. **Pass 1 (object recovery).** The GDINO bbox crop is denoised conditioned on `ẑ_sig_obj`, then composited back onto the original to form a spliced latent.
 2. **Pass 2 (global recovery).** Starts from the original init latent conditioned on `ẑ_sig_global`. Bbox tokens are blended toward the spliced latent with a cosine-decaying weight (0.6 → 0), anchoring object structure early and releasing it late. Latents outside the circular aperture are pinned to the original.
 
-No adapter finetuning is involved. Everything downstream of the encoders is pretrained and frozen.
+The IP-Adapter itself is used as pretrained. To close the domain gap between its natural-photograph training distribution and HVM stimuli (controlled lighting, plain backgrounds, circular aperture), a rank-16 LoRA is fine-tuned on the 270 HVM training images over the FLUX transformer's attention and feed-forward layers, with the base weights, VAE, text encoders, SigLIP encoder, and IP-Adapter all frozen. That LoRA is loaded by default at inference.
 
 ---
 
-## Install
+## Install and usage
 
-Dependencies are pinned in `pyproject.toml` and locked in `uv.lock` ([uv](https://docs.astral.sh/uv/) required, Python 3.12).
+Requires [uv](https://docs.astral.sh/uv/) and Python 3.12. All commands run from the repo root.
 
 ```bash
 uv sync
-```
 
-This creates `.venv/` with the cu124 torch builds. The loaders import `HexPred`, which is not a package dependency and is reached through a path entry, so add one after syncing:
-
-```bash
+# HexPred is reached by path, not as a dependency
 printf '%s\n' /home/yy3658 /home/yy3658/HexPred /home/yy3658/helpers \
   > .venv/lib/python3.12/site-packages/extra_paths.pth
+
+uv run python train/train_multihead_v2.py                   # unified three-head encoder
+uv run python train/train_multihead.py --dataset hvm --use-category   # global model, for generation
+uv run python train/train_multihead_obj.py --use-category             # object model, for generation
+uv run python scripts/generate_hvm_obj.py                   # 90 test stimuli
 ```
 
-Then run commands with `uv run`, or activate the venv directly:
-
-```bash
-source .venv/bin/activate
-```
-
-All scripts run from the repo root. Key paths live in `config_const.py`. HVM stimulus images are expected at `stimuli/hvm_nofixation/`, and the caches in `cache/` are built by the scripts in `scripts/`.
-
-## Usage
-
-**Train the encoders.**
-
-```bash
-# Global model (full-image SigLIP + CLIP)
-uv run python train/train_multihead.py --dataset hvm --use-category
-
-# Object model (bbox-crop SigLIP + CLIP)
-uv run python train/train_multihead_obj.py --use-category
-```
-
-Best configurations are written to `cache/best_hvm_multihead_config.json` and `cache/best_hvm_multihead_obj_config.json`. Best sweep result: `d_model=64, n_heads=4, n_layers=2, shared_dim=512`.
-
-**Generate reconstructions.**
-
-```bash
-uv run python scripts/generate_hvm_obj.py          # all 90 test stimuli
-uv run python scripts/generate_hvm_obj.py --n 10   # first 10 only
-```
-
-Outputs land in `outputs/generate_hvm_obj/{full,crop}/` as labeled PNG composites, one per stimulus, covering all four conditions.
+Paths live in `config_const.py`, stimuli in `stimuli/hvm_nofixation/`, and `cache/` is built by the scripts in `scripts/`. Reconstructions land in `outputs/generate_hvm_obj/{full,crop}/`. Best sweep config: `d_model=64, n_heads=4, n_layers=2, shared_dim=512`.
 
 ## Repository layout
 
@@ -100,13 +73,17 @@ Neural responses are mean-trial spike rates from Neuropixels 1.0 recordings in m
 
 ## Model details
 
-Each encoder predicts an L2-normalised SigLIP and CLIP embedding from the neural response. The global model targets the full-image SigLIP, the object model targets SigLIP of the GDINO-cropped object region. That separation is neurobiologically motivated: the ventral stream encodes a position- and size-invariant representation that aligns more closely with the object crop than the full image. A learned category embedding is added to the shared latent as a low-data inductive bias, and the shared latent doubles as an interpretable probe of the population, analyzable independently of generation.
+A shared pre-LN transformer backbone pools the neural response over time by learned attention, projects it to a `shared_dim` latent, and reads out three L2-normalised heads: full-image SigLIP, object-crop SigLIP, and CLIP. Splitting the two SigLIP targets is neurobiologically motivated, since the ventral stream encodes a position- and size-invariant representation that aligns more closely with the object crop than the full image.
+
+This unified V2 encoder (`encoders/multihead_v2.py`, trained by `train/train_multihead_v2.py`) is what the analyses below probe. The generation pipeline still runs the earlier design, where the same backbone and loss are trained twice as separate global and object models with one SigLIP head each.
+
+A learned category embedding is added to the shared latent as a low-data inductive bias. The label is either supplied (`given`) or predicted from the pre-addition latent by a small classifier (`predict`); all results here use `given`, since the classifier only reaches 0.22 test accuracy. The latent before that addition doubles as an interpretable probe of the population, analyzable independently of generation.
 
 ![MultiHeadTransformer architecture](assets/fig1_architecture.png)
 
 The loss combines per-head InfoNCE and cosine regression with a uniformity penalty on the shared latent:
 
-$$\mathcal{L} = w_\text{sig}\left[\alpha \mathcal{L}^\text{sig}_\text{NCE} + (1-\alpha)\mathcal{L}^\text{sig}_\text{cos}\right] + w_\text{clip}\left[\alpha \mathcal{L}^\text{clip}_\text{NCE} + (1-\alpha)\mathcal{L}^\text{clip}_\text{cos}\right] + w_\text{unif}\mathcal{L}_\text{unif}$$
+$$\mathcal{L} = \sum_{h \in \{\text{sig-g},\, \text{sig-o},\, \text{clip}\}} w_h \left[\alpha \mathcal{L}^h_\text{NCE} + (1-\alpha)\mathcal{L}^h_\text{cos}\right] + w_\text{unif}\mathcal{L}_\text{unif}$$
 
 where $\alpha$ controls the InfoNCE/cosine tradeoff and $\mathcal{L}_\text{unif}$ penalises collapsed shared latents.
 
@@ -125,14 +102,15 @@ The IP-Adapter's `MLPProjModel` maps SigLIP 1152-d to 128 × 4096 image tokens, 
 | Neural pred | zeroed | ẑ_clip (obj model) | ẑ_sig_obj → ẑ_sig_global |
 | GT emb (upper bound) | zeroed | category CLIP | GT SigLIP crop → GT SigLIP full |
 
-**The encoders generalize.** Both reach well above-chance 2-AFC on held-out stimuli, so 270 training examples suffice to recover stimulus-specific embedding information from noisy pseudo-population responses.
+**The encoders generalize.** All three heads reach well above-chance 2-AFC on held-out stimuli, so 270 training examples suffice to recover stimulus-specific embedding information from noisy pseudo-population responses.
 
-| Model | SigLIP cos | CLIP cos | SigLIP 2-AFC | CLIP 2-AFC |
+| Head | cos sim | 2-AFC | top-1 | top-5 |
 | --- | --- | --- | --- | --- |
-| Global | 0.8331 | 0.9834 | 0.9663 | 0.9101 |
-| Object | 0.8804 | 0.9886 | 0.9582 | 0.9101 |
+| SigLIP global | 0.8526 | 0.9649 | 0.222 | 0.711 |
+| SigLIP object | 0.8744 | 0.9596 | 0.178 | 0.644 |
+| CLIP | 0.9845 | — | 0.078 | 0.511 |
 
-*Chance = 0.5, on the 90 test stimuli.*
+*Unified V2 encoder (`cat_mode=given`), test split, 90 stimuli. Chance is 0.5 for 2-AFC and 0.011 for top-1. The reconstructions below were generated earlier, from the two separate global and object encoders.*
 
 **Neural conditioning matches or beats text conditioning.** Across the 90 test stimuli, neural reconstructions beat text-conditioned ones on pixel and perceptual fidelity, despite the text condition receiving the ground-truth category label through both T5 and CLIP. The neural pathway has to recover that semantic content from a small, noisy population and still comes out ahead.
 
@@ -149,6 +127,16 @@ The IP-Adapter's `MLPProjModel` maps SigLIP 1152-d to 128 × 4096 image tokens, 
 
 **Failures localize what the population misses.** The gap between neural and GT conditioning is a direct readout of what is in the image but absent from the predicted embeddings. Two patterns recur: on faces, GT recovers fine detail while neural produces a face-shaped object without recognizable features, and on elephants, both text and GT succeed while neural consistently struggles, suggesting a general difficulty encoding that category.
 
+## Probing the decoded representation
+
+The notebooks ask what the decoded embeddings actually contain, past whether the reconstructions look right. Two findings stand out.
+
+**Identity survives the category-centroid control.** A baseline predicting each image's category centroid scores 0.93 overall 2-AFC, beating the decoder, because getting the category right settles most pairwise comparisons. Within-category 2-AFC removes that advantage, putting centroids at exactly 0.500 by construction. The global SigLIP decoder reaches **0.712** there, so it carries genuine image identity beyond category. The object and CLIP heads fall off sharply (0.599, 0.513).
+
+**But the usable subspace is only ~10-dimensional.** Against a permutation null, 10 components of the predicted-to-ground-truth alignment survive, holding 87.6% of ground-truth embedding variance. That subspace is category-structured: between-category axes (animate, face, vehicle) are 93 to 97% aligned with it, while within-category pose axes (rotation, size, translation) are 11 to 18% aligned and land mostly in the discarded remainder. Linear probes agree, recovering category from the shared latent (0.607 vs 0.100 chance) but not pose, scale, or translation.
+
+So the reconstructions rest on a low-dimensional, category-dominated code that still carries measurable within-category identity. The gesture recovery in Figure 3A is real but sits at the edge of what the population supports, which is why it shows up in reconstructions more clearly than in pose probes.
+
 ## Analysis notebooks
 
 | Notebook | Contents |
@@ -164,17 +152,13 @@ The IP-Adapter's `MLPProjModel` maps SigLIP 1152-d to 128 × 4096 image tokens, 
 
 ---
 
-## Limitations and next steps
+## Limitations
 
-The IP-Adapter is frozen and relies on generalizing from its natural-photograph training distribution to HVM stimuli. A lightweight LoRA finetune of its key/value projections on the 270 HVM training images would test whether domain adaptation closes the remaining gap to the original stimulus.
+The FLUX LoRA is trained on the same 270 images the encoders use, so the generator has seen the stimulus domain even though it never sees the held-out test images. Reconstruction quality reflects that adaptation alongside the decoded neural signal.
 
-The encoder's usable signal is also narrower than the reconstructions suggest. The brain-aligned SigLIP subspace is roughly 10-dimensional, and linear probes recover category far better than pose, size, or position, so much of the reconstruction quality rests on category-level structure.
+The encoder's usable signal is also narrower than the reconstructions suggest, as the subspace and probe results above show. Recovering pose reliably likely needs a richer neural signal rather than a better readout.
 
-Planned work:
-
-- **Time and neuron ablation.** Vary the spike-count window across biologically motivated intervals to test whether the early feedforward sweep or later recurrent activity carries more recoverable image information, and subsample recording sites (10/25/50/75%) to trace how reconstruction quality degrades as the pseudo-population shrinks.
-- **Five-fold cross-validation.** Evaluation currently covers 90 of 450 stimuli. Five disjoint category-stratified folds would reconstruct every image exactly once, giving fold-level standard errors and identifying stimuli that fail consistently across folds.
-- **Extend the recording set.** Incorporating additional sessions and newer preprocessing would raise stimulus coverage and electrode count, benefiting both analyses above.
+Evaluation covers the 90 held-out stimuli, not the full 450.
 
 ## References
 
